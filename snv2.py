@@ -134,6 +134,29 @@ def get_obj_one_snv_p(index, p_vec, v, y, rho, pairs_mapping, b_vec, tumor_cn_ve
     
     return obj_one_snv_p
 
+def get_obj_all_snv_p(v, y, rho, combinations, pairs_mapping, b_mat, tumor_cn_mat, normal_cn_mat, purity_mat, read_mat, total_read_mat, n, m):
+    v_tilde = v + y / rho
+    
+    def obj_all_snv_p(p):
+        res = -1 * get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat, normal_cn_mat, purity_mat, read_mat, total_read_mat)
+        for i in range(len(combinations)):
+            pair = combinations[i]
+            index_v = pairs_mapping[pair]
+            start_v = index_v * m 
+            end_v = (index_v + 1) * m
+            l1, l2 = pair
+            start_p_l1 = l1 * m
+            end_p_l1 = (l1 + 1) * m
+            start_p_l2 = l2 * m
+            end_p_l2 = (l2 + 1) * m
+            temp = p[start_p_l1:end_p_l1] - p[start_p_l2: end_p_l2] - v_tilde[start_v: end_v]
+            res = res + rho * np.matmul(temp.T, temp) / 2
+        
+        return res
+    
+    return obj_all_snv_p
+            
+
 def update_v(index_v, pairs_mapping_inverse, p_vec, y, m, rho, omega, gamma):
     start_y = index_v * m
     end_y = (index_v + 1) * m
@@ -168,7 +191,7 @@ def update_y(y, v, index_v, pairs_mapping_inverse, p_vec, m, rho):
 
 
 
-def dis_cluster(v, n, m, combinations, pairs_mapping):
+def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
     dic = {i : i for i in range(n)}
     res = np.zeros([n, n])
     for i in range(len(combinations)):
@@ -184,11 +207,11 @@ def dis_cluster(v, n, m, combinations, pairs_mapping):
                 if res[i, j] == 1:
                     dic[j] = dic[i]
               
-    print(dic)      
+    print(f"Gamma: {gamma}, clusters : {dic}")      
             
     return dic
 
-@ray.remote(num_returns = 5)
+@ray.remote(num_returns = 4)
 def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     
     sets = {i for i in range(n)}
@@ -219,11 +242,14 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     k = 0
     while(k < max_iteration):
         k = k + 1
-        for i in range(n):
-            start = i * m
-            end = (i + 1) * m
-            p0 = p[start: end]
-            res = minimize(get_obj_one_snv_p(i, 
+        hh = 0
+        while(hh < 10):
+            hh = hh + 1
+            for i in range(n):
+                start = i * m
+                end = (i + 1) * m
+                p0 = p[start: end]
+                res = minimize(get_obj_one_snv_p(i, 
                                              p, 
                                              v, 
                                              y, 
@@ -240,7 +266,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
                        p0, 
                        method='nelder-mead',
                        options={'xatol': 1e-2, 'disp': False})
-            p[start: end] = res.x
+                p[start: end] = res.x
 
         for i in range(len(combinations_2)):
             pair = combinations_2[i]
@@ -250,12 +276,79 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
             v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, m, rho, omega, gamma)
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, m, rho)
             
-    cls = dis_cluster(v, n, m, combinations_2, pairs_mapping)
+    cls = dis_cluster(v, n, m, combinations_2, pairs_mapping, gamma)
     loglik = get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
     bic = -2 * loglik
     bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
     
-    return p, v, y, bic, loglik
+    return p, v, y, [bic, loglik, gamma]
+
+
+
+@ray.remote(num_returns = 4)
+def ADMM2(df, rho, gamma, omega, n, m, max_iteration):
+    
+    sets = {i for i in range(n)}
+    combinations_2 = list(itertools.combinations(sets, 2))
+    dic1 = {}
+    dic2 = {}
+    index = 0
+    for i in range(len(combinations_2)):
+        combination = combinations_2[i]
+        dic1[combination] = index
+        dic2[index] = combination
+        index = index + 1
+    pairs_mapping = dic1
+    pairs_mapping_inverse = dic2
+
+    b_mat = get_b_mat(df)
+    tumor_cn_mat = get_tumor_cn_mat(df)
+    normal_cn_mat = get_normal_cn_mat(df)
+    purity_mat = get_purity_mat(df)
+    read_mat = get_read_mat(df)
+    total_read_mat = get_total_read_mat(df)
+    
+    p = np.zeros([n*m])
+    v = np.ones([len(combinations_2) * m])
+    y = np.ones([len(combinations_2) * m])
+
+    from scipy.optimize import minimize
+    k = 0
+    while(k < max_iteration):
+        k = k + 1
+        p0 = p
+        res = minimize(get_obj_all_snv_p(v,
+                                         y, 
+                                         rho,
+                                         combinations_2, 
+                                         pairs_mapping, 
+                                         b_mat, 
+                                         tumor_cn_mat, 
+                                         normal_cn_mat, 
+                                         purity_mat, 
+                                         read_mat, 
+                                         total_read_mat, 
+                                         n,
+                                         m), 
+                       p0, 
+                       method='nelder-mead',
+                       options={'xatol': 1e-2, 'disp': False})
+        p = res.x
+
+        for i in range(len(combinations_2)):
+            pair = combinations_2[i]
+            index_v = pairs_mapping[pair]
+            start_v = index_v * m
+            end_v = (index_v + 1) * m
+            v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, m, rho, omega, gamma)
+            y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, m, rho)
+            
+    cls = dis_cluster(v, n, m, combinations_2, pairs_mapping, gamma)
+    loglik = get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
+    bic = -2 * loglik
+    bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
+    
+    return p, v, y, [bic, loglik, gamma]
 
 
 

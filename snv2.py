@@ -251,7 +251,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     bic = -2 * get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
     bic = bic + np.log(n) * len(np.unique(cls.values)) * m
     
-    return p, v, y
+    return p, v, y, bic
 
 
 

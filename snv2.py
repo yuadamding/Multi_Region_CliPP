@@ -1,4 +1,6 @@
-'''----------------------------------------------------------------------
+'''
+----------------------------------------------------------------------
+----------------------------------------------------------------------
 This file contains functions for multi-region CliPP
 Authors: Yu Ding
 Date: 10/16/2024
@@ -186,7 +188,7 @@ def dis_cluster(v, n, m, combinations, pairs_mapping):
             
     return dic
 
-@ray.remote(num_returns = 4)
+@ray.remote(num_returns = 5)
 def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     
     sets = {i for i in range(n)}
@@ -245,15 +247,15 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
             index_v = pairs_mapping[pair]
             start_v = index_v * m
             end_v = (index_v + 1) * m
-            v0 = v[start_v: end_v]
             v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, m, rho, omega, gamma)
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, m, rho)
             
     cls = dis_cluster(v, n, m, combinations_2, pairs_mapping)
-    bic = -2 * get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
-    bic = bic + np.log(n) * len(np.unique(cls.values)) * m
+    loglik = get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
+    bic = -2 * loglik
+    bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
     
-    return p, v, y, bic
+    return p, v, y, bic, loglik
 
 
 

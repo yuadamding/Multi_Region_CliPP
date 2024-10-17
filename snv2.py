@@ -103,10 +103,10 @@ def get_prop_mat(df, cp = None, mapped_cp = None):
     res = cp * b_mat / ((1 - purity_mat) * normal_cn_mat + purity_mat * tumor_cn_mat)
     return res
 
-def get_loglikelihood_one_snv(p, b_vec, tumor_cn_vec, normal_cn_vec, purity_vec, read_vec, total_read_vec):
+def get_loglikelihood(p, b_mat, tumor_cn_mat, normal_cn_mat, purity_mat, read_mat, total_read_mat):
     cp = sci.stats.norm.cdf(p)
-    prop = cp * b_vec / ((1 - purity_vec) * normal_cn_vec + purity_vec * tumor_cn_vec)
-    return np.sum(read_vec * np.log(prop) + (total_read_vec - read_vec) * np.log(1 - prop))
+    prop = cp * b_mat / ((1 - purity_mat) * normal_cn_mat + purity_mat * tumor_cn_mat)
+    return np.sum(read_mat * np.log(prop) + (total_read_mat - read_mat) * np.log(1 - prop))
     
 
 def get_obj_one_snv_p(index, p_vec, v, y, rho, pairs_mapping, b_vec, tumor_cn_vec, normal_cn_vec, purity_vec, read_vec, total_read_vec, n, m):
@@ -205,7 +205,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     normal_cn_mat = get_normal_cn_mat(df)
     purity_mat = get_purity_mat(df)
     read_mat = get_read_mat(df)
-    total_rad_mat = get_total_read_mat(df)
+    total_read_mat = get_total_read_mat(df)
     
     p = np.zeros([n*m])
     v = np.ones([len(combinations_2) * m])
@@ -230,7 +230,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
                                              normal_cn_mat[i, :], 
                                              purity_mat[i, :], 
                                              read_mat[i, :], 
-                                             total_rad_mat[i, :], 
+                                             total_read_mat[i, :], 
                                              n, 
                                              m), 
                        p0, 
@@ -247,10 +247,11 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
             v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, m, rho, omega, gamma)
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, m, rho)
             
-    dis_cluster(v, n, m, combinations_2, pairs_mapping)
+    cls = dis_cluster(v, n, m, combinations_2, pairs_mapping)
+    bic = -2 * get_loglikelihood(np.reshape(p, [n, m]), b_mat, tumor_cn_mat,normal_cn_mat, purity_mat, read_mat, total_read_mat)
+    bic = bic + np.log(n) * len(np.unique(cls.values)) * m
     
     return p, v, y
-
 
 
 

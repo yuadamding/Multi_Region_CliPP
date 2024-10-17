@@ -10,6 +10,7 @@ import numpy as np
 import scipy as sci
 import itertools
 import time
+import ray
 
 def get_major_cn(df):
     n = len(np.unique(df.mutation))
@@ -185,6 +186,7 @@ def dis_cluster(v, n, m, combinations, pairs_mapping):
             
     return dic
 
+@ray.remote(num_returns = 4)
 def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     
     sets = {i for i in range(n)}

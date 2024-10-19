@@ -11,8 +11,19 @@ Email: yding1995@gmail.com; yding4@mdanderson.org
 import numpy as np
 import scipy as sci
 import itertools
-import time
+import torch
 import ray
+
+def matmul_by_torch(amat, bmat):
+    amat = torch.from_numpy(amat)
+    bmat = torch.from_numpy(bmat)
+    res_mat = torch.matmul(amat, bmat)
+    return res_mat.numpy()
+
+def sum_by_torch(mat):
+    mat = torch.from_numpy(mat)
+    res_mat = torch.sum(mat)
+    return res_mat.numpy()
 
 def get_major_cn(df):
     n = len(np.unique(df.mutation))
@@ -109,7 +120,7 @@ def get_prop_mat(df, cp = None, mapped_cp = None):
 def get_loglikelihood(p, b_mat, tumor_cn_mat, normal_cn_mat, purity_mat, read_mat, total_read_mat):
     cp = sci.stats.norm.cdf(p)
     prop = cp * b_mat / ((1 - purity_mat) * normal_cn_mat + purity_mat * tumor_cn_mat)
-    return np.sum(read_mat * np.log(prop) + (total_read_mat - read_mat) * np.log(1 - prop))
+    return sum_by_torch(read_mat * np.log(prop) + (total_read_mat - read_mat) * np.log(1 - prop))
     
 
 def get_obj_one_snv_p(index, p_vec, v, y, rho, pairs_mapping, b_vec, tumor_cn_vec, normal_cn_vec, purity_vec, read_vec, total_read_vec, n, m):
@@ -118,7 +129,7 @@ def get_obj_one_snv_p(index, p_vec, v, y, rho, pairs_mapping, b_vec, tumor_cn_ve
     def obj_one_snv_p(p):
         cp = sci.stats.norm.cdf(p)
         prop = cp * b_vec / ((1 - purity_vec) * normal_cn_vec + purity_vec * tumor_cn_vec)
-        res = -1 * np.sum(read_vec * np.log(prop) + (total_read_vec - read_vec) * np.log(1 - prop))
+        res = -1 * sum_by_torch(read_vec * np.log(prop) + (total_read_vec - read_vec) * np.log(1 - prop))
         for i in range(n):
             if i != index:
                 pair = (index, i) if index < i else (i, index)
@@ -128,7 +139,7 @@ def get_obj_one_snv_p(index, p_vec, v, y, rho, pairs_mapping, b_vec, tumor_cn_ve
                 start_p = i * m
                 end_p = (i + 1) * m
                 temp = v_tilde[start_v : end_v] - p + p_vec[start_p: end_p]
-                res = res + 0.5 * rho * np.matmul(temp.T, temp) / 2 
+                res = res + 0.5 * rho * matmul_by_torch(temp.T, temp) / 2 
     
         return res
     
@@ -150,7 +161,7 @@ def get_obj_all_snv_p(v, y, rho, combinations, pairs_mapping, b_mat, tumor_cn_ma
             start_p_l2 = l2 * m
             end_p_l2 = (l2 + 1) * m
             temp = p[start_p_l1:end_p_l1] - p[start_p_l2: end_p_l2] - v_tilde[start_v: end_v]
-            res = res + rho * np.matmul(temp.T, temp) / 2
+            res = res + rho * matmul_by_torch(temp.T, temp) / 2
         
         return res
     
@@ -166,7 +177,7 @@ def update_v(index_v, pairs_mapping_inverse, p_vec, y, m, rho, omega, gamma):
     start_p_l2 = l2 * m
     end_p_l2 = (l2 + 1) * m
     temp = p_vec[start_p_l1:end_p_l1] - p_vec[start_p_l2: end_p_l2] - y[start_y: end_y] / rho
-    norm = np.sqrt(np.matmul(temp.T, temp))
+    norm = np.sqrt(matmul_by_torch(temp.T, temp))
     if norm >= gamma * omega / rho:
         v = (1 - gamma * omega / (rho * norm)) * temp
     else:
@@ -175,8 +186,8 @@ def update_v(index_v, pairs_mapping_inverse, p_vec, y, m, rho, omega, gamma):
     return v
     # def obj_v(v):
     #     temp1 = v - temp
-    #     res = 0.5 * np.matmul(temp1.T, temp1)
-    #     res = res + gamma * omega * np.sqrt(np.matmul(v.T, v)) / rho
+    #     res = 0.5 * matmul_by_torch(temp1.T, temp1)
+    #     res = res + gamma * omega * np.sqrt(matmul_by_torch(v.T, v)) / rho
     #     return res
     
     # return obj_v
@@ -199,7 +210,7 @@ def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
         start_v = index_v * m 
         end_v = (index_v + 1) * m
         v_index = v[start_v : end_v]
-        if np.matmul(v_index.T, v_index) < 0.01:
+        if matmul_by_torch(v_index.T, v_index) < 0.01:
             res[combinations[i]] = 1
         
     for i in range(n - 1):

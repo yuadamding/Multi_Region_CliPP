@@ -218,7 +218,7 @@ def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
                 if res[i, j] == 1:
                     dic[j] = dic[i]
               
-    print(f"Gamma: {gamma}, clusters : {dic}")      
+    print(f"Gamma: {gamma}, clusters : {dic.values()}")      
             
     return dic
 
@@ -245,7 +245,8 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     read_mat = get_read_mat(df)
     total_read_mat = get_total_read_mat(df)
     
-    p = np.zeros([n*m])
+    p = read_mat * ((1 - purity_mat) *normal_cn_mat + purity_mat *tumor_cn_mat )  / (total_read_mat * b_mat)
+    p = p.reshape([n*m])
     v = np.ones([len(combinations_2) * m])
     y = np.ones([len(combinations_2) * m])
 
@@ -319,7 +320,8 @@ def ADMM2(df, rho, gamma, omega, n, m, max_iteration):
     read_mat = get_read_mat(df)
     total_read_mat = get_total_read_mat(df)
     
-    p = np.zeros([n*m])
+    p = read_mat * ((1 - purity_mat) *normal_cn_mat + purity_mat *tumor_cn_mat )  / (total_read_mat * b_mat)
+    p = p.reshape([n*m])
     v = np.ones([len(combinations_2) * m])
     y = np.ones([len(combinations_2) * m])
 

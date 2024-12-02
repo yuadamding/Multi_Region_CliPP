@@ -1,4 +1,4 @@
-mutation_id	sample_id	ref_counts	alt_counts	major_cn	minor_cn	normal_cn	tumour_content	error_rate	g_n	g_r	g_v	ccf	mu	cluster
+mutation	region	ref_counts	alt_counts	major_cn	minor_cn	normal_cn	tumour_purity	error_rate	g_n	g_r	g_v	ccf	mu	cluster
 m0	s0	69	29	3	0	2	1.0	0.001	AA	AA	BBB	0.1692567775854891	0.23460756427139176	0
 m0	s1	66	39	2	2	2	1.0	0.001	AA	AA	AABB	0.7555651186098564	0.43052208401687436	0
 m0	s2	49	39	2	2	2	1.0	0.001	AA	AA	AABB	0.9529679801978649	0.48798291722177256	0

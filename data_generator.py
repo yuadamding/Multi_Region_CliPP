@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from snv3 import * 
+from snv import * 
 import matplotlib.pyplot as plt
 import seaborn as sns
 import itertools
@@ -27,22 +27,26 @@ class Mutation:
         c = self.c
         cp = self.cp
         total_reads = self.total_reads
+        # reads = total_reads * cp * c + np.random.normal(0, 0.01 * total_reads)
         reads = np.random.binomial(total_reads, cp * c)
         return reads
 
 def generate_data(n, m, cp, cluster):
-    regions = ['R' + str(i % 4 + 1) for i in range(n * m)]
+    regions = ['R' + str(i % m + 1) for i in range(n * m)]
 
     ref_counts = []
     alt_counts = []
     normal_cn = [2] * n * m
     major_cn = []
     minor_cn = []
-    tumour_purity = [0.75, 0.65, 0.85, 0.7]
+    if m == 4:
+        tumour_purity = [0.75, 0.65, 0.85, 0.7]
+    elif m == 2:
+        tumour_purity = [0.75, 0.65]
     clusters = [cluster] * n * m
 
     for i in range(n * m):
-        mut = Mutation(cluster, tumour_purity[i % 4], cp[i % 4])
+        mut = Mutation(cluster, tumour_purity[i % m], cp[i % m])
         ref_counts.append(mut.total_reads - mut.reads)
         alt_counts.append(mut.reads)
         major_cn.append(mut.major_cn)

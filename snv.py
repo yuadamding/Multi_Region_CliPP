@@ -13,9 +13,20 @@ import itertools
 import torch
 import ray
 from scipy.optimize import fsolve
+import pandas as pd
 
 def sigmoid(x):
   return 1 / (1 + np.exp(-x))
+
+def adjust_array(arr, epsilon=1e-10):
+    arr = np.array(arr)  # Ensure input is a numpy array
+    arr[arr <= 0] = epsilon
+    arr[arr >= 1] = 1 - epsilon
+    return arr
+
+def inverse_sigmoid(y):
+    y = adjust_array(y)
+    return np.log(y / (1 - y))
 
 def sigmoid_derivative(x):
   return sigmoid(x) * (1 - sigmoid(x))
@@ -88,10 +99,15 @@ def get_b_mat(df):
     
     for i in range(n):
         for j in range(m):
-            temp = read_mat[i, j] * (purity_mat[i, j] * tumor_cn_mat[i, j] + normal_cn_mat[i, j] * (1 - purity_mat[i, j]))\
-                / (total_read_mat[i, j] * purity_mat[i, j])
-            temp = 1 if np.round(temp) == 0 else np.round(temp)
-            res[i, j] = np.min([temp, major_cn_mat[i, j]])
+            index = i * m + j
+            res[i, j] = df.iloc[index , :].multiplicity
+    
+    # for i in range(n):
+    #     for j in range(m):
+    #         temp = read_mat[i, j] * (purity_mat[i, j] * tumor_cn_mat[i, j] + normal_cn_mat[i, j] * (1 - purity_mat[i, j]))\
+    #             / (total_read_mat[i, j] * purity_mat[i, j])
+    #         temp = 1 if np.round(temp) == 0 else np.round(temp)
+    #         res[i, j] = np.min([temp, major_cn_mat[i, j]])
     return res
 
 def get_tumor_cn_mat(df):
@@ -154,7 +170,7 @@ def get_c_mat(df):
     return c_mat
 
 def get_loglikelihood(p, c_mat, read_mat, total_read_mat):
-    cp = sigmoid(p) / c_mat
+    cp = sigmoid(p)
     prop = cp * c_mat
     if np.any(prop < 0) or np.any(prop > 1):
         print(prop)
@@ -185,7 +201,7 @@ def get_objective_function(p, v, y, rho,combinations, pairs_mapping, c_mat, read
         res = res + 0.5 * rho * matmul_by_torch(temp.T, temp)
         res = res + matmul_by_torch(y[start_v: end_v].T, temp)
         temp = v[start_v: end_v]
-        res = res + gamma * omega * np.sqrt(matmul_by_torch(temp.T, temp))
+        res = res + gamma * omega[i] * np.sqrt(matmul_by_torch(temp.T, temp))
     return res
 
 def get_grad_of_objective_function(v, y, rho,combinations, pairs_mapping, c_mat, read_mat, total_read_mat, n, m):
@@ -194,8 +210,8 @@ def get_grad_of_objective_function(v, y, rho,combinations, pairs_mapping, c_mat,
 
     def grad_of_objective_function(p):
         p = np.reshape(p, [n, m])
-        cp_prime = sigmoid_derivative(p) / c_mat
-        cp = sigmoid(p) / c_mat
+        cp_prime = sigmoid_derivative(p)
+        cp = sigmoid(p)
         prop = cp * c_mat
         if np.any(prop < 0) or np.any(prop > 1) or np.nan in prop:
             print(prop)
@@ -231,7 +247,7 @@ def update_v(index_v, pairs_mapping_inverse, p_vec, y, n, m, rho, omega, gamma):
     a_mat = a_mat_generator(l1, l2, n, m)
     temp = matmul_by_torch(a_mat, p_vec) - y[start_y: end_y] / rho
     norm = np.sqrt(matmul_by_torch(temp.T, temp))
-    if norm >= gamma * omega / rho:
+    if norm > gamma * omega / rho:
         v = (1 - gamma * omega / (rho * norm)) * temp
     else:
         v = np.zeros(m)
@@ -256,7 +272,8 @@ def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
         start_v = index_v * m 
         end_v = (index_v + 1) * m
         v_index = v[start_v : end_v]
-        if sum(v_index == 0) == m:
+        temp = np.sqrt(matmul_by_torch(v_index.T, v_index) / m)
+        if temp < 1e-1:
             res[combinations[i]] = 1
         
     for i in range(n - 1):
@@ -268,7 +285,7 @@ def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
             
     return dic
 
-@ray.remote(num_returns=4)
+@ray.remote(num_returns=1)
 def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     """
     Alternating Direction Method of Multipliers (ADMM) for optimization.
@@ -300,32 +317,30 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     pairs_mapping_inverse = {index: combination for index, combination in enumerate(combinations_2)}
 
     # Get matrices
-    b_mat = get_b_mat(df)
-    tumor_cn_mat = get_tumor_cn_mat(df)
-    normal_cn_mat = get_normal_cn_mat(df)
-    purity_mat = get_purity_mat(df)
     read_mat = get_read_mat(df)
     total_read_mat = get_total_read_mat(df)
     c_mat = get_c_mat(df)
 
     # Initialize variables
-    p = read_mat * ((1 - purity_mat) * normal_cn_mat + purity_mat * tumor_cn_mat) / (total_read_mat * b_mat)
+    #12/12/2024
+    p = inverse_sigmoid(read_mat / (total_read_mat * c_mat))
+    # p = np.ones([n * m])
     p = p.reshape([n * m])
-    v = np.ones([len(combinations_2) * m])
+    v = np.zeros([len(combinations_2) * m])
     y = np.ones([len(combinations_2) * m])
-    
+    omega = np.ones([len(combinations_2)])
     k = 0
-    obj_values = []
+    # obj_values = []
     Flag = True
     while k < max_iteration and Flag:
         k += 1
 
         # Calculate current objective function
-        curr_objective_function = get_objective_function(
-            p, v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m, gamma, omega
-        )
-        print(f"Iteration {k}, Objective Function: {curr_objective_function}")
-        obj_values.append(curr_objective_function)
+        # curr_objective_function = get_objective_function(
+        #     p, v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m, gamma, omega
+        # )
+        # print(f"Iteration {k}, Objective Function: {curr_objective_function}")
+        # obj_values.append(curr_objective_function)
         
         fp = get_grad_of_objective_function(
             v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m
@@ -337,7 +352,10 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
             index_v = pairs_mapping[pair]
             start_v = index_v * m
             end_v = (index_v + 1) * m
-            v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, n, m, rho, omega, gamma)                
+            # temp = np.sqrt(matmul_by_torch(v[start_v: end_v].T, v[start_v: end_v]))
+            # temp = 1e-10 if temp == 0 else temp
+            # omega[i] = pow(temp, -0.2)
+            v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, n, m, rho, omega[i], gamma)                
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, n, m, rho)
 
     cls = dis_cluster(v, n, m, combinations_2, pairs_mapping, gamma)
@@ -346,8 +364,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     df = len(np.unique(list(cls.values()))) * m
     bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
     
-    return p, v, y, [bic, loglik, gamma, df, list(cls.values()), obj_values]
-
+    return [p, v, y, bic, loglik, gamma, df, list(cls.values())]
 
 
 

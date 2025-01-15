@@ -150,14 +150,21 @@ tree = nx.DiGraph()
 # Add edges to represent the tree structure
 tree.add_edges_from([
     (0, 1),  # Edge from node 0 to node 1
-    (1, 2),  # Edge from node 0 to node 1
-    (1, 3),  # Edge from node 0 to node 1
-    (0, 4),  # Edge from node 0 to node 1
+    (0, 2),  # Edge from node 0 to node 1
 ])
 cluster = [
-    [1.0, 0.32, 0.1, 0.21, 0.59],
-    [1.0, 0.68, 0.45, 0.1, 0.2]
+    [1.0, 0.44, 0.28]
 ]
+# tree.add_edges_from([
+#     (0, 1),  # Edge from node 0 to node 1
+#     (1, 2),  # Edge from node 0 to node 1
+#     (1, 3),  # Edge from node 0 to node 1
+#     (0, 4),  # Edge from node 0 to node 1
+# ])
+# cluster = [
+#     [1.0, 0.32, 0.1, 0.21, 0.59],
+#     [1.0, 0.68, 0.45, 0.1, 0.2]
+# ]
 
 
 def run_simulation(argv, tree, clusters):
@@ -214,7 +221,7 @@ def run_simulation(argv, tree, clusters):
     # draw_graph(tree)
 
     output_handle = open(output_root + '/simulation_data_cluster_%s_region_%s_read_depth_%s_replica_%s.tsv' % (n_clusters, n_samples, read_depth, replicate), 'w')
-    _header = ['mutation', 'region', 'ref_counts', 'alt_counts', 'normal_cn', 'major_cn', 'minor_cn', 'tumour_purity', 'multiplicity', 'ccf', 'cluster']
+    _header = ['mutation', 'region', 'ref_counts', 'alt_counts', 'normal_cn', 'major_cn', 'minor_cn', 'tumour_purity', 'multiplicity', 'ccf', 'cluster', 'cp']
     _header = '\t'.join(_header)
     
     output_handle.write(_header + '\n')
@@ -257,7 +264,7 @@ def run_simulation(argv, tree, clusters):
             #     ccf = clusters[sample_index][cluster_index]
                 
             ccf = clusters[sample_index][cluster_index]
-
+            cp = ccf * purity[sample_index]
             af = ccf * mult * purity[sample_index] / ( purity[sample_index] * total_CN + 2 * (1.0 - purity[sample_index]))
             af = round(af, 4)
 
@@ -275,7 +282,7 @@ def run_simulation(argv, tree, clusters):
             major_cn = al_1 if al_1 > al_2 else al_2
             minor_cn = al_1 if al_1 < al_2 else al_2
             
-            _output = [chrom + ':' + str(pos), 'R' + str(sample_index + 1), str(total_reads - alt_reads), str(alt_reads),  str(2), str(major_cn), str(minor_cn), str(purity[sample_index]), str(mult), str(ccf), str(cluster_index)]
+            _output = [chrom + ':' + str(pos), 'R' + str(sample_index + 1), str(total_reads - alt_reads), str(alt_reads),  str(2), str(major_cn), str(minor_cn), str(purity[sample_index]), str(mult), str(ccf), str(cluster_index), str(cp)]
             _output = '\t'.join(_output)
 
             output_handle.write(_output + '\n')
@@ -289,8 +296,8 @@ if __name__ == '__main__':
 
 
     _argv = {
-        'n_clusters': 5,
-        'n_samples': 2,
+        'n_clusters': 3,
+        'n_samples': 1,
         'purity': 'uniform',
         'read_depth': 100,
         'n_mutations': 100, ## the union of SNVs in all regions

@@ -176,4 +176,43 @@ def get_file_for_clipp(df):
 
     return matrix / len(dfs_by_region.keys())
 
+def reNC(estimated_num_clusters, true_num_clusters):
+    return abs(estimated_num_clusters - true_num_clusters) / true_num_clusters
 
+def rdCF(estimated_clonal_fraction, true_clonal_fraction):
+    return abs(estimated_clonal_fraction - true_clonal_fraction) / true_clonal_fraction
+
+def RMSE(estimated_cp, true_cp, purity):
+    estimated_cp = np.array(estimated_cp)
+    true_cp = np.array(true_cp)
+    return np.sqrt(np.mean(((estimated_cp - true_cp) / purity) ** 2))
+
+def measuring_overall_error(estimated_num_clusters, 
+                            true_num_clusters,
+                            estimated_clonal_fraction,
+                            true_clonal_fraction,
+                            estimated_cp,
+                            true_cp,
+                            purity):
+    reNC_error = reNC(estimated_num_clusters, true_num_clusters)
+    rdCF_error = rdCF(estimated_clonal_fraction, true_clonal_fraction)
+    RMSE_error = RMSE(estimated_cp, true_cp, purity)
+    return (reNC_error + rdCF_error + RMSE_error) / 3
+
+def create_df_from_clipp(snvfile, cnafile, purityfile):
+    dfsnv = pd.read_csv(snvfile, sep='\t')
+    dfcna = pd.read_csv(cnafile, sep='\t')
+    with open(purityfile, 'r') as file:
+            purity = float(file.read().strip())
+    n = len(dfsnv)
+    df = pd.DataFrame({
+        'mutation': dfsnv['position'],
+        'region' : 1,
+        'ref_counts': dfsnv['ref_count'],
+        'alt_counts': dfsnv['alt_count'],
+        'major_cn': dfcna['major_cn'],
+        'minor_cn': dfcna['minor_cn'],
+        'normal_cn': [2 for i in range(n)],
+        'tumour_purity': [purity for i in range(n)]
+    })
+    return df

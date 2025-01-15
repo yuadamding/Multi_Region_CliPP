@@ -97,17 +97,17 @@ def get_b_mat(df):
     read_mat = get_read_mat(df)
     total_read_mat = get_total_read_mat(df)
     
-    for i in range(n):
-        for j in range(m):
-            index = i * m + j
-            res[i, j] = df.iloc[index , :].multiplicity
-    
     # for i in range(n):
     #     for j in range(m):
-    #         temp = read_mat[i, j] * (purity_mat[i, j] * tumor_cn_mat[i, j] + normal_cn_mat[i, j] * (1 - purity_mat[i, j]))\
-    #             / (total_read_mat[i, j] * purity_mat[i, j])
-    #         temp = 1 if np.round(temp) == 0 else np.round(temp)
-    #         res[i, j] = np.min([temp, major_cn_mat[i, j]])
+    #         index = i * m + j
+    #         res[i, j] = df.iloc[index , :].multiplicity
+    
+    for i in range(n):
+        for j in range(m):
+            temp = read_mat[i, j] * (purity_mat[i, j] * tumor_cn_mat[i, j] + normal_cn_mat[i, j] * (1 - purity_mat[i, j]))\
+                / (total_read_mat[i, j] * purity_mat[i, j])
+            temp = 1 if np.round(temp) == 0 else np.round(temp)
+            res[i, j] = np.min([temp, major_cn_mat[i, j]])
     return res
 
 def get_tumor_cn_mat(df):
@@ -264,16 +264,24 @@ def update_y(y, v, index_v, pairs_mapping_inverse, p_vec, n, m, rho):
     # end_p_l2 = (l2 + 1) * m
     return y + rho * (v - matmul_by_torch(a_mat, p_vec))
 
-def dis_cluster(v, n, m, combinations, pairs_mapping, gamma):
+def dis_cluster(p, v, n, m, combinations, pairs_mapping, gamma):
     dic = {i : i for i in range(n)}
     res = np.zeros([n, n])
     for i in range(len(combinations)):
+        # l1, l2 = combinations[i]
+        # start_p_l1 = l1 * m
+        # end_p_l1 = (l1 + 1) * m
+        # start_p_l2 = l2 * m
+        # end_p_l2 = (l2 + 1) * m
+        # cp1 = sigmoid(p[start_p_l1: end_p_l1])
+        # cp2 = sigmoid(p[start_p_l2: end_p_l2])
+        # v_index = cp1 - cp2
         index_v = pairs_mapping[combinations[i]]
         start_v = index_v * m 
         end_v = (index_v + 1) * m
         v_index = v[start_v : end_v]
         temp = np.sqrt(matmul_by_torch(v_index.T, v_index) / m)
-        if temp < 1e-1:
+        if temp < 1e-2:
             res[combinations[i]] = 1
         
     for i in range(n - 1):
@@ -323,8 +331,8 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
 
     # Initialize variables
     #12/12/2024
-    p = inverse_sigmoid(read_mat / (total_read_mat * c_mat))
-    # p = np.ones([n * m])
+    # p = inverse_sigmoid(read_mat / (total_read_mat * c_mat))
+    p = np.zeros([n * m])
     p = p.reshape([n * m])
     v = np.zeros([len(combinations_2) * m])
     y = np.ones([len(combinations_2) * m])
@@ -332,6 +340,8 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     k = 0
     # obj_values = []
     Flag = True
+    
+    # ADMM
     while k < max_iteration and Flag:
         k += 1
 
@@ -345,7 +355,7 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
         fp = get_grad_of_objective_function(
             v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m
         )
-        p = fsolve(fp, p)
+        p = fsolve(fp, p) 
         
         for i in range(len(combinations_2)):
             pair = combinations_2[i]
@@ -358,16 +368,180 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
             v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, n, m, rho, omega[i], gamma)                
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, n, m, rho)
 
-    cls = dis_cluster(v, n, m, combinations_2, pairs_mapping, gamma)
+    cls = dis_cluster(p, v, n, m, combinations_2, pairs_mapping, gamma)
     loglik = get_loglikelihood(np.reshape(p, [n, m]), c_mat, read_mat, total_read_mat)
     bic = -2 * loglik
-    df = len(np.unique(list(cls.values()))) * m
+    dof = len(np.unique(list(cls.values()))) * m
     bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
     
-    return [p, v, y, bic, loglik, gamma, df, list(cls.values())]
+    # PostProcess
+    cp = sigmoid(p)
+    mutation_df = pd.DataFrame(
+        {
+            'mutation': [i for i in range(n)],
+            'cluster': [cls[i] for i in range(n)],
+            'cp_sqrt': [np.sqrt(matmul_by_torch(cp[i * m: (i + 1) * m].T, cp[i * m: (i + 1) * m])) for i in range(n)]
+        }
+    )
+    cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
+    num_cluster = len(cluster_cp)
+    largest_mean_cluster = cluster_cp.idxmax()
+    clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
+    # Filter 1: deal with superclusters
+    # If the max CP > 1 & the sample has > 2 clusters & the current clonal fraction <= 0.4:
+    # Merge the two clusters with the largest CP values
+    while cluster_cp.max() > 1 and num_cluster > 2 and clonal_fraction <= 0.4:
+        # Get the two clusters with the largest CP values
+        largest_cluster = cluster_cp.idxmax()
+        cluster_cp.drop(largest_cluster, inplace=True)
+        second_largest_cluster = cluster_cp.idxmax()
+
+        # Update the cluster assignment
+        mutation_df['cluster'] = mutation_df['cluster'].replace(largest_cluster, second_largest_cluster)
+        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
+        num_cluster = len(cluster_cp)
+        largest_mean_cluster = cluster_cp.idxmax()
+        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
+    # Filter 2: deal with small clones, i.e., the clonal cluster has a small number of mutations
+    # If the sample has > 2 clusters & the current clonal fraction <= 0.15:
+    # Merge the two clusters with the largest CP values
+    while num_cluster > 2 and clonal_fraction <= 0.15:
+        # Get the two clusters with the largest CP values
+        largest_cluster = cluster_cp.idxmax()
+        cluster_cp.drop(largest_cluster, inplace=True)
+        second_largest_cluster = cluster_cp.idxmax()
+
+        # Update the cluster assignment
+        mutation_df['cluster'] = mutation_df['cluster'].replace(largest_cluster, second_largest_cluster)
+        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
+        num_cluster = len(cluster_cp)
+        largest_mean_cluster = cluster_cp.idxmax()
+        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
+    # Filter 3: deal with adjacent clusters, i.e., cluster with similar CP values
+    # If the sample has > 2 clusters & if CP values between any two clusters < 0.1
+    # Merge those two clusters together
+    if num_cluster > 2:
+        cluster_pairs = list(itertools.combinations(cluster_cp.index, 2))
+        pairwise_differences = {}
+        for (cluster1, cluster2) in cluster_pairs:
+            diff = abs(cluster_cp[cluster1] - cluster_cp[cluster2])
+            pairwise_differences[(cluster1, cluster2)] = diff
+        min_diff = min(pairwise_differences.values())
+        while num_cluster > 2 and min_diff < 0.1:
+            # Get the two clusters with the smallest difference in CP values
+            keys_with_value = [key for key, value in pairwise_differences.items() if value == min_diff]
+            cluster1 = keys_with_value[0][0]
+            cluster2 = keys_with_value[0][1]
+
+            # Update the cluster assignment
+            mutation_df['cluster'] = mutation_df['cluster'].replace(cluster1, cluster2)
+            cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
+            num_cluster = len(cluster_cp)
+            if num_cluster <= 2:
+                break
+            cluster_pairs = list(itertools.combinations(cluster_cp.index, 2))
+            pairwise_differences = {}
+            for (cluster1, cluster2) in cluster_pairs:
+                diff = abs(cluster_cp[cluster1] - cluster_cp[cluster2])
+                pairwise_differences[(cluster1, cluster2)] = diff
+            min_diff = min(pairwise_differences.values())
+            
+            largest_mean_cluster = cluster_cp.idxmax()
+            clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
+    # Filter 4: deal with small subclones, i.e., subclonal clusters with a small number of mutations
+    # If a subclone has cluster_num < 0.05 * total mutaton
+    # Merge this subclone with its closest cluster
+    cluster_num = mutation_df['cluster'].value_counts()
+    while cluster_num.min() < 0.05 * n:
+        # Get the subclone with the smallest number of mutations
+        min_cluster = cluster_num.idxmin()
+        cluster_num = cluster_num.drop(min_cluster)
+        second_min_cluster = cluster_num.idxmin()
+
+        # Update the cluster assignment
+        mutation_df['cluster'] = mutation_df['cluster'].replace(min_cluster, second_min_cluster)
+        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
+        cluster_num = mutation_df['cluster'].value_counts()
+        num_cluster = len(cluster_cp)
+        largest_mean_cluster = cluster_cp.idxmax()
+        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
+        
+    cls  = mutation_df['cluster'].to_list()
+    mutation_df = pd.DataFrame(
+        {
+            'mutation': [i for i in range(n)],
+            'cluster': cls,
+        }
+    )
+    for j in range(m):
+        mutation_df[f'p_{j}'] = [p[i * m + j] for i in range(n)]
+        mutation_df[f'p_{j}'] = mutation_df.groupby('cluster')[f'p_{j}'].transform('mean')
+    p = np.reshape(mutation_df.iloc[:, 2:].values, [n * m])
+    
+    return [p, v, y, bic, loglik, gamma, dof, cls]
 
 
-
+def find_gamma(res, purity, n, m):
+    A_score_lst = []
+    for i in range(len(res)):
+        temp1 = sigmoid(res[i][0])
+        temp1 = np.reshape(temp1, (n, m))
+        temp2 = res[i][7]
+        df = pd.DataFrame(
+            {
+                'cluster': temp2
+            }
+        )
+        for j in range(m):
+            name = 'cp' + str(j)
+            df[name] = temp1[:, j]
+        
+        max_cp = 0
+        max_cp_ind = 0
+        for j in range(n):
+            cp = df.iloc[0, :][1: (m + 1)]
+            cp_value = np.matmul(np.transpose(cp), cp) 
+            if cp_value > max_cp:
+                max_cp_ind = j
+        max_cp = df.iloc[max_cp_ind, :][1: (m + 1)]
+        A_score = np.matmul(np.transpose(max_cp - purity), max_cp - purity) / np.matmul(np.transpose(purity), purity)
+        A_score_lst.append(np.sqrt(A_score))
+        
+    A_score_lst = np.array(A_score_lst)
+    if any((A_score_lst) < 0.05):
+        best_ind = np.max(np.where(A_score_lst < 0.05))
+        return(res[best_ind])
+    elif all((A_score_lst) > 0.01):
+        best_ind = np.argmin(A_score_lst)
+        return(res[best_ind])
+    else:
+        print("Cannot select lambda given current criterion.")
+        
+def find_gamma_single_region(res, purity, n, m = 1):
+    A_score_lst = []
+    for i in range(len(res)):
+        temp1 = sigmoid(res[i][0])
+        temp2 = res[i][7]
+        df = pd.DataFrame(
+            {
+                'cluster': temp2,
+                'cp' : temp1
+            }
+        )
+        
+        max_cp = max(df['cp'])
+        A_score = abs(max_cp - purity) / purity
+        A_score_lst.append(A_score)
+        
+    A_score_lst = np.array(A_score_lst)
+    if any((A_score_lst) < 0.05):
+        best_ind = np.max(np.where(A_score_lst < 0.05))
+        return(res[best_ind])
+    elif all((A_score_lst) > 0.01):
+        best_ind = np.argmin(A_score_lst)
+        return(res[best_ind])
+    else:
+        print("Cannot select lambda given current criterion.")
 
 
 

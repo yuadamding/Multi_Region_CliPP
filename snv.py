@@ -14,6 +14,9 @@ import torch
 import ray
 from scipy.optimize import fsolve
 import pandas as pd
+from scipy.special import logit
+from scipy.special import expit
+import scipy as sp
 
 def sigmoid(x):
   return 1 / (1 + np.exp(-x))
@@ -71,6 +74,11 @@ def matmul_by_torch(amat, bmat):
     res_mat = torch.matmul(amat, bmat)
     return res_mat.numpy()
 
+def mat_inverse_by_torch(mat):
+    mat = torch.from_numpy(mat)
+    res_mat = torch.inverse(mat)
+    return res_mat.numpy()
+
 def sum_by_torch(mat):
     mat = torch.from_numpy(mat)
     res_mat = torch.sum(mat)
@@ -85,6 +93,79 @@ def get_major_cn(df):
             index = i * m + j
             res[i, j] = df.iloc[index , :].major_cn
     return res
+
+def theta(w, c):
+    return (np.exp(w) * c) / (1 + np.exp(w))
+
+def linear_evaluate(x, a, b):
+    return a * x + b
+
+def linear_approximate(c):
+    w = [-4, -1.8, 1.8, 4]
+    actual_theta = theta(w, c)
+    
+    b_1 = (actual_theta[1] - actual_theta[0]) / (w[1] - w[0])
+    a_1 = actual_theta[0] - w[0] * b_1
+    b_2 = (actual_theta[2] - actual_theta[1]) / (w[2] - w[1])
+    a_2 = actual_theta[1] - w[1] * b_2
+    b_3 = (actual_theta[3] - actual_theta[2]) / (w[3] - w[2])
+    a_3 = actual_theta[2] - w[2] * b_3
+    
+    return {
+        'w_cut': [-1.8, 1.8],
+        'coef': [b_1, a_1, b_2, a_2, b_3, a_3],
+    }
+
+def get_linear_approximation(c_mat):
+    n = c_mat.shape[0]
+    m = c_mat.shape[1]
+    wcut = []
+    coef = []
+    for i in range(n):
+        for j in range(m):
+            wcut.append(linear_approximate(c_mat[i, j])['w_cut'])
+            coef.append(linear_approximate(c_mat[i, j])['coef'])
+    return wcut, coef
+
+def get_a_and_b_mat(p_old, total_read_mat, c_mat, read_mat, n, m, linearApprox):
+    p = p_old.reshape([n, m])
+    cp = sigmoid(p)
+    prop = cp * c_mat
+    a_mat = np.zeros([n, m])
+    b_mat = np.zeros([n, m])
+    for i in range(n):
+        for j in range(m):
+            # tag1, tag2, tag3, tag4 = 0, 0, 0, 0
+            # temp = linearApprox[(i, j)]
+            # w_cut = temp['w_cut']
+            
+            # if p[i, j] < w_cut[0]:
+            #     tag1 = 1
+            # else:
+            #     tag3 = 1
+            
+            # if p[i, j] > w_cut[0]:
+            #     tag2 = 1
+            # else:
+            #     tag4 = 1
+                
+            # coefs = temp['coef']
+            
+            if prop[i, j] >= 1:
+                prop[i, j] = 1 - 1e-10
+            
+            coef2 = c_mat[i, j] / 10
+            coef1 = c_mat[i, j] / 2 
+            
+            a_mat[i, j] = np.sqrt(total_read_mat[i, j]) * (coef1 - read_mat[i, j] / total_read_mat[i, j]) / np.sqrt((prop[i, j] * (1 - prop[i, j])))
+            b_mat[i, j] = np.sqrt(total_read_mat[i, j]) * (coef2 ) / np.sqrt((prop[i, j] * (1 - prop[i, j])))
+            
+            # a_mat[i, j] = np.sqrt(total_read_mat[i, j]) * (coefs[1] * tag1 + coefs[5] * tag2 + coefs[3] * tag3 * tag4 - read_mat[i, j] / total_read_mat[i, j]) / np.sqrt((prop[i, j] * (1 - prop[i, j])))
+            # b_mat[i, j] = np.sqrt(total_read_mat[i, j]) * (coefs[0] * tag1 + coefs[4] * tag2 + coefs[2] * tag3 * tag4 ) / np.sqrt((prop[i, j] * (1 - prop[i, j])))
+    
+    return a_mat, b_mat
+
+
 
 def get_b_mat(df):
     n = len(np.unique(df.mutation))
@@ -108,6 +189,16 @@ def get_b_mat(df):
                 / (total_read_mat[i, j] * purity_mat[i, j])
             temp = 1 if np.round(temp) == 0 else np.round(temp)
             res[i, j] = np.min([temp, major_cn_mat[i, j]])
+    return res
+
+def get_minor_cn_mat(df):
+    n = len(np.unique(df.mutation))
+    m = sum(df.mutation == np.unique(df.mutation)[0])
+    res = np.zeros([n, m])
+    for i in range(n):
+        for j in range(m):
+            index = i * m + j
+            res[i, j] = df.iloc[index , ].minor_cn
     return res
 
 def get_tumor_cn_mat(df):
@@ -161,7 +252,6 @@ def get_total_read_mat(df):
     return res
 
 def get_c_mat(df):
-
     tumor_cn_mat = get_tumor_cn_mat(df)
     normal_cn_mat = get_normal_cn_mat(df)
     purity_mat = get_purity_mat(df)
@@ -253,6 +343,18 @@ def update_v(index_v, pairs_mapping_inverse, p_vec, y, n, m, rho, omega, gamma):
         v = np.zeros(m)
     
     return v
+
+def update_v_SCAD(index_v, pairs_mapping_inverse, p_vec, y, n, m, rho, omega, gamma):
+    start_y = index_v * m
+    end_y = (index_v + 1) * m
+    l1, l2 = pairs_mapping_inverse[index_v]
+    a_mat = a_mat_generator(l1, l2, n, m)
+    temp = matmul_by_torch(a_mat, p_vec) - y[start_y: end_y] / rho
+    Lambda = gamma * omega
+    v = ST_vector(temp, Lambda / rho) * (np.linalg.norm(temp) <  Lambda / rho + Lambda) + \
+        ST_vector(temp, 3.7 * Lambda / (2.7 * rho)) / (1 - 1/ (2.7 * rho)) * (np.linalg.norm(temp) >=  Lambda / rho + Lambda) * (np.linalg.norm(temp) <=  Lambda * 3.7) + \
+            temp * (np.linalg.norm(temp) >  Lambda * 3.7)  
+    return v
     
 def update_y(y, v, index_v, pairs_mapping_inverse, p_vec, n, m, rho):
     
@@ -293,11 +395,66 @@ def dis_cluster(p, v, n, m, combinations, pairs_mapping, gamma):
             
     return dic
 
-@ray.remote(num_returns=1)
-def ADMM(df, rho, gamma, omega, n, m, max_iteration):
-    """
-    Alternating Direction Method of Multipliers (ADMM) for optimization.
+def ST(x, lam):
+	val = np.abs(x) - lam
+	val = np.sign(x)*(val > 0) * val
+	return val
+
+def ST_vector(x, lam):
+    temp = np.linalg.norm(x)
+    if temp > lam:
+        return (1 - lam / temp) * x
+    else:
+        return np.zeros(x.shape)
     
+def get_DELTA(No_mutation):
+    col_id = np.append(np.array(range(int(No_mutation * (No_mutation - 1) / 2))),
+                        np.array(range(int(No_mutation * (No_mutation - 1) / 2))))
+    row1 = np.zeros(int(No_mutation * (No_mutation - 1) / 2))
+    row2 = np.zeros(int(No_mutation * (No_mutation - 1) / 2))
+    starting = 0
+    for i in range(No_mutation - 1):
+        row1[starting:(starting + No_mutation - i - 1)] = i
+        row2[starting:(starting + No_mutation - i - 1)] = np.array(range(No_mutation))[(i + 1):]
+        starting = starting + No_mutation - i - 1
+    row_id = np.append(row1, row2)
+    vals = np.append(np.ones(int(No_mutation * (No_mutation - 1) / 2)),
+                        -np.ones(int(No_mutation * (No_mutation - 1) / 2)))
+    DELTA = sp.sparse.coo_matrix((vals, (row_id, col_id)),
+                                    shape=(No_mutation, int(No_mutation * (No_mutation - 1) / 2))).tocsr()
+    return DELTA
+
+def update_p(p, v, y, n, m, read_mat, total_read_mat, bb_mat, tumor_cn_mat, coef, wcut, combinations_2, pairs_mapping, rho, control_large):
+    No_mutation = n * m
+    theta_hat = np.reshape(read_mat / total_read_mat, [No_mutation])
+
+    theta = np.exp(p) * np.reshape(bb_mat, [No_mutation]) / (2 + np.exp(p) * np.reshape(tumor_cn_mat, [No_mutation]))
+
+    A = np.sqrt(np.reshape(total_read_mat, [No_mutation])) * (
+                (p <= wcut[:, 0]) * coef[:, 1] + (p >= wcut[:, 1]) * coef[:, 5] + (p > wcut[:, 0]) * (
+                    p < wcut[:, 1]) * coef[:, 3] - theta_hat) / np.sqrt(theta * (1 - theta))
+    B = np.sqrt(np.reshape(total_read_mat, [No_mutation])) * (
+                (p <= wcut[:, 0]) * coef[:, 0] + (p >= wcut[:, 1]) * coef[:, 4] + (p > wcut[:, 0]) * (
+                    p < wcut[:, 1]) * coef[:, 2]) / np.sqrt(theta * (1 - theta))
+
+    linear = rho * get_v_mat(v, y, rho, combinations_2, pairs_mapping, n, m) - (B * A)
+
+    Minv = 1 / (B ** 2 + No_mutation * rho)
+    Minv_diag = np.diag(Minv)
+
+    trace_g = -rho * np.sum(Minv)
+
+    Minv_outer = np.outer(Minv,Minv)
+    inverted = Minv_diag - (1 / (1 + trace_g) * (-rho) * Minv_outer)
+    p_new    = matmul_by_torch(inverted, linear.T)
+    p_new = p_new.reshape([No_mutation])
+    p_new[p_new > control_large] = control_large
+    p_new[p_new < -control_large] = -control_large
+    return p_new
+
+@ray.remote(num_returns=1)
+def CliPP2(df, rho, gamma, omega, n, m, max_iteration = 1000, precision=1e-2, control_large = 5):
+    """    
     Parameters:
     df: pd.DataFrame
         Input dataframe containing mutation data.
@@ -328,194 +485,171 @@ def ADMM(df, rho, gamma, omega, n, m, max_iteration):
     read_mat = get_read_mat(df)
     total_read_mat = get_total_read_mat(df)
     c_mat = get_c_mat(df)
-
+    bb_mat = get_b_mat(df)
+    tumor_cn_mat = get_tumor_cn_mat(df)
+    linearApprox = get_linear_approximation(c_mat)
     # Initialize variables
     #12/12/2024
-    # p = inverse_sigmoid(read_mat / (total_read_mat * c_mat))
-    p = np.zeros([n * m])
+    phi_hat = (read_mat / (total_read_mat * c_mat))
+    scale_parameter = np.max([1, np.max(phi_hat)])
+    phi_hat = phi_hat / scale_parameter
+    phi_hat[phi_hat > sigmoid(control_large)] = sigmoid(control_large)
+    phi_hat[phi_hat < sigmoid(-control_large)] = sigmoid(-control_large)
+    p = inverse_sigmoid(phi_hat)
+    p[p > control_large] = control_large
+    p[p < -control_large] = -control_large
     p = p.reshape([n * m])
     v = np.zeros([len(combinations_2) * m])
+    for i in range(len(combinations_2)):
+        pair = combinations_2[i]
+        index_v = pairs_mapping[pair]
+        start_v = index_v * m
+        end_v = (index_v + 1) * m
+        l1, l2 = pairs_mapping_inverse[index_v]
+        a_mat = a_mat_generator(l1, l2, n, m)
+        v[start_v: end_v] = matmul_by_torch(a_mat, p)
+        
     y = np.ones([len(combinations_2) * m])
     omega = np.ones([len(combinations_2)])
     k = 0
-    # obj_values = []
-    Flag = True
-    
-    # ADMM
-    while k < max_iteration and Flag:
-        k += 1
 
-        # Calculate current objective function
-        # curr_objective_function = get_objective_function(
-        #     p, v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m, gamma, omega
-        # )
-        # print(f"Iteration {k}, Objective Function: {curr_objective_function}")
-        # obj_values.append(curr_objective_function)
-        
-        fp = get_grad_of_objective_function(
-            v, y, rho, combinations_2, pairs_mapping, c_mat, read_mat, total_read_mat, n, m
-        )
-        p = fsolve(fp, p) 
-        
+    control_large = 5
+    wcut = np.array(linearApprox[0])
+    coef = np.array(linearApprox[1])
+    temp = 100
+    # ADMM
+    while k < max_iteration and precision < temp:
+        p = update_p(p, v, y, n, m, read_mat, total_read_mat, bb_mat, tumor_cn_mat, coef, wcut, combinations_2, pairs_mapping, rho, control_large)
+        temp = 0
         for i in range(len(combinations_2)):
             pair = combinations_2[i]
             index_v = pairs_mapping[pair]
             start_v = index_v * m
             end_v = (index_v + 1) * m
-            # temp = np.sqrt(matmul_by_torch(v[start_v: end_v].T, v[start_v: end_v]))
-            # temp = 1e-10 if temp == 0 else temp
-            # omega[i] = pow(temp, -0.2)
-            v[start_v: end_v] = update_v(index_v, pairs_mapping_inverse, p, y, n, m, rho, omega[i], gamma)                
+            v[start_v: end_v] = update_v_SCAD(index_v, pairs_mapping_inverse, p, y, n, m, rho, omega[i], gamma)                
             y[start_v: end_v] = update_y(y[start_v: end_v], v[start_v: end_v], i, pairs_mapping_inverse, p, n, m, rho)
-
-    cls = dis_cluster(p, v, n, m, combinations_2, pairs_mapping, gamma)
-    loglik = get_loglikelihood(np.reshape(p, [n, m]), c_mat, read_mat, total_read_mat)
-    bic = -2 * loglik
-    dof = len(np.unique(list(cls.values()))) * m
-    bic = bic + np.log(n) * len(np.unique(list(cls.values()))) * m
-    
-    # PostProcess
-    cp = sigmoid(p)
-    mutation_df = pd.DataFrame(
-        {
-            'mutation': [i for i in range(n)],
-            'cluster': [cls[i] for i in range(n)],
-            'cp_sqrt': [np.sqrt(matmul_by_torch(cp[i * m: (i + 1) * m].T, cp[i * m: (i + 1) * m])) for i in range(n)]
-        }
-    )
-    cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
-    num_cluster = len(cluster_cp)
-    largest_mean_cluster = cluster_cp.idxmax()
-    clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
-    # Filter 1: deal with superclusters
-    # If the max CP > 1 & the sample has > 2 clusters & the current clonal fraction <= 0.4:
-    # Merge the two clusters with the largest CP values
-    while cluster_cp.max() > 1 and num_cluster > 2 and clonal_fraction <= 0.4:
-        # Get the two clusters with the largest CP values
-        largest_cluster = cluster_cp.idxmax()
-        cluster_cp.drop(largest_cluster, inplace=True)
-        second_largest_cluster = cluster_cp.idxmax()
-
-        # Update the cluster assignment
-        mutation_df['cluster'] = mutation_df['cluster'].replace(largest_cluster, second_largest_cluster)
-        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
-        num_cluster = len(cluster_cp)
-        largest_mean_cluster = cluster_cp.idxmax()
-        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
-    # Filter 2: deal with small clones, i.e., the clonal cluster has a small number of mutations
-    # If the sample has > 2 clusters & the current clonal fraction <= 0.15:
-    # Merge the two clusters with the largest CP values
-    while num_cluster > 2 and clonal_fraction <= 0.15:
-        # Get the two clusters with the largest CP values
-        largest_cluster = cluster_cp.idxmax()
-        cluster_cp.drop(largest_cluster, inplace=True)
-        second_largest_cluster = cluster_cp.idxmax()
-
-        # Update the cluster assignment
-        mutation_df['cluster'] = mutation_df['cluster'].replace(largest_cluster, second_largest_cluster)
-        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
-        num_cluster = len(cluster_cp)
-        largest_mean_cluster = cluster_cp.idxmax()
-        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
-    # Filter 3: deal with adjacent clusters, i.e., cluster with similar CP values
-    # If the sample has > 2 clusters & if CP values between any two clusters < 0.1
-    # Merge those two clusters together
-    if num_cluster > 2:
-        cluster_pairs = list(itertools.combinations(cluster_cp.index, 2))
-        pairwise_differences = {}
-        for (cluster1, cluster2) in cluster_pairs:
-            diff = abs(cluster_cp[cluster1] - cluster_cp[cluster2])
-            pairwise_differences[(cluster1, cluster2)] = diff
-        min_diff = min(pairwise_differences.values())
-        while num_cluster > 2 and min_diff < 0.1:
-            # Get the two clusters with the smallest difference in CP values
-            keys_with_value = [key for key, value in pairwise_differences.items() if value == min_diff]
-            cluster1 = keys_with_value[0][0]
-            cluster2 = keys_with_value[0][1]
-
-            # Update the cluster assignment
-            mutation_df['cluster'] = mutation_df['cluster'].replace(cluster1, cluster2)
-            cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
-            num_cluster = len(cluster_cp)
-            if num_cluster <= 2:
-                break
-            cluster_pairs = list(itertools.combinations(cluster_cp.index, 2))
-            pairwise_differences = {}
-            for (cluster1, cluster2) in cluster_pairs:
-                diff = abs(cluster_cp[cluster1] - cluster_cp[cluster2])
-                pairwise_differences[(cluster1, cluster2)] = diff
-            min_diff = min(pairwise_differences.values())
+            l1, l2 = pairs_mapping_inverse[index_v]
+            a_mat = a_mat_generator(l1, l2, n, m)
+            temp = max(temp, np.linalg.norm(matmul_by_torch(a_mat, p) - v[start_v: end_v]))
+        rho = 1.02 * rho
+        k = k + 1
+        print('\r', k, ',', temp, end="")
             
-            largest_mean_cluster = cluster_cp.idxmax()
-            clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
-    # Filter 4: deal with small subclones, i.e., subclonal clusters with a small number of mutations
-    # If a subclone has cluster_num < 0.05 * total mutaton
-    # Merge this subclone with its closest cluster
-    cluster_num = mutation_df['cluster'].value_counts()
-    while cluster_num.min() < 0.05 * n:
-        # Get the subclone with the smallest number of mutations
-        min_cluster = cluster_num.idxmin()
-        cluster_num = cluster_num.drop(min_cluster)
-        second_min_cluster = cluster_num.idxmin()
+    diff = np.zeros((n, n))
+    class_label = -np.ones(n)
+    class_label[0] = 0
+    group_size = [1]
+    labl = 1
+    least_mut = 25
+    for i in range(1, n):
+        for j in range(i):
+            index_v = pairs_mapping[(j, i)]
+            start_v = index_v * m
+            end_v = (index_v + 1) * m
+            diff[j, i] = np.linalg.norm(v[start_v: end_v]) if np.linalg.norm(v[start_v: end_v]) > 0.05 else 0
+            diff[i, j] = diff[j, i]
+    for i in range(1, n):
+        for j in range(i):
+            if diff[j, i] == 0:
+                class_label[i] = class_label[j]
+                group_size[int(class_label[j])] += 1
+                break
+        if class_label[i] == -1:
+            class_label[i] = labl
+            labl += 1
+            group_size.append(1)
 
-        # Update the cluster assignment
-        mutation_df['cluster'] = mutation_df['cluster'].replace(min_cluster, second_min_cluster)
-        cluster_cp = mutation_df.groupby('cluster')['cp_sqrt'].mean()
-        cluster_num = mutation_df['cluster'].value_counts()
-        num_cluster = len(cluster_cp)
-        largest_mean_cluster = cluster_cp.idxmax()
-        clonal_fraction = mutation_df['cluster'].value_counts(normalize=True)[largest_mean_cluster]
-        
-    cls  = mutation_df['cluster'].to_list()
-    mutation_df = pd.DataFrame(
-        {
-            'mutation': [i for i in range(n)],
-            'cluster': cls,
-        }
-    )
-    for j in range(m):
-        mutation_df[f'p_{j}'] = [p[i * m + j] for i in range(n)]
-        mutation_df[f'p_{j}'] = mutation_df.groupby('cluster')[f'p_{j}'].transform('mean')
-    p = np.reshape(mutation_df.iloc[:, 2:].values, [n * m])
-    
-    return [p, v, y, bic, loglik, gamma, dof, cls]
+            
+    # quality control
+    tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
+    tmp_grp = np.where(group_size == tmp_size)
+    refine = False
+    if tmp_size < least_mut:
+        refine = True
+    while refine:
+        refine = False
+        tmp_col = np.where(class_label == tmp_grp[0][0])[0]
+        for i in range(len(tmp_col)):
+            if tmp_col[i] != 0 and tmp_col[i] != n - 1:
+                tmp_diff = np.abs(np.append(np.append(diff[0:tmp_col[i], tmp_col[i]].T.ravel(), 100),
+                                            diff[tmp_col[i], (tmp_col[i] + 1):n].ravel()))
+                tmp_diff[tmp_col] += 100
+                diff[0:tmp_col[i], tmp_col[i]] = tmp_diff[0:tmp_col[i]]
+                diff[tmp_col[i], (tmp_col[i] + 1):n] = tmp_diff[(tmp_col[i] + 1):n]
+            elif tmp_col[i] == 0:
+                tmp_diff = np.append(100, diff[0, 1:n])
+                tmp_diff[tmp_col] += 100
+                diff[0, 1:n] = tmp_diff[1:n]
+            else:
+                tmp_diff = np.append(diff[0:(n - 1), n - 1], 100)
+                tmp_diff[tmp_col] += 100
+                diff[0:(n - 1), n - 1] = tmp_diff[0:(n - 1)]
+            ind = tmp_diff.argmin()
+            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] -= 1
+            class_label[tmp_col[i]] = class_label[ind]
+            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] += 1
+        tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
+        tmp_grp = np.where(group_size == tmp_size)
+        refine = False
+        if tmp_size < least_mut:
+            refine = True
+    labels = np.unique(class_label)
+
+    phi_out = np.zeros((len(labels), m))
+    for i in range(len(labels)):
+        ind = np.where(class_label == labels[i])[0]
+        class_label[ind] = i
+        phi_out[i, :] = np.sum(phi_hat[ind,: ] * total_read_mat[ind,: ]) / np.sum(total_read_mat[ind, :])
+    if len(labels) > 1:
+        phi_norm = np.linalg.norm(phi_out, axis=1)
+        sort_phi = np.sort(phi_norm)
+        indices = [np.where(phi_norm == element)[0][0] for element in sort_phi]
+        phi_diff = sort_phi[1:] - sort_phi[:-1]
+        min_val = phi_diff.min()
+        min_ind = phi_diff.argmin()
+        while min_val < 0.01:
+            combine_ind = np.where(phi_out == sort_phi[indices[min_ind]])[0]
+            combine_to_ind = np.where(phi_out == sort_phi[indices[min_ind] + 1])[0]
+            class_label[class_label == combine_ind] = combine_to_ind
+            labels = np.unique(class_label)
+            phi_out = np.zeros(len(labels))
+            for i in range(len(labels)):
+                ind = np.where(class_label == labels[i])[0]
+                class_label[ind] = i
+                phi_out[i, :] = np.sum(phi_hat[ind, :] * total_read_mat[ind, :]) / np.sum(total_read_mat[ind, :])
+            if len(labels) == 1:
+                break
+            else:
+                phi_norm = np.linalg.norm(phi_out, axis=1)
+                sort_phi = np.sort(phi_norm)
+                indices = [np.where(phi_norm == element)[0][0] for element in sort_phi]
+                phi_diff = sort_phi[1:] - sort_phi[:-1]
+                min_val = phi_diff.min()
+                min_ind = phi_diff.argmin()
+    phi_res = np.zeros((n, m))
+    for lab in range(len(phi_out)):
+        phi_res[class_label == lab, :] = phi_out[lab, :]
+
+    purity = get_purity_mat(df)[0,0]
+    return {'phi': phi_res, 'label': class_label, 'purity' : purity}
 
 
-def find_gamma(res, purity, n, m):
-    A_score_lst = []
+def find_gamma(res):
+    A_score = []
     for i in range(len(res)):
-        temp1 = sigmoid(res[i][0])
-        temp1 = np.reshape(temp1, (n, m))
-        temp2 = res[i][7]
-        df = pd.DataFrame(
-            {
-                'cluster': temp2
-            }
-        )
-        for j in range(m):
-            name = 'cp' + str(j)
-            df[name] = temp1[:, j]
-        
-        max_cp = 0
-        max_cp_ind = 0
-        for j in range(n):
-            cp = df.iloc[0, :][1: (m + 1)]
-            cp_value = np.matmul(np.transpose(cp), cp) 
-            if cp_value > max_cp:
-                max_cp_ind = j
-        max_cp = df.iloc[max_cp_ind, :][1: (m + 1)]
-        A_score = np.matmul(np.transpose(max_cp - purity), max_cp - purity) / np.matmul(np.transpose(purity), purity)
-        A_score_lst.append(np.sqrt(A_score))
-        
-    A_score_lst = np.array(A_score_lst)
-    if any((A_score_lst) < 0.05):
-        best_ind = np.max(np.where(A_score_lst < 0.05))
-        return(res[best_ind])
-    elif all((A_score_lst) > 0.01):
-        best_ind = np.argmin(A_score_lst)
-        return(res[best_ind])
+        phi_res = res[i]['phi']
+        cp_norm = np.linalg.norm(phi_res, axis=1)
+        A_score.append((max(cp_norm) - res[i]['purity']) / res[i]['purity'])
+    A_score = np.array(A_score)
+    if np.any(A_score < 0.05):
+        ind1 = np.where(A_score < 0.05)
+        ind2 = np.argmin(A_score[ind1])
+    elif np.all(A_score > 0.01):
+        ind2 = np.argmax(A_score)
     else:
-        print("Cannot select lambda given current criterion.")
+        raise("Selection Failed")
+    
+    return ind2
         
 def find_gamma_single_region(res, purity, n, m = 1):
     A_score_lst = []
@@ -543,6 +677,13 @@ def find_gamma_single_region(res, purity, n, m = 1):
     else:
         print("Cannot select lambda given current criterion.")
 
+
+def drop_snv(df):
+    drop = []
+    # take only non-negative counts
+    read = get_read_mat(df)
+    total_read = get_total_read_mat(df)
+    
 
 
 

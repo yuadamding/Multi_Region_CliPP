@@ -206,7 +206,9 @@ def create_df_from_clipp(snvfile, cnafile, purityfile):
             purity = float(file.read().strip())
     n = len(dfsnv)
     df = pd.DataFrame({
+        'mutation_chrom' : [1 for i in range(len(dfsnv['position']))],
         'mutation': dfsnv['position'],
+        'position' : dfsnv['position'],
         'region' : 1,
         'ref_counts': dfsnv['ref_count'],
         'alt_counts': dfsnv['alt_count'],

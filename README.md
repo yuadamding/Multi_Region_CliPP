@@ -4,7 +4,7 @@
 **Date**: 10/29/2024  
 **Email**: [yding1995@gmail.com](mailto:yding1995@gmail.com), [yding4@mdanderson.org](mailto:yding4@mdanderson.org)
 
-This repository provides **multi-region CliPP (Clonal Proliferation and Prevalence)** analysis in Python. It uses augmented Lagrangian / ADMM methods to infer the subclonal structure of tumors by integrating mutation (SNV) counts, copy numbers, and purity across multiple samples or regions.
+This repository provides **multi-region CliPP (multi-region Clonal structure identification through penalizing pairwise differences)** analysis in Python. It uses augmented Lagrangian / ADMM methods to infer the subclonal structure of tumors by integrating mutation (SNV) counts, copy numbers, and purity across multiple samples or regions.
 
 ---
 

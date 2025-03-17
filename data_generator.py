@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from snv import * 
+from clipp2 import * 
 import matplotlib.pyplot as plt
 import seaborn as sns
 import itertools

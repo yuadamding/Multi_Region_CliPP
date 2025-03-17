@@ -1,4 +1,4 @@
-from snv import *
+from clipp2 import *
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -218,3 +218,58 @@ def create_df_from_clipp(snvfile, cnafile, purityfile):
         'tumour_purity': [purity for i in range(n)]
     })
     return df
+
+
+
+def find_gamma(res):
+    A_score = []
+    for i in range(len(res)):
+        phi_res = res[i]['phi']
+        cp_norm = np.linalg.norm(phi_res, axis=1)
+        A_score.append((max(cp_norm) - res[i]['purity']) / res[i]['purity'])
+    A_score = np.array(A_score)
+    if np.any(A_score < 0.05):
+        ind1 = np.where(A_score < 0.05)
+        ind2 = np.argmin(A_score[ind1])
+    elif np.all(A_score > 0.01):
+        ind2 = np.argmax(A_score)
+    else:
+        raise("Selection Failed")
+    
+    return ind2
+        
+def find_gamma_single_region(res, purity, n, m = 1):
+    A_score_lst = []
+    for i in range(len(res)):
+        temp1 = sigmoid(res[i][0])
+        temp2 = res[i][7]
+        df = pd.DataFrame(
+            {
+                'cluster': temp2,
+                'cp' : temp1
+            }
+        )
+        
+        max_cp = max(df['cp'])
+        A_score = abs(max_cp - purity) / purity
+        A_score_lst.append(A_score)
+        
+    A_score_lst = np.array(A_score_lst)
+    if any((A_score_lst) < 0.05):
+        best_ind = np.max(np.where(A_score_lst < 0.05))
+        return(res[best_ind])
+    elif all((A_score_lst) > 0.01):
+        best_ind = np.argmin(A_score_lst)
+        return(res[best_ind])
+    else:
+        print("Cannot select lambda given current criterion.")
+
+
+def drop_snv(df):
+    drop = []
+    # take only non-negative counts
+    read = get_read_mat(df)
+    total_read = get_total_read_mat(df)
+    
+    
+    

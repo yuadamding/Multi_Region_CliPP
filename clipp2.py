@@ -533,14 +533,14 @@ def CliPP2(df, rho, gamma, omega, n, m, max_iteration = 1000, precision=1e-2, co
             temp = max(temp, np.linalg.norm(matmul_by_torch(a_mat, p) - v[start_v: end_v]))
         rho = 1.02 * rho
         k = k + 1
-        print('\r', k, ',', temp, end="")
+        # print('\r', k, ',', temp, end="")
             
     diff = np.zeros((n, n))
     class_label = -np.ones(n)
     class_label[0] = 0
     group_size = [1]
     labl = 1
-    least_mut = 25
+    least_mut = np.ceil(0.05 * n)
     for i in range(1, n):
         for j in range(i):
             index_v = pairs_mapping[(j, i)]
@@ -548,6 +548,7 @@ def CliPP2(df, rho, gamma, omega, n, m, max_iteration = 1000, precision=1e-2, co
             end_v = (index_v + 1) * m
             diff[j, i] = np.linalg.norm(v[start_v: end_v]) if np.linalg.norm(v[start_v: end_v]) > 0.05 else 0
             diff[i, j] = diff[j, i]
+    
     for i in range(1, n):
         for j in range(i):
             if diff[j, i] == 0:
@@ -560,130 +561,588 @@ def CliPP2(df, rho, gamma, omega, n, m, max_iteration = 1000, precision=1e-2, co
             group_size.append(1)
 
             
-    # quality control
-    tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
-    tmp_grp = np.where(group_size == tmp_size)
+    # ----------------------------------------------------------
+    #  PART A: Refine small clusters by reassigning to closest
+    # ----------------------------------------------------------
+    tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])  
+    tmp_grp  = np.where(group_size == tmp_size)
+
     refine = False
     if tmp_size < least_mut:
         refine = True
+
     while refine:
         refine = False
-        tmp_col = np.where(class_label == tmp_grp[0][0])[0]
+        # Find which SNVs belong to the smallest cluster (tmp_grp[0][0])
+        smallest_cluster = tmp_grp[0][0]
+        tmp_col = np.where(class_label == smallest_cluster)[0]
+        
         for i in range(len(tmp_col)):
-            if tmp_col[i] != 0 and tmp_col[i] != n - 1:
-                tmp_diff = np.abs(np.append(np.append(diff[0:tmp_col[i], tmp_col[i]].T.ravel(), 100),
-                                            diff[tmp_col[i], (tmp_col[i] + 1):n].ravel()))
+            mut_idx = tmp_col[i]
+
+            # -- Gather distance from mut_idx to all other SNVs
+            if mut_idx != 0 and mut_idx != (n - 1):
+                tmp_diff = np.abs(
+                    np.concatenate((
+                        diff[0:mut_idx, mut_idx].ravel(),
+                        [100],  # placeholder for self
+                        diff[mut_idx, (mut_idx+1):n].ravel()
+                    ))
+                )
+                # Increase distances to members of tmp_col so we don't pick same cluster
                 tmp_diff[tmp_col] += 100
-                diff[0:tmp_col[i], tmp_col[i]] = tmp_diff[0:tmp_col[i]]
-                diff[tmp_col[i], (tmp_col[i] + 1):n] = tmp_diff[(tmp_col[i] + 1):n]
-            elif tmp_col[i] == 0:
+
+                # Put these adjusted distances back
+                diff[0:mut_idx, mut_idx] = tmp_diff[0:mut_idx]
+                diff[mut_idx, (mut_idx+1):n] = tmp_diff[(mut_idx+1):n]
+
+            elif mut_idx == 0:
+                # Edge case: first row
                 tmp_diff = np.append(100, diff[0, 1:n])
                 tmp_diff[tmp_col] += 100
                 diff[0, 1:n] = tmp_diff[1:n]
-            else:
-                tmp_diff = np.append(diff[0:(n - 1), n - 1], 100)
+
+            else: 
+                # Edge case: last row (mut_idx == n-1)
+                tmp_diff = np.append(diff[0:(n-1), n-1], 100)
                 tmp_diff[tmp_col] += 100
-                diff[0:(n - 1), n - 1] = tmp_diff[0:(n - 1)]
+                diff[0:(n-1), n-1] = tmp_diff[0:(n-1)]
+
+            # -- Pick cluster of the SNV that has the smallest distance in tmp_diff
             ind = tmp_diff.argmin()
-            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] -= 1
-            class_label[tmp_col[i]] = class_label[ind]
-            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] += 1
+
+            # Decrement the old cluster size
+            old_clust = int(class_label[mut_idx])
+            group_size[old_clust] -= 1
+
+            # Reassign to the cluster of 'ind'
+            new_clust = int(class_label[ind])
+            class_label[mut_idx] = new_clust
+            group_size[new_clust] += 1
+
+        # Check if there's still a too-small cluster
         tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
-        tmp_grp = np.where(group_size == tmp_size)
-        refine = False
-        if tmp_size < least_mut:
-            refine = True
+        tmp_grp  = np.where(group_size == tmp_size)
+        refine   = (tmp_size < least_mut)
+        
+    # ----------------------------------------------------------
+    #  PART B: Recompute cluster centroids
+    # ----------------------------------------------------------
     labels = np.unique(class_label)
 
-    phi_out = np.zeros((len(labels), m))
+    phi_out = np.zeros((len(labels), m))  # shape = (#clusters x m)
+
     for i in range(len(labels)):
-        ind = np.where(class_label == labels[i])[0]
+        cluster_id = labels[i]
+        ind = np.where(class_label == cluster_id)[0]
+
+        # Re-assign members to a contiguous labeling i (0..K-1)
         class_label[ind] = i
-        phi_out[i, :] = np.sum(phi_hat[ind,: ] * total_read_mat[ind,: ]) / np.sum(total_read_mat[ind, :])
+
+        # Weighted average (across multiple regions)
+        numerator   = np.sum(phi_hat[ind, :] * total_read_mat[ind, :], axis=0)
+        denominator = np.sum(total_read_mat[ind, :], axis=0)
+        phi_out[i, :] = numerator / denominator
+    
+    
+    # ----------------------------------------------------------
+    #  PART C: Merge clusters with small difference in *scalar*
+    # ----------------------------------------------------------
     if len(labels) > 1:
-        phi_norm = np.linalg.norm(phi_out, axis=1)
-        sort_phi = np.sort(phi_norm)
-        indices = [np.where(phi_norm == element)[0][0] for element in sort_phi]
-        phi_diff = sort_phi[1:] - sort_phi[:-1]
-        min_val = phi_diff.min()
-        min_ind = phi_diff.argmin()
-        while min_val < 0.01:
-            combine_ind = np.where(phi_out == sort_phi[indices[min_ind]])[0]
-            combine_to_ind = np.where(phi_out == sort_phi[indices[min_ind] + 1])[0]
-            class_label[class_label == combine_ind] = combine_to_ind
+        # We'll define a single scalar "phi_scalar[i]" for each cluster i,
+        # using the same coverage weighting but flattening *all* regions into 1 value.
+        # This matches the single-region logic, i.e. we get "one phi" per cluster.
+
+        def compute_cluster_scalar(phi_center):
+            # For example, you might just take the mean of the m-dimensional centroid:
+            # return np.mean(phi_center)
+            
+            # Or, to be consistent with single-region code's weighting logic,
+            # we can multiply by sum over all m's coverage. But typically the centroid
+            # is already coverage-weighted. So let's do a simple average:
+            return np.mean(phi_center)  
+
+        phi_scalar = np.array([compute_cluster_scalar(phi_out[i,:]) for i in range(len(labels))])
+
+        # Sort those scalars
+        sort_vals = np.sort(phi_scalar)
+        phi_diff = sort_vals[1:] - sort_vals[:-1]
+        min_val  = phi_diff.min()
+        min_ind  = phi_diff.argmin()
+
+        least_diff = 0.01
+        while min_val < least_diff:
+            # Identify the two clusters with the smallest difference
+            smaller_val = sort_vals[min_ind]
+            bigger_val  = sort_vals[min_ind+1]
+
+            # Which cluster(s) have these centroid values?
+            combine_ind    = np.where(phi_scalar == smaller_val)[0]
+            combine_to_ind = np.where(phi_scalar == bigger_val)[0]
+
+            # Reassign all members in 'combine_ind' to 'combine_to_ind' 
+            # (just pick the first if there's more than one)
+            c_from = combine_ind[0]
+            c_to   = combine_to_ind[0]
+            class_label[class_label == c_from] = c_to
+
+            # Recompute the unique label set
             labels = np.unique(class_label)
-            phi_out = np.zeros(len(labels))
-            for i in range(len(labels)):
-                ind = np.where(class_label == labels[i])[0]
-                class_label[ind] = i
-                phi_out[i, :] = np.sum(phi_hat[ind, :] * total_read_mat[ind, :]) / np.sum(total_read_mat[ind, :])
+
+            # Recompute phi_out for the new cluster set
+            phi_out = np.zeros((len(labels), m))
+            for idx, lbl in enumerate(labels):
+                cluster_members = np.where(class_label == lbl)[0]
+                # Re-map them to a contiguous cluster index 'idx'
+                class_label[cluster_members] = idx
+
+                numerator   = np.sum(phi_hat[cluster_members, :] * total_read_mat[cluster_members, :], axis=0)
+                denominator = np.sum(total_read_mat[cluster_members, :], axis=0)
+                phi_out[idx, :] = numerator / denominator
+
             if len(labels) == 1:
                 break
-            else:
-                phi_norm = np.linalg.norm(phi_out, axis=1)
-                sort_phi = np.sort(phi_norm)
-                indices = [np.where(phi_norm == element)[0][0] for element in sort_phi]
-                phi_diff = sort_phi[1:] - sort_phi[:-1]
-                min_val = phi_diff.min()
-                min_ind = phi_diff.argmin()
-    phi_res = np.zeros((n, m))
-    for lab in range(len(phi_out)):
-        phi_res[class_label == lab, :] = phi_out[lab, :]
 
+            # Recompute the scalar representation for each cluster
+            phi_scalar = np.array([compute_cluster_scalar(phi_out[i,:]) for i in range(len(labels))])
+
+            # Sort and repeat
+            sort_vals = np.sort(phi_scalar)
+            phi_diff  = sort_vals[1:] - sort_vals[:-1]
+            min_val   = phi_diff.min()
+            min_ind   = phi_diff.argmin()
+            
+            
+    phi_res = np.zeros((n, m))
+    for k in range(len(labels)):
+        # all SNVs that belong to cluster k
+        idx_k = np.where(class_label == k)[0]
+        phi_res[idx_k, :] = phi_out[k, :]
+    
     purity = get_purity_mat(df)[0,0]
     return {'phi': phi_res, 'label': class_label, 'purity' : purity}
 
 
-def find_gamma(res):
-    A_score = []
-    for i in range(len(res)):
-        phi_res = res[i]['phi']
-        cp_norm = np.linalg.norm(phi_res, axis=1)
-        A_score.append((max(cp_norm) - res[i]['purity']) / res[i]['purity'])
-    A_score = np.array(A_score)
-    if np.any(A_score < 0.05):
-        ind1 = np.where(A_score < 0.05)
-        ind2 = np.argmin(A_score[ind1])
-    elif np.all(A_score > 0.01):
-        ind2 = np.argmax(A_score)
-    else:
-        raise("Selection Failed")
+
+def preprocess_for_clipp2(snv_df, cn_df, purity, sample_id="unknown_sample",
+                          valid_snvs_threshold=0, diff_cutoff=0.1):
+    """
+    Python version of the 'clipp1'-style preprocessing for multi-region CliPP2.
+    Returns in-memory arrays/data for direct use by CliPP2.
     
-    return ind2
+    Parameters
+    ----------
+    snv_df : pd.DataFrame
+        Must have columns: ["chromosome_index", "position", "ref_count", "alt_count"].
+        One row per SNV (or per SNV-region if you are combining multiple regions).
+    cn_df : pd.DataFrame
+        Must have columns: [chr, start, end, minor_cn, major_cn, total_cn].
+        Typically one row per CN segment.
+    purity : float
+        Sample-level tumor purity.
+    sample_id : str
+        Used for logging or error messages.
+    valid_snvs_threshold : int
+        Minimum required SNV count after filtering. Raises ValueError if below this.
+    diff_cutoff : float
+        Maximum piecewise-linear approximation error allowed for \(\theta\).
+
+    Returns
+    -------
+    result_dict : dict
+        {
+            "snv_df_final": final filtered SNV DataFrame,
+            "minor_read": 1D array of alt counts,
+            "total_read": 1D array of alt+ref counts,
+            "minor_count": 1D array of final minor counts,
+            "total_count": 1D array of final total CN,
+            "coef": 2D array of piecewise-linear coefficients (one row per SNV),
+            "cutbeta": 2D array of the cut-points (one row per SNV),
+            "excluded_SNVs": list of strings describing dropped SNVs,
+            "purity": float
+        }
+    """
+    ############################
+    # Some small helper functions
+    ############################
+    def combine_reasons(chroms, positions, indices, reason):
+        return [
+            f"{chroms[i]}\t{positions[i]}\t{reason}"
+            for i in indices
+        ]
+    
+    def theta_func(w, bv, cv, cn, pur):
+        """
+        R-style: theta = (exp(w)*bv) / ((1+exp(w))*cn*(1-pur) + (1+exp(w))*cv*pur)
+        """
+        num = np.exp(w) * bv
+        den = ((1 + np.exp(w)) * cn * (1 - pur) + (1 + np.exp(w)) * cv * pur)
+        return num / den
+
+    def linear_evaluate(x, a, b):
+        return a*x + b
+
+    def linear_approximate(bv, cv, cn, pur, diag_plot=False):
+        """
+        Piecewise-linear approximation of theta(w), enumerating breakpoints.
+        """
+        w_vals = np.arange(-5, 5.01, 0.1)
+        actual = theta_func(w_vals, bv, cv, cn, pur)
         
-def find_gamma_single_region(res, purity, n, m = 1):
-    A_score_lst = []
-    for i in range(len(res)):
-        temp1 = sigmoid(res[i][0])
-        temp2 = res[i][7]
-        df = pd.DataFrame(
-            {
-                'cluster': temp2,
-                'cp' : temp1
-            }
+        best_diff = float('inf')
+        best_cuts = None
+        best_coef = None
+
+        for i in range(1, len(w_vals)-2):
+            for j in range(i+1, len(w_vals)-1):
+                w1, w2 = w_vals[i], w_vals[j]
+                # 3 segments: [0..i], [i+1..j], [j+1..end]
+                
+                # seg1 slope/intercept
+                b1 = (actual[i] - actual[0]) / (w1 - w_vals[0])
+                a1 = actual[0] - w_vals[0]*b1
+                # seg2 slope/intercept
+                b2 = (actual[j] - actual[i]) / (w2 - w1)
+                a2 = actual[i] - w1*b2
+                # seg3 slope/intercept
+                b3 = (actual[-1] - actual[j]) / (w_vals[-1] - w2)
+                a3 = actual[-1] - w_vals[-1]*b3
+
+                approx1 = linear_evaluate(w_vals[:i+1], b1, a1)
+                approx2 = linear_evaluate(w_vals[i+1:j+1], b2, a2)
+                approx3 = linear_evaluate(w_vals[j+1:], b3, a3)
+                approx_val = np.concatenate((approx1, approx2, approx3))
+                
+                diff = np.max(np.abs(actual - approx_val))
+                if diff < best_diff:
+                    best_diff = diff
+                    best_cuts = [w1, w2]
+                    best_coef = [b1, a1, b2, a2, b3, a3]
+
+        return {
+            "w_cut": best_cuts,
+            "diff": best_diff,
+            "coef": best_coef
+        }
+
+    ############################
+    # Start actual logic
+    ############################
+    dropped_reasons = []
+
+    # 1) Filter out invalid chromosome
+    mask_chr = snv_df["chromosome_index"].notna()
+    drop_inds = np.where(~mask_chr)[0]
+    if len(drop_inds) > 0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "Missing/invalid chromosome index"
         )
-        
-        max_cp = max(df['cp'])
-        A_score = abs(max_cp - purity) / purity
-        A_score_lst.append(A_score)
-        
-    A_score_lst = np.array(A_score_lst)
-    if any((A_score_lst) < 0.05):
-        best_ind = np.max(np.where(A_score_lst < 0.05))
-        return(res[best_ind])
-    elif all((A_score_lst) > 0.01):
-        best_ind = np.argmin(A_score_lst)
-        return(res[best_ind])
-    else:
-        print("Cannot select lambda given current criterion.")
+    snv_df = snv_df[mask_chr].reset_index(drop=True)
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} SNVs left after invalid chromosome removal; need >= {valid_snvs_threshold}.")
 
+    # 2) Negative or invalid read counts
+    alt_arr = snv_df["alt_count"].values
+    ref_arr = snv_df["ref_count"].values
+    tot_arr = alt_arr + ref_arr
+    mask_reads = (alt_arr >= 0) & (tot_arr >= 0)
+    drop_inds = np.where(~mask_reads)[0]
+    if len(drop_inds) > 0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "Negative or invalid read counts"
+        )
+    snv_df = snv_df[mask_reads].reset_index(drop=True)
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} with valid read counts; need >= {valid_snvs_threshold}.")
 
-def drop_snv(df):
-    drop = []
-    # take only non-negative counts
-    read = get_read_mat(df)
-    total_read = get_total_read_mat(df)
+    # Recalc
+    alt_arr = snv_df["alt_count"].values
+    ref_arr = snv_df["ref_count"].values
+    tot_arr = alt_arr + ref_arr
+
+    # 3) Match CN segment
+    cn_df_ = cn_df.dropna(subset=["minor_cn"]).reset_index(drop=True)
+    if len(cn_df_) == 0:
+        raise ValueError(f"{sample_id}: no valid CN rows after dropping NA minor_cn.")
+
+    def match_cn(schr, spos):
+        row_ids = cn_df_.index[
+            (cn_df_.iloc[:, 0] == schr) &
+            (cn_df_.iloc[:, 1] <= spos) &
+            (cn_df_.iloc[:, 2] >= spos)
+        ]
+        return row_ids[0] if len(row_ids)>0 else -1
+
+    matched_idx = [match_cn(snv_df.loc[i,"chromosome_index"], snv_df.loc[i,"position"])
+                   for i in range(len(snv_df))]
+    matched_idx = np.array(matched_idx)
+
+    mask_cn = (matched_idx >= 0)
+    drop_inds = np.where(~mask_cn)[0]
+    if len(drop_inds) > 0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "No matching CN segment"
+        )
+    snv_df = snv_df[mask_cn].reset_index(drop=True)
+    matched_idx = matched_idx[mask_cn]
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} with valid CN match; need >= {valid_snvs_threshold}.")
+
+    alt_arr = snv_df["alt_count"].values
+    ref_arr = snv_df["ref_count"].values
+    tot_arr = alt_arr + ref_arr
+
+    tot_cn   = cn_df_["total_cn"].values[matched_idx]
+    minor_cn = cn_df_["minor_cn"].values[matched_idx]
+    major_cn = cn_df_["major_cn"].values[matched_idx]
+    minor_lim = np.maximum(minor_cn, major_cn)
+
+    # 4) Multiplicity
+    mult = np.round(
+        (alt_arr / tot_arr / purity) * (tot_cn * purity + (1 - purity)*2)
+    ).astype(int)
+    # minor_count = np.minimum(mult, minor_lim)
+    minor_count = np.minimum(mult, minor_lim)
+    minor_count[minor_count == 0] = 1
+
+    mask_valid_mult = (minor_count>0) & (tot_cn>0)
+    drop_inds = np.where(~mask_valid_mult)[0]
+    if len(drop_inds) > 0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "Invalid multiplicities (<=0)"
+        )
+    snv_df = snv_df[mask_valid_mult].reset_index(drop=True)
+    minor_count = minor_count[mask_valid_mult]
+    tot_cn      = tot_cn[mask_valid_mult]
+
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} remain after multiplicity filtering; need >= {valid_snvs_threshold}.")
+
+    # 5) Piecewise approximation of theta
+    #    For each SNV => key (cn=2, total_cn, minor_count)
+    def combo_key(tcount, mcount):
+        return f"{tcount}_{mcount}"
+
+    cache_good = {}
+    cache_bad  = set()
+    sample_coef = np.zeros((len(snv_df),6))
+    sample_cut  = np.zeros((len(snv_df),2))
+    sample_diff = np.zeros(len(snv_df))
+
+    for i in range(len(snv_df)):
+        key = combo_key(tot_cn[i], minor_count[i])
+        if key in cache_good:
+            # load
+            sample_coef[i,:] = cache_good[key]["coef"]
+            sample_cut[i,:]  = cache_good[key]["cut"]
+            sample_diff[i]   = cache_good[key]["diff"]
+        elif key in cache_bad:
+            sample_diff[i] = 999
+        else:
+            # new approximation
+            res = linear_approximate(
+                bv = minor_count[i], 
+                cv = tot_cn[i],
+                cn = 2,
+                pur = purity
+            )
+            if res["diff"] <= diff_cutoff:
+                sample_coef[i,:] = res["coef"]
+                sample_cut[i,:]  = res["w_cut"]
+                sample_diff[i]   = res["diff"]
+                cache_good[key]  = {
+                    "coef": res["coef"],
+                    "cut":  res["w_cut"],
+                    "diff": res["diff"]
+                }
+            else:
+                sample_diff[i] = 999
+                cache_bad.add(key)
+
+    mask_approx = (sample_diff <= diff_cutoff)
+    drop_inds = np.where(~mask_approx)[0]
+    if len(drop_inds)>0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "Piecewise approx error>cutoff"
+        )
+    snv_df = snv_df[mask_approx].reset_index(drop=True)
+    sample_coef = sample_coef[mask_approx,:]
+    sample_cut  = sample_cut[mask_approx,:]
+    minor_count = minor_count[mask_approx]
+    tot_cn      = tot_cn[mask_approx]
+
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} remain after approx filter; need >= {valid_snvs_threshold}.")
+
+    # Recalc alt/ref after final drop
+    alt_arr = snv_df["alt_count"].values
+    ref_arr = snv_df["ref_count"].values
+    tot_arr = alt_arr + ref_arr
+
+    # 6) Evaluate phi
+    #   phi = 2 / ( minor_count/(alt_arr/tot_arr) - tot_cn + 2 )
+    fraction = alt_arr / tot_arr
+    fraction[fraction<=0] = 1e-12
+    phi = 2.0 / ((minor_count/fraction) - tot_cn + 2.0)
+
+    # keep phi <=1.5 and >0
+    mask_phi = (phi>0) & (phi<=1.5)
+    drop_inds = np.where(~mask_phi)[0]
+    if len(drop_inds)>0:
+        dropped_reasons += combine_reasons(
+            snv_df["chromosome_index"].values,
+            snv_df["position"].values,
+            drop_inds,
+            "Phi out of range (<=0 or>1.5)"
+        )
+    snv_df = snv_df[mask_phi].reset_index(drop=True)
+    sample_coef = sample_coef[mask_phi,:]
+    sample_cut  = sample_cut[mask_phi,:]
+    minor_count = minor_count[mask_phi]
+    tot_cn      = tot_cn[mask_phi]
+
+    if len(snv_df) < valid_snvs_threshold:
+        raise ValueError(f"{sample_id}: only {len(snv_df)} remain after phi filter; need >= {valid_snvs_threshold}.")
+
+    # Final results
+    result_dict = {
+        "snv_df_final": snv_df,
+        "minor_read": alt_arr[mask_phi],
+        "total_read": (alt_arr+ref_arr)[mask_phi],
+        "minor_count": minor_count,
+        "total_count": tot_cn,
+        "coef": sample_coef,
+        "cutbeta": sample_cut,
+        "excluded_SNVs": dropped_reasons,
+        "purity": purity
+    }
+    return result_dict
+
+def build_cliPP2_input(preproc_res):
+    """
+    Convert the dictionary from preprocess_for_clipp2(...) 
+    into a DataFrame that matches the columns needed by CliPP2.
     
+    For multi-region data, you would expand this by replicating each SNV 
+    across multiple 'regions' or 'samples', each with distinct alt_counts, etc.
+    
+    Returns
+    -------
+    df_for_cliPP2 : pd.DataFrame
+       Columns: [mutation, alt_counts, ref_counts, major_cn, minor_cn, normal_cn, tumour_purity]
+    n : int
+       Number of unique mutations
+    m : int
+       Number of samples (here 1 if single region)
+    """
+
+    snv_df_final = preproc_res["snv_df_final"]
+    alt_counts   = preproc_res["minor_read"]
+    tot_counts   = preproc_res["total_read"]  # alt+ref
+    minor_count  = preproc_res["minor_count"] # from CN step
+    total_count  = preproc_res["total_count"]
+    purity       = preproc_res["purity"]
+    
+    n_snv = len(snv_df_final)  # one row per SNV if single region
+    # For multi-region, you'd have n_snv * n_regions
+    # Here we do single region => m=1
+    df_for_cliPP2 = pd.DataFrame({
+        "mutation": np.arange(n_snv),  # 0..n_snv-1
+        "alt_counts": alt_counts,
+        "ref_counts": (tot_counts - alt_counts),
+        # We can define minor_cn, major_cn from (minor_count, total_count-minor_count)
+        "minor_cn": minor_count,
+        "major_cn": (total_count - minor_count),
+        "normal_cn": 2,            # typical assumption
+        "tumour_purity": purity    # same purity repeated
+    })
+    n = len(np.unique(df_for_cliPP2.mutation))
+    m = 1
+    return df_for_cliPP2, n, m
 
 
+def run_preproc_and_CliPP2(
+    snv_df, cn_df, purity, sample_id,
+    gamma_list,
+    rho = 0.8, omega = 1,
+    max_iteration=1000, precision=1e-2, control_large=5,
+    valid_snvs_threshold=0, diff_cutoff=0.1
+):
+    """
+    End-to-end function:
+     1) Preprocess SNVs
+     2) Build a DataFrame with columns required by CliPP2
+     3) Run CliPP2
+    
+    Parameters
+    ----------
+    snv_df, cn_df : pd.DataFrame
+        Raw data frames for SNV & CN input
+    purity : float
+        Sample-level purity
+    sample_id : str
+        For logging
+    rho, gamma, omega : float
+        ADMM parameters for CliPP2
+    max_iteration : int
+        ...
+    precision : float
+        ...
+    control_large : float
+        ...
+    valid_snvs_threshold : int
+        Minimally required SNV count post-filter
+    diff_cutoff : float
+        Piecewise approximation error cutoff
+    
+    Returns
+    -------
+    final_result : dict
+        Contains:
+            "phi": final cluster membership proportions
+            "label": cluster labels for each SNV
+            "purity": float
+            plus any other keys from the CliPP2 output
+    """
+    # 1) Preprocess
+    preproc_res = preprocess_for_clipp2(
+        snv_df, cn_df, purity, 
+        sample_id=sample_id,
+        valid_snvs_threshold=valid_snvs_threshold,
+        diff_cutoff=diff_cutoff
+    )
+    
+    # 2) Build input DataFrame for CliPP2
+    df_for_cliPP2, n, m = build_cliPP2_input(preproc_res)
+    
+    # 3) Invoke your existing CliPP2 code
+    #    Note that df_for_cliPP2 must have columns:
+    #    "mutation", "alt_counts", "ref_counts", "major_cn", "minor_cn", "normal_cn", "tumour_purity"
+    ray.shutdown()
+    ray.init()
+    clipp2_result = [CliPP2.remote(
+        df_for_cliPP2, rho, gamma_list[i], omega,
+        n, m,
+        max_iteration=max_iteration,
+        precision=precision,
+        control_large=control_large
+    ) for i in range(len(gamma_list))]
+    final_result = ray.get(clipp2_result)
+    ray.shutdown()
 
+    return final_result

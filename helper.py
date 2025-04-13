@@ -1,4 +1,4 @@
-from clipp2 import *
+from clipp2.clipp2 import *
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd

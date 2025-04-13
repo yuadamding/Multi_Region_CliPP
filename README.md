@@ -157,8 +157,9 @@ Below is a brief outline of the key functions in `scad_admm.py` (or whichever sc
 
 ## Contact
 
-- **[Your Name]**  
-- **[Your Email or Lab Website]**  
+- **Author: Yu Ding, Ph.D. / Wenyi Wang's Lab / MD Anderson Cancer Center**  
+- **Date: Oct 2024**
+- **Contact: yding4@mdanderson.org, yding1995@gmail.com**  
 - Contributions, bug reports, and feature requests are welcome.  
 
 Feel free to adapt this pipeline to your own subclone modeling or SCAD-penalized tasks.  

@@ -1,7 +1,6 @@
-
 # SCAD-Penalized ADMM for Multi-region Subclone Reconstruction
 
-This project implements a research-oriented pipeline to perform SCAD-penalized ADMM for subclone reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The code is structured to load data from multiple directories (each representing a “region” or “sample”), build logistic-scale parameters, and then run an ADMM loop with SCAD-based thresholding to cluster SNVs. Finally, it merges clusters if needed and outputs the final group assignments.
+This project implements a **CUDA-accelerated**, research-oriented pipeline to perform **SCAD-penalized ADMM** for subclone reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The newest version removes the need to build large dense matrices on CPU, instead using **iterative Conjugate Gradient** (CG) on the GPU to solve the ADMM subproblems efficiently. Additionally, we avoid Python `for` loops in the main numeric routine, relying on **vectorized** or **sparse** operations in PyTorch.
 
 ## Table of Contents
 1. [Introduction](#introduction)  
@@ -16,19 +15,30 @@ This project implements a research-oriented pipeline to perform SCAD-penalized A
 ## Introduction
 
 **Goal:**  
-Subclone reconstruction by grouping single nucleotide variants (SNVs) that share a similar frequency pattern, either in single-sample or multi-sample contexts. The penalty is a group-SCAD that encourages merging of pairwise differences in the logistic-scale parameters.
+Subclone reconstruction by grouping single nucleotide variants (SNVs) that share similar frequency patterns, in either a single-sample or multi-sample context. The penalty is a group-SCAD that encourages merging of pairwise differences in logistic-scale parameters.
 
-**Key Idea:**  
-1. **Logistic Transform**: We parametrize each SNV’s frequency in a logit scale.  
-2. **SCAD Penalty**: We apply a piecewise, nonconvex SCAD approach on the pairwise differences.  
-3. **CliPP2**: The Alternating Direction Method of Multipliers separates the likelihood (IRLS approximation) from the nonconvex penalty (for detailed formulations, you need to check **CliPP2.pdf**).  
+**Key Changes in the CUDA Implementation:**
+1. **GPU (CUDA) Acceleration**:  
+   We now rely on **PyTorch** tensors on the GPU. Instead of building a dense \(\mathbf{H}\) matrix \((B^T B + \alpha \Delta^T \Delta)\), we keep \(\Delta\) in **sparse** format and use **iterative Conjugate Gradient**.  
+
+2. **No Python `for` Loops in the Main Numeric Code**:  
+   - Pairwise differences are computed via sparse multiplication instead of explicit loops.  
+   - The ADMM iteration is controlled by a `while True:` block, which is typically acceptable.
+
+3. **Better Memory Usage for Large Problems**:  
+   Because we never build or factor a large dense \(\mathbf{H}\), the approach scales more easily to large \(\text{No\_mutation} \times M\).
 
 ---
 
 ## Directory Layout
 
 ```
-YOUR_PROJECT/
+MUITI_REGION_CLIPP/
+  ├── clipp2/
+  │   ├── core.py/
+  │   ├── core_cuda.py/
+  │   ├── preprocess.py/
+  │   └── ...
   ├── input_files/
   │   ├── regionA/
   │   │    ├── r.txt
@@ -40,128 +50,120 @@ YOUR_PROJECT/
   │   └── regionB/ 
   │        └── ...
   ├── preprocess_result/
-  ├── input_files/
-  │   ├── core.py
-  │   ├── preprocess.R
+  ├── scad_admm.py      (or clipp2/core.py, etc.)
   ├── README.md
   └── ...
 ```
 
 - **`input_files/`**: Example or raw input data with one subdirectory per region (`regionA`, `regionB`, etc.).  
 - **`preprocess_result/`**: (Optional) where you might store processed data.  
-- **`scad_admm.py`**: The main script containing your SCAD-based ADMM code.  
-- **`README.md`**: This documentation file.
+- **`scad_admm.py`**: The main script containing your SCAD-based ADMM code (or in some versions, `core.py`).  
+- **`README.md`**: This documentation file, which you are reading now.
 
 ---
 
 ## Dependencies
 
 - **Python 3.7+**
-- **NumPy** (for arrays, linear algebra)
-- **SciPy** (for sparse matrices, linear solvers)
-- **`scipy.sparse`** and **`scipy.sparse.linalg`** (for building/solving large, sparse systems)
-- **`subprocess`, `os`, etc.** for directory management (optional)
+- **NumPy**  
+- **SciPy**  
+- **PyTorch (>=1.10)** or ideally **PyTorch 2.0+** for advanced CUDA/sparse ops
+  - If you want to use the **built-in** `torch.sparse.linalg.cg`, you need **PyTorch ≥2.0** (experimental).
+  - Otherwise, a **manual CG** loop is provided (no Python `for` loops).
 
-Install packages:
-
+Install example:
 ```bash
-pip install numpy scipy
+pip install numpy scipy torch
 ```
+(Adjust for your CUDA toolkit version if needed.)
 
 ---
 
 ## Running the Code
 
-1. **Organize Data**:  
-   Make sure each “region” subdirectory has `r.txt, n.txt, minor.txt, total.txt, purity_ploidy.txt, coef.txt`. All regions must have the same number of SNVs (rows).
+1. **Organize Data**  
+   Each “region” subdirectory has `r.txt, n.txt, minor.txt, total.txt, purity_ploidy.txt, coef.txt`. All regions must have the same number of SNVs (rows).
 
-2. **Load and Prepare**:  
-   The function `group_all_regions_for_ADMM(root_dir)` reads from all subdirectories in `root_dir` and returns stacked arrays `(r, n, minor, total, purity, ploidy, coef_list, wcut)`.
+2. **Load and Prepare**  
+   The function `group_all_regions_for_ADMM(root_dir)` reads from all subdirectories in `root_dir` and returns stacked arrays `(r, n, minor, total, purity_list, coef_list, wcut)`.
 
-3. **Call the CliPP2**:  
-   In your script or an interactive session:
+3. **Run the ADMM**  
+   In your script or interactive session:
 
    ```python
-   from clipp2.core import *
+   from clipp2.core_cuda_ import *
 
-   # Step 1: gather data
    root_dir = "input_files"
-   (r, n, minor, total,
-    purity, ploidy,
-    coef_list,
-    wcut) = group_all_regions_for_ADMM(root_dir)
+   r, n, minor, total, purity, coef_list, wcut, drop_rows = group_all_regions_for_ADMM(root_dir)
 
-   # Step 2: run CliPP2
+   # Optionally pick a GPU device
    result = clipp2(
        r, n, minor, total,
-       purity, ploidy,
+       purity,
        coef_list,
        wcut=wcut,
-       alpha=1.0, gamma=3.7, rho=0.95, precision=0.01,
-       Run_limit=1000, control_large=5, Lambda=0.01,
-       post_th=0.05, least_diff=0.01
+       alpha=0.8, gamma=3.7, rho=1.02, precision=0.01,
+       Run_limit=1e4, control_large=5, Lambda=0.01,
+       post_th=0.05, least_diff=0.01,
+       device='cuda'    # GPU acceleration
    )
 
-   # result is a dict with final 'phi' and 'label'
-   print("Final logistic-scale subclone means:", result['phi'])
-   print("Cluster assignments:", result['label'])
+   print("Final subclone logistic-scale means (phi):", result['phi'])
+   print("Cluster assignments (label):", result['label'])
    ```
 
-4. **Results**:  
-   - `result['phi']`: The final logistic-scale estimates (or cluster means) for each SNV.  
-   - `result['label']`: Cluster labels for each SNV, indicating subclone membership.
+   - Set `device='cuda'` if you have a GPU and want to accelerate.  
+   - The code now uses **vectorized** sparse operations to compute pairwise differences.  
+   - The main linear system `(B^T B + alpha * Delta^T Delta)*w = ...` is solved **iteratively** with a **manual Conjugate Gradient** approach, **no** Python `for` loops.
+
+4. **Results**  
+   - **`result['phi']`**: The final logistic-scale estimates (subclone means) for each SNV in shape `(No_mutation, M)`.  
+   - **`result['label']`**: The integer cluster labels for each SNV, indicating subclone membership.
 
 ---
 
 ## Script Overview
 
-Below is a brief outline of the key functions in `scad_admm.py` (or whichever script name you use):
+Key functions in `scad_admm.py` (or `core3.py`):
 
-1. **`sort_by_2norm(x)`**  
-   Sorts the rows of `x` by L2 norm.
+1. **`group_all_regions_for_ADMM(root_dir)`**  
+   - Recursively finds subdirectories in `root_dir`.  
+   - Reads in `r.txt, n.txt, minor.txt, total.txt, purity_ploidy.txt, coef.txt`.  
+   - Returns arrays stacked as `(No_mutation, M)` plus a global `wcut` array.
 
-2. **`find_min_row_by_2norm(x)`**  
-   Identifies the row in `x` with the smallest L2 norm.
+2. **`build_DELTA_multiM(No_mutation, M)`**  
+   Creates a **sparse** operator \(\Delta\), so \(\Delta \cdot w\) yields all pairwise differences `(w_i - w_j)` for `(i<j)` across the M coordinates. We avoid explicit loops by building a COO structure.
 
-3. **`group_all_regions_for_ADMM(root_dir)`**  
-   - Searches each subdirectory in `root_dir`.  
-   - Reads `r.txt, n.txt, minor.txt, total.txt, purity_ploidy.txt, coef.txt`.  
-   - Stacks horizontally into shape `(No_mutation, M)`.  
-   - Returns `(r, n, minor, total, purity_list, ploidy_list, coef_list, wcut)`.
+3. **`clipp2(...)`**  
+   - **ADMM** iterations:
+     - IRLS expansions => build `A, B` => flatten => construct `(B^T B + alpha * Delta^T Delta)*w = linear`.
+     - **Sparse Iterative Solve**: A custom Conjugate Gradient routine on GPU, using `matvec_H` to apply `diag(B^2) + alpha(Delta^T Delta)` with no dense factorization or Python for loops.
+     - SCAD threshold => update `eta, tau`.
+     - Check residual => repeat until convergence.
+   - **Post-processing** merges small clusters or those with small 2-norm differences.
 
-4. **`soft_threshold_group(...)` & `SCAD_group_threshold(...)`**  
-   Core piecewise definitions for group SCAD thresholding in the ADMM updates.
+4. **No `for` loops** for pairwise expansions  
+   All pair expansions are done with **tensor indexing** and **sparse ops**.
 
-5. **`build_DELTA_multiM(No_mutation, M)`**  
-   Builds a sparse operator that, when multiplied by flattened `w`, yields pairwise differences `(w_i - w_j)` for every `(i<j)` and every coordinate in `[0..M-1]`.
-
-6. **`initialize_w(...)`**  
-   Creates an initial guess for logistic-scale parameters with copy-number/purity adjustments.
-
-7. **`reshape_eta_to_2D(...)`**  
-   Initializes `eta` by flattening the initial `w_new` and extracting upper-triangle differences.
-
-8. **`diff_mat(...)`**  
-   Builds a “signed” difference matrix for multi-sample data:  
-   - L2 norm across all M coordinates,  
-   - sign determined by the difference in the first coordinate.
-
-9. **`clipp2(...)`**  
-   - The main ADMM logic:
-     1. IRLS expansions => build `A_array, B_array` => flatten.  
-     2. Solve `(B^T B + alpha * DELTA^T DELTA)*w = linear`.  
-     3. SCAD threshold => update `eta`.  
-     4. Repeat until residual < `precision` or `Run_limit`.  
-   - Post-processing: merges clusters if 2-norm difference < `least_diff`.  
-   - Returns `{'phi': phi_res, 'label': class_label}`.
+5. **Manual CG**  
+   - The code shows how to do a “loop-free” approach or a minimal `while True:` approach for iterative solving.  
+   - If you prefer the built-in `torch.sparse.linalg.cg` (PyTorch 2.0+), you can swap in that call.
 
 ---
 
 ## Contact
 
-- **Author: Yu Ding, Ph.D. / Wenyi Wang's Lab / MD Anderson Cancer Center**  
-- **Date: Oct 2024**
-- **Contact: yding4@mdanderson.org, yding1995@gmail.com**  
-- Contributions, bug reports, and feature requests are welcome.  
+- **Author**: Yu Ding, Ph.D. / Wenyi Wang’s Lab / MD Anderson Cancer Center  
+- **Date**: October 2024  
+- **Email**: yding4@mdanderson.org, yding1995@gmail.com
 
-Feel free to adapt this pipeline to your own subclone modeling or SCAD-penalized tasks.  
+For questions, bug reports, or contributions, please reach out or open an issue. Feel free to adapt this pipeline to your subclone modeling or SCAD-penalized tasks!
+```
+
+---
+
+### Key Points
+
+1. **`device='cuda'`** argument in `clipp2(...)` ensures GPU acceleration.  
+2. **Iterative CG** means no large dense matrix is ever built, improving memory usage and speed.  
+3. **No Python `for` loops** for pairwise expansions—PyTorch sparse operators handle them.

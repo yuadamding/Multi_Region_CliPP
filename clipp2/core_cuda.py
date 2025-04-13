@@ -21,77 +21,83 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import spsolve
 from scipy.special import expit, logit
+import torch
 
-def scad_threshold_update(
-    w_new,             # shape (N, M)
-    tau_old,           # shape (No_pairs, M)
-    DELTA,             # shape (No_pairs*M, N*M)
+def scad_threshold_update_torch(
+    w_new_t,        # shape (No_mutation, M)
+    tau_old_t,      # shape (No_pairs, M)
+    Delta_coo,      # shape ((No_pairs*M), (No_mutation*M)), sparse
     alpha, Lambda, gamma
 ):
     """
-    Vectorized update of eta, tau in the group-SCAD ADMM steps.
-
-    Returns
-    -------
-    eta_new : (No_pairs, M)
-    tau_new : (No_pairs, M)
+    GPU-based SCAD threshold update using PyTorch, fully vectorized.
+    No Python for-loops. 
     """
+    # ------------------------------------------------------------------
+    # 1) Compute all pairwise differences D_w = w_i - w_j
+    #    Because Delta_coo * w_new_flat = [ (w[i]-w[j])_m ] stacked
+    # ------------------------------------------------------------------
+    w_new_flat = w_new_t.reshape(-1)  # shape => (No_mutation*M,)
+    # shape => ((No_pairs*M),)
+    D_w_flat = torch.sparse.mm(Delta_coo, w_new_flat.unsqueeze(1)).squeeze(1)
+    # Reshape to (No_pairs, M)
+    # We know the first dimension is No_pairs*M
+    # So we can do a simple view if we track them carefully:
+    # D_w_flat[ k*M : k*M+M ] are pair k, across M
+    # => .view(No_pairs, M)
+    # But we must ensure correct ordering from the way we built Delta_coo.
+    D_w = D_w_flat.view(tau_old_t.shape[0], tau_old_t.shape[1])  # shape => (No_pairs, M)
 
-    # 1) All differences D_w = (w_i - w_j), shape (No_pairs, M)
-    w_new_flat = w_new.ravel()                      # (N*M,)
-    D_w_flat   = DELTA.dot(w_new_flat)              # (No_pairs*M,)
-    D_w        = D_w_flat.reshape((-1, w_new.shape[1]))  # (No_pairs, M)
-
-    # 2) Compute delt_ij = D_w - (1/alpha)*tau_old
-    delt = D_w - (1.0/alpha)*tau_old
+    # 2) delt_ij = D_w - (1/alpha)*tau_old_t
+    delt_t = D_w - (1.0/alpha)*tau_old_t
 
     # 3) Norm of each row
-    delt_norm = np.linalg.norm(delt, axis=1)  # (No_pairs,)
+    delt_norm_t = torch.norm(delt_t, dim=1)  # shape (No_pairs,)
 
-    # 4) Piecewise group SCAD
     lam_over_alpha = Lambda / alpha
     gamma_lam      = gamma  * Lambda
 
-    mask1 = (delt_norm <= lam_over_alpha)
-    mask2 = (delt_norm > lam_over_alpha) & (delt_norm <= Lambda + lam_over_alpha)
-    mask3 = (delt_norm > (Lambda + lam_over_alpha)) & (delt_norm <= gamma_lam)
-    mask4 = (delt_norm >  gamma_lam)
+    # 4) Piecewise region masks
+    mask1 = (delt_norm_t <= lam_over_alpha)
+    mask2 = (delt_norm_t > lam_over_alpha) & (delt_norm_t <= (Lambda + lam_over_alpha))
+    mask3 = (delt_norm_t > (Lambda + lam_over_alpha)) & (delt_norm_t <= gamma_lam)
+    mask4 = (delt_norm_t > gamma_lam)
 
-    eta_new = np.zeros_like(delt)
+    # 5) Create eta_new in one shot
+    eta_new_t = torch.zeros_like(delt_t)
 
     # region 1 => zero
-    eta_new[mask1] = 0.0
+    eta_new_t[mask1] = 0.0
 
     # region 2 => group soft threshold
-    i2     = np.where(mask2)[0]
-    scale2 = 1.0 - (lam_over_alpha / delt_norm[i2])
-    scale2 = np.clip(scale2, 0.0, None)  # no negatives
-    eta_new[i2] = scale2[:,None]*delt[i2]
+    i2 = mask2.nonzero(as_tuple=True)[0]  # shape (#region2,)
+    scale2 = 1.0 - (lam_over_alpha / delt_norm_t[i2])
+    scale2 = torch.clamp(scale2, min=0.0)
+    eta_new_t[i2] = scale2.unsqueeze(1) * delt_t[i2]
 
     # region 3 => SCAD mid region
-    i3 = np.where(mask3)[0]
+    i3 = mask3.nonzero(as_tuple=True)[0]  # shape (#region3,)
     T_mid  = gamma_lam / ((gamma - 1)*alpha)
     denom2 = 1.0 - 1.0/((gamma - 1)*alpha)
     if denom2 <= 0:
         # fallback => no shrink
-        eta_new[i3] = delt[i3]
+        eta_new_t[i3] = delt_t[i3]
     else:
         scale_factor_ = 1.0 / denom2
-        scale3 = 1.0 - (T_mid / delt_norm[i3])
-        scale3 = np.clip(scale3, 0.0, None)
-        st_vec = scale3[:,None]*delt[i3]
-        eta_new[i3] = scale_factor_*st_vec
+        scale3 = 1.0 - (T_mid / delt_norm_t[i3])
+        scale3 = torch.clamp(scale3, min=0.0)
+        st_vec = scale3.unsqueeze(1) * delt_t[i3]
+        eta_new_t[i3] = scale_factor_ * st_vec
 
     # region 4 => no shrink
-    eta_new[mask4] = delt[mask4]
+    i4 = mask4.nonzero(as_tuple=True)[0]
+    eta_new_t[i4] = delt_t[i4]
 
-    # 5) Now update tau in bulk
-    diff_2D = D_w - eta_new
-    tau_new = tau_old - alpha*diff_2D
+    # 6) Update tau
+    diff_2D_t = D_w - eta_new_t
+    tau_new_t = tau_old_t - alpha*diff_2D_t
 
-    return eta_new, tau_new
-
-
+    return eta_new_t, tau_new_t
 
 def sort_by_2norm(x):
     """
@@ -614,6 +620,17 @@ def diff_mat(w_new):
     diff_signed[j_idx, i_idx] = -diff_signed[i_idx, j_idx]
     return(diff_signed)
 
+
+def matvec_H(x, B_sq, DTD, alpha):
+    # x shape => (NM,)
+    # 1) Multiply by diagonal B^2
+    out = B_sq * x
+    # 2) Multiply by alpha*(Delta^T Delta)
+    #    DTD is a sparse matrix => shape (NM, NM)
+    out += alpha * torch.sparse.mm(DTD, x.unsqueeze(-1)).squeeze(-1)
+    return out
+
+
 def clipp2(
     r, n, minor, total,
     purity,
@@ -627,7 +644,8 @@ def clipp2(
     control_large=5,
     Lambda=0.01,
     post_th=0.05,
-    least_diff=0.01
+    least_diff=0.01,
+    device='cuda'
 ):
     """
     Perform the ADMM + SCAD approach for multi-sample subclone reconstruction,
@@ -680,193 +698,242 @@ def clipp2(
     minor = ensure_2D_and_no_zeros(minor)
     total = ensure_2D_and_no_zeros(total)
 
-    No_mutation, M = r.shape
+    def to_torch_gpu(arr):
+        return torch.as_tensor(arr, dtype=torch.float32, device=device)
 
-    # -------- 2) Broadcast purity => shape (No_mutation, M).  Fix ploidy=2.0. --------
-    if np.isscalar(purity):
-        purity_arr = np.full((No_mutation, M), float(purity))
+    r_t     = to_torch_gpu(r)
+    n_t     = to_torch_gpu(n)
+    minor_t = to_torch_gpu(minor)
+    total_t = to_torch_gpu(total)
+
+    # Build c_all => shape(No_mutation, M, 6)
+    c_stack = []
+    for c in coef_list:
+        # Each c => shape(No_mutation, 6)
+        c_stack.append(to_torch_gpu(c))
+    c_all_t = torch.stack(c_stack, dim=1)  # shape => (No_mutation, M, 6)
+
+    No_mutation, M = r_t.shape
+
+    # 1) Prepare purity => shape (No_mutation, M)
+    if isinstance(purity, (float, int)):
+        purity_t = torch.full((No_mutation, M), float(purity), device=device)
     else:
-        purity = np.asarray(purity, dtype=float)
-        if purity.ndim == 1 and purity.shape[0] == M:
-            purity_arr = np.broadcast_to(purity.reshape(1,M), (No_mutation, M))
-        else:
-            raise ValueError(f"purity must be scalar or shape (M,). Got shape {purity.shape}.")
-    ploidy_arr = np.full((No_mutation, M), 2.0)
+        purity_vec = to_torch_gpu(purity)  # shape (M,)
+        purity_t   = purity_vec.unsqueeze(0).expand(No_mutation, -1)
 
-    # -------- 3) Compute w_new, using single-sample style bounding logic --------
-    # fraction = (r + eps)/(n + 2eps), then scale by copy/purity factor, clip in [expit(-cl), expit(cl)]
-    fraction = (r ) / (n )
-    phi_hat  = fraction * ( (ploidy_arr - purity_arr*ploidy_arr) + (purity_arr*total) ) / minor
+    ploidy_t = torch.full((No_mutation, M), 2.0, device=device)
 
-    scale_parameter = max(1.0, np.max(phi_hat))
-    phi_new = phi_hat / scale_parameter
+    # 2) Initialize w_new from logistic bounding
+    fraction_t = r_t / (n_t + 1e-12)
+    phi_hat_t  = fraction_t * ((ploidy_t - purity_t*ploidy_t) + (purity_t*total_t)) / (minor_t + 1e-12)
 
-    low_b = expit(-control_large)
-    up_b  = expit(control_large)
-    phi_new = np.clip(phi_new, low_b, up_b)  # shape (No_mutation, M)
+    scale_parameter = torch.clamp(torch.max(phi_hat_t), min=1.0)
+    phi_new_t = phi_hat_t / scale_parameter
 
-    w_init = logit(phi_new)
-    w_init = np.clip(w_init, -control_large, control_large)
-    w_new  = w_init.copy()
+    low_b = torch.sigmoid(torch.tensor(-control_large, device=device))
+    up_b  = torch.sigmoid(torch.tensor( control_large, device=device))
+    phi_new_t = torch.clamp(phi_new_t, low_b, up_b)
 
-    # -------- 4) Build the DELTA operator with NO Python for-loops --------
-    # We want pairs (i<j).  We'll use triu_indices:
-    i_idx, j_idx = np.triu_indices(No_mutation, k=1)     # shape=(No_pairs,)
-    No_pairs = i_idx.size                                # # of i<j pairs
+    w_init_t = torch.log(phi_new_t) - torch.log(1 - phi_new_t + 1e-12)
+    w_init_t = torch.clamp(w_init_t, -control_large, control_large)
+    w_new_t  = w_init_t.clone()
 
-    # For each pair k, we have M rows in the final big matrix.
-    # row indices => (k*M + m) for m in [0..M-1].
-    # We'll build them in bulk.
-    row_block = np.arange(No_pairs)[:,None]*M + np.arange(M)   # shape=(No_pairs, M)
-    # We want 2 columns per row block => one for +1 at col i, one for -1 at col j,
-    # so the total rows = 2 * (No_pairs * M).  But the row index is the same for i and j.
-    # => We'll horizontally stack row_block with itself, then flatten.
-    row_block_2 = np.hstack((row_block, row_block))            # shape=(No_pairs, 2*M)
-    row_idx = row_block_2.ravel()                              # shape=(2*M*No_pairs,)
+    # 3) Build the sparse DELTA operator (COO)
+    #    For i<j pairs, each row in the big (No_pairs*M) row-block has +1 at (i,m) and -1 at (j,m).
+    #    We'll do this *without* for-loops using advanced indexing.
+    i_idx_np, j_idx_np = torch.triu_indices(No_mutation, No_mutation, offset=1)
+    # Move them to 'device'
+    i_idx_np = i_idx_np.to(device)
+    j_idx_np = j_idx_np.to(device)
 
-    # For column indices => i_idx[k], j_idx[k] => i_idx[k]*M + m
-    col_block_i = i_idx[:,None]*M + np.arange(M)   # shape=(No_pairs, M)
-    col_block_j = j_idx[:,None]*M + np.arange(M)   # shape=(No_pairs, M)
-    col_block_2 = np.hstack((col_block_i, col_block_j))  # shape=(No_pairs, 2*M)
-    col_idx = col_block_2.ravel()
+    No_pairs = i_idx_np.size(0)
 
-    # For the data => +1 for i, -1 for j
-    plus_ones  = np.ones_like(col_block_i)
-    minus_ones = -np.ones_like(col_block_j)
-    data_block = np.hstack((plus_ones, minus_ones))    # shape=(No_pairs, 2*M)
-    vals = data_block.ravel()                          # shape=(2*M*No_pairs,)
+    # Then proceed to build row/col indices for the sparse Delta operator:
+    pair_range = torch.arange(No_pairs, device=device)
+    m_range    = torch.arange(M, device=device)
 
-    total_rows = No_pairs * M
-    total_cols = No_mutation * M
-    DELTA = sp.coo_matrix((vals, (row_idx, col_idx)),
-                          shape=(total_rows, total_cols)).tocsr()
+    # row_idx for the +1 block => shape (No_pairs, M)
+    row_plus_2D = pair_range.unsqueeze(1)*M + m_range  # broadcast
+    # row_idx for the -1 block => same row => row_plus_2D
+    row_combined = torch.cat([row_plus_2D, row_plus_2D], dim=1)  # shape => (No_pairs, 2*M)
 
-    # -------- 5) Initialize eta, tau, residual, iteration k with NO loops --------
-    # We can get the initial pairwise differences: w_new[i_idx,:] - w_new[j_idx,:]
-    # shape => (No_pairs, M)
-    eta_new = w_new[i_idx, :] - w_new[j_idx, :]
+    # col_idx for +1 => i_idx_np*M + m
+    col_plus_2D = i_idx_np.unsqueeze(1)*M + m_range
+    # col_idx for -1 => j_idx_np*M + m
+    col_minus_2D = j_idx_np.unsqueeze(1)*M + m_range
+    col_combined = torch.cat([col_plus_2D, col_minus_2D], dim=1)
 
-    # tau_new => just ones
-    tau_new = np.ones_like(eta_new)
+    row_idx = row_combined.reshape(-1)
+    col_idx = col_combined.reshape(-1)
 
-    # Large initial residual
+    # data => +1 then -1
+    plus_block  = torch.ones_like(col_plus_2D, dtype=torch.float32)
+    minus_block = -torch.ones_like(col_minus_2D, dtype=torch.float32)
+    vals_2D = torch.cat([plus_block, minus_block], dim=1)
+    vals = vals_2D.reshape(-1)
+
+    total_rows = No_pairs*M
+    total_cols = No_mutation*M
+    Delta_coo = torch.sparse_coo_tensor(
+        indices=torch.stack([row_idx, col_idx], dim=0),
+        values=vals,
+        size=(total_rows, total_cols),
+        device=device
+    ).coalesce()
+
+    # 4) Initialize eta, tau
+    #    We can get the difference directly: D_w => shape(No_pairs, M) = w[i_idx]-w[j_idx]
+    #    We'll re-use the code from scad_threshold_update for consistency.
+    #    For initialization, just do:
+    eta_new_t = (w_new_t[i_idx_np, :] - w_new_t[j_idx_np, :])
+    tau_new_t = torch.ones_like(eta_new_t, device=device)
+
+    # 5) ADMM iteration
     residual = 1e6
-    k = 0
+    k_iter   = 0
 
-    c_all = np.stack(coef_list, axis=1)
-    i_idx, j_idx = np.triu_indices(No_mutation, k=1)  
-    No_pairs = i_idx.size
-    # 6) ADMM loop
-    while True:
-            
-        if k > 10 and (k > Run_limit or residual < precision):
-            break
-        elif k > 10 and np.isnan(residual):
-            break
-        
-        k += 1
-        w_old  = w_new.copy()
-        eta_old = eta_new.copy()
-        tau_old = tau_new.copy()
+    low_cut, up_cut = wcut
 
-        # =========================
-        # (A) IRLS expansions in bulk
-        # =========================
+    while k_iter < Run_limit and residual > precision:
 
-        # 1) theta = (e^w * minor) / (2 + e^w * total)
-        expW   = np.exp(w_old)
-        denom_ = 2.0 + (expW*total)
-        # avoid zero denominators
-        denom_ = np.where(denom_==0, 1e-12, denom_)
-        theta  = (expW*minor)/denom_    # shape => (No_mutation, M)
+        # Might also stop if we get nan
+        # (we do a small check below)
+        k_iter += 1
 
-        # 2) Build partA, partB fully vectorized
-        #    shape => (No_mutation, M)
-        #    using c_all => shape(No_mutation, M, 6)
-        low_cut, up_cut = wcut
-        maskLow =  (w_old <= low_cut)
-        maskUp  =  (w_old >= up_cut)
-        maskMid = ~(maskLow | maskUp)
+        w_old_t  = w_new_t.clone()
+        eta_old_t = eta_new_t.clone()
+        tau_old_t = tau_new_t.clone()
 
-        # partA_full = (branch on c_all[...,1], c_all[...,3], c_all[...,5]) 
-        #              minus (r/n)
-        partA_full = (
-            (maskLow * c_all[...,1])
-          + (maskUp  * c_all[...,5])
-          + (maskMid * c_all[...,3])
-        ) - (r / n)
+        # =========== (A) IRLS expansions (vectorized) ===========
+        expW_t = torch.exp(w_old_t)
+        denom_ = 2.0 + expW_t*total_t
+        denom_ = torch.clamp(denom_, min=1e-12)
+        theta_t = (expW_t * minor_t)/denom_
 
-        # partB_full similarly from c_all[...,0], c_all[...,2], c_all[...,4]
-        partB_full = (
-            (maskLow * c_all[...,0])
-          + (maskUp  * c_all[...,4])
-          + (maskMid * c_all[...,2])
+        maskLow_t = (w_old_t <= low_cut)
+        maskUp_t  = (w_old_t >= up_cut)
+        maskMid_t = ~(maskLow_t | maskUp_t)
+
+        # c_all_t => shape(No_mutation, M, 6)
+        partA_full_t = (
+            maskLow_t * c_all_t[...,1]
+          + maskUp_t  * c_all_t[...,5]
+          + maskMid_t * c_all_t[...,3]
+        ) - (r_t/(n_t+1e-12))
+
+        partB_full_t = (
+            maskLow_t * c_all_t[...,0]
+          + maskUp_t  * c_all_t[...,4]
+          + maskMid_t * c_all_t[...,2]
         )
 
-        # 3) A_array, B_array => multiply by sqrt(n) / sqrt(theta*(1-theta))
-        sqrt_n = np.sqrt(n)
-        # avoid zero => add small epsilon
-        denom2 = np.sqrt(theta*(1 - theta) + 1e-12)
+        sqrt_n_t = torch.sqrt(n_t)
+        denom2_t = torch.sqrt(theta_t*(1-theta_t) + 1e-12)
 
-        A_array = (sqrt_n * partA_full) / denom2
-        B_array = (sqrt_n * partB_full) / denom2
+        A_array_t = (sqrt_n_t * partA_full_t)/denom2_t
+        B_array_t = (sqrt_n_t * partB_full_t)/denom2_t
 
-        # 4) Flatten them for the linear system
-        A_flat = A_array.ravel()    # shape => (No_mutation*M,)
-        B_flat = B_array.ravel()
+        A_flat_t = A_array_t.flatten()  # shape => (No_mutation*M,)
+        B_flat_t = B_array_t.flatten()
 
-        # =========================
-        # (B) Form the linear system => (B^T B + alpha Delta^T Delta) w = ...
-        # =========================
-        # big_eta_tau => alpha*eta_old + tau_old
-        big_eta_tau = alpha*eta_old + tau_old
-        big_eta_tau_flat = big_eta_tau.ravel()
+        # ---------------- (B) Build system & solve with manual CG ----------------
 
-        linear_1 = DELTA.transpose().dot(big_eta_tau_flat)
-        # linear_2 = B_flat * A_flat => elementwise, shape => (No_mutation*M,)
-        linear_2 = B_flat * A_flat
-        # final 'linear'
-        linear   = linear_1 - linear_2
+        # 1) Get dimensions and build diag(B^2):
+        NM = B_flat_t.shape[0]      # = (No_mutation * M)
+        B_sq_t = B_flat_t**2        # shape => (NM,)
 
-        # B^T B => diag of B_flat^2
-        B_sq = B_flat**2
-        Bmat = sp.diags(B_sq, 0, shape=(No_mutation*M, No_mutation*M))
-        H    = Bmat + alpha*(DELTA.transpose().dot(DELTA))
+        # 2) Compute sparse Delta^T Delta => shape (NM, NM)
+        Delta_t = Delta_coo.transpose(0, 1)  # shape => (NM, No_pairs*M)
+        DTD = torch.sparse.mm(Delta_t, Delta_coo)  # shape => (NM, NM), still sparse
 
-        # Solve
-        w_new_flat = spsolve(H, linear)
-        w_new = w_new_flat.reshape(No_mutation, M)
-        # clip
-        np.clip(w_new, -control_large, control_large, out=w_new)
+        # 3) Define a function that multiplies H = (diag(B^2) + alpha * (Delta^T Delta)) by x
+        def matvec_H(x):
+            # x shape => (NM,)
+            # (A) multiply by diag(B_sq_t)
+            out = B_sq_t * x
+            # (B) add alpha * (DTD @ x)
+            out += alpha * torch.sparse.mm(DTD, x.unsqueeze(-1)).squeeze(-1)
+            return out
 
-        # =========================
-        # (C) SCAD threshold => eta_new, tau_new (already vectorized)
-        # =========================
-        eta_new, tau_new = scad_threshold_update(
-            w_new, tau_old, DELTA, alpha, Lambda, gamma
+        # 4) Build the right-hand side: linear_t
+        big_eta_tau_t = alpha*eta_old_t + tau_old_t   # shape => (No_pairs, M)
+        big_eta_tau_flat_t = big_eta_tau_t.flatten()  # shape => (No_pairs*M,)
+
+        RHS_1 = torch.sparse.mm(Delta_t, big_eta_tau_flat_t.unsqueeze(1)).squeeze(1)
+        linear_t = RHS_1 - (B_flat_t * A_flat_t)      # shape => (NM,)
+
+        # 5) Manual Conjugate Gradient solve
+        #    We'll do a 'while True' to avoid Python 'for' loops.
+        #    x0: initial guess => use the old solution w_old_t.
+        x = w_old_t.flatten().clone()
+        r = linear_t - matvec_H(x)
+        p = r.clone()
+        rs_old = torch.dot(r, r)
+
+        max_cg_iter = 500
+        tol = 1e-6
+        iter_cg = 0
+
+        while True:
+            # Ap = H * p
+            Ap = matvec_H(p)
+            denom_ = torch.dot(p, Ap) + 1e-12
+            alpha_cg = rs_old / denom_
+            
+            x = x + alpha_cg * p
+            r = r - alpha_cg * Ap
+            rs_new = torch.dot(r, r)
+
+            iter_cg += 1
+            # Check stopping criteria
+            if rs_new.sqrt() < tol or iter_cg >= max_cg_iter:
+                break
+
+            p = r + (rs_new / rs_old) * p
+            rs_old = rs_new
+
+        # x now holds the solution for (diag(B^2) + alpha * DTD) * x = linear_t
+        w_new_flat_t = x
+        w_new_t = w_new_flat_t.view(No_mutation, M)
+
+        # Finally, clamp in [-control_large, control_large]
+        w_new_t = torch.clamp(w_new_t, -control_large, control_large)
+
+
+        # Finally, clamp in [-control_large, control_large]
+        w_new_t = torch.clamp(w_new_t, -control_large, control_large)
+
+        # =========== (C) SCAD threshold ===========  
+        eta_new_t, tau_new_t = scad_threshold_update_torch(
+            w_new_t, tau_old_t, Delta_coo, alpha, Lambda, gamma
         )
 
         # scale alpha
         alpha *= rho
 
-        # =========================
-        # (D) residual check in bulk (no for-loops)
-        # =========================
-        #  Residual = max_{pair} max_{m} | (w_new[i,:]-w_new[j,:]) - eta_new[k,:] |
-        #
-        # i_idx, j_idx => shape (No_pairs,)
-        # => compute w_new[i_idx,:] - w_new[j_idx,:], shape => (No_pairs, M)
-        # subtract eta_new => shape => (No_pairs, M)
-        diff_2D = (w_new[i_idx,:] - w_new[j_idx,:]) - eta_new
-        # compute max absolute difference
-        residual = np.max(np.abs(diff_2D))
+        # =========== (D) residual check ===========
+        # residual = max_{i<j,m} | (w[i]-w[j]) - eta[k]| 
+        # We'll do it again with the Delta approach
+        # D_w = Delta_coo w_new_flat
+        w_new_flat2 = w_new_t.flatten()
+        D_w_flat2   = torch.sparse.mm(Delta_coo, w_new_flat2.unsqueeze(1)).squeeze(1)
+        # reshape to (No_pairs, M)
+        D_w2 = D_w_flat2.view(No_pairs, M)
+        diff_2D_t = D_w2 - eta_new_t
+        residual_val_t = torch.max(torch.abs(diff_2D_t))
+        residual = float(residual_val_t.item())
 
-        print(f"Iteration={k}, alpha={alpha:.4g}, residual={residual:.6g}")
+        if torch.isnan(residual_val_t):
+            break
 
-    # End while
+        print(f"Iter={k_iter}, alpha={alpha:.4f}, residual={residual:.6g}")
 
     print("\nADMM finished.\n")
     
+    w_new = w_new_t.detach().cpu().numpy()
+    eta_new = eta_new_t.detach().cpu().numpy()
+    phi_hat = phi_hat_t.detach().cpu().numpy()
     diff = diff_mat(w_new)
     ids = np.triu_indices(diff.shape[1], 1)
     eta_new[np.where(np.abs(eta_new) <= post_th)] = 0

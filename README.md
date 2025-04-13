@@ -21,7 +21,7 @@ Subclone reconstruction by grouping single nucleotide variants (SNVs) that share
 **Key Idea:**  
 1. **Logistic Transform**: We parametrize each SNV’s frequency in a logit scale.  
 2. **SCAD Penalty**: We apply a piecewise, nonconvex SCAD approach on the pairwise differences.  
-3. **ADMM**: The Alternating Direction Method of Multipliers separates the likelihood (IRLS approximation) from the nonconvex penalty.  
+3. **CliPP2**: The Alternating Direction Method of Multipliers separates the likelihood (IRLS approximation) from the nonconvex penalty (for detailed formulations, you need to check **CliPP2.pdf**).  
 
 ---
 
@@ -40,7 +40,9 @@ YOUR_PROJECT/
   │   └── regionB/ 
   │        └── ...
   ├── preprocess_result/
-  ├── scad_admm.py
+  ├── input_files/
+  │   ├── core.py
+  │   ├── preprocess.R
   ├── README.md
   └── ...
 ```
@@ -76,11 +78,11 @@ pip install numpy scipy
 2. **Load and Prepare**:  
    The function `group_all_regions_for_ADMM(root_dir)` reads from all subdirectories in `root_dir` and returns stacked arrays `(r, n, minor, total, purity, ploidy, coef_list, wcut)`.
 
-3. **Call the ADMM**:  
+3. **Call the CliPP2**:  
    In your script or an interactive session:
 
    ```python
-   from scad_admm import group_all_regions_for_ADMM, clipp2_all_in_one
+   from clipp2.core import *
 
    # Step 1: gather data
    root_dir = "input_files"
@@ -89,8 +91,8 @@ pip install numpy scipy
     coef_list,
     wcut) = group_all_regions_for_ADMM(root_dir)
 
-   # Step 2: run ADMM
-   result = clipp2_all_in_one(
+   # Step 2: run CliPP2
+   result = clipp2(
        r, n, minor, total,
        purity, ploidy,
        coef_list,
@@ -144,7 +146,7 @@ Below is a brief outline of the key functions in `scad_admm.py` (or whichever sc
    - L2 norm across all M coordinates,  
    - sign determined by the difference in the first coordinate.
 
-9. **`clipp2_all_in_one(...)`**  
+9. **`clipp2(...)`**  
    - The main ADMM logic:
      1. IRLS expansions => build `A_array, B_array` => flatten.  
      2. Solve `(B^T B + alpha * DELTA^T DELTA)*w = linear`.  

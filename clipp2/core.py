@@ -518,7 +518,7 @@ def diff_mat(w_new):
     diff_signed[j_idx, i_idx] = -diff_signed[i_idx, j_idx]
     return(diff_signed)
 
-def clipp2_all_in_one(
+def clipp2(
     r, n, minor, total,
     purity, ploidy,
     coef_list,

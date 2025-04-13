@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import pandas as pd
 
@@ -113,8 +114,6 @@ def process_files(snvfile, cnafile, purityfile):
     return df
 
 
-    
-
 def insert_distinct_rows_multi(df_list):
     """
     Given a list of M DataFrames (df_list), each DataFrame has columns including:
@@ -128,79 +127,61 @@ def insert_distinct_rows_multi(df_list):
       2) Gather the union of *all* (key) rows across all DataFrames.
       3) For each DataFrame, find which key rows are missing 
          and create new rows with default columns:
-            major_cn     = 1
-            minor_cn     = 1
-            normal_cn    = 2
-            startpos     = 1
-            endpos       = 1
+            major_cn      = 1
+            minor_cn      = 1
+            normal_cn     = 2
+            startpos      = 1
+            endpos        = 1
             tumour_purity = (the DataFrame's own tumour_purity 
                              => we take the first row's value as a default)
       4) Insert those new rows into the DataFrame. 
          This ensures each DataFrame ends up with all keys 
          from the union of keys in df_list.
+
     Returns
     -------
     new_list : list of pd.DataFrame
         The updated DataFrames after insertion of missing rows.
-
-    Notes
-    -----
-    - This example picks the DataFrame's first row's 'tumour_purity' 
-      as the default for all newly inserted rows in that DataFrame.
-    - If you have multiple different purities in a single DataFrame,
-      adapt the logic (e.g. group by region or something else).
-    - All DataFrames must have the same columns. If some have no rows,
-      we fallback to tumour_purity=0.5 or an arbitrary choice.
     """
 
-    # 1) define key columns
-    key_cols = ['mutation_chrom','mutation']
+    # 1) Define the key columns
+    key_cols = ['mutation_chrom', 'position']
 
-    # 2) gather union of all keys across all dfs
-    #    We'll build a big set or use a DataFrame index approach
-    #    For convenience, convert each DF to an index on those key_cols,
-    #    then combine.
+    # 2) Gather union of all keys across all DataFrames (only once)
     all_key_tuples = set()
     for df in df_list:
-        # Convert to a MultiIndex of (mutation_chrom,mutation)
-        #   zip => each row => (chr, mut)
-        for row in zip(df['mutation_chrom'], df['mutation']):
-            all_key_tuples.add(row)
+        # For each row, collect the tuple (mutation_chrom, mutation)
+        all_key_tuples.update(zip(df['mutation_chrom'], df['position']))
 
-    #  Now we have the union of keys across all DataFrames
-    #  We'll convert that set to a list of dict with columns
+    # Convert that set into a list we can iterate over
     all_keys_list = list(all_key_tuples)
 
     new_list = []
 
-    for i, df in enumerate(df_list):
-        # If the DataFrame is empty, we pick a fallback purity (say 0.5)
-        if not df.empty:
+    # 3) For each DataFrame, identify which keys are missing and insert them
+    for df in df_list:
+        # If the DataFrame is empty, pick a fallback purity
+        if df.empty:
+            df_purity = 0.5
+        else:
             # pick the first row's tumour_purity as this DF's default
             df_purity = df['tumour_purity'].iloc[0]
-        else:
-            df_purity = 0.5
 
-        # build an index for the DF on (mutation_chrom, mutation) 
-        # to see which keys it already has
-        existing_keys = set(zip(df['mutation_chrom'], df['mutation']))
+        # Build a set of existing keys in this DataFrame
+        existing_keys = set(zip(df['mutation_chrom'], df['position']))
 
-        # find the missing ones: those in all_key_tuples but not in this DF
-        missing = [k for k in all_keys_list if k not in existing_keys]
+        # Find keys in all_keys_list that are not present in the current DF
+        missing_keys = [k for k in all_keys_list if k not in existing_keys]
 
-        if len(missing) == 0:
-            # No distinct rows to insert -> just keep the same DF
+        if len(missing_keys) == 0:
+            # No missing keys => no change
             new_list.append(df)
             continue
+        print(len(missing_keys))
+        # Build a DataFrame for the missing keys
+        to_insert = pd.DataFrame(missing_keys, columns=['mutation_chrom','position'])
 
-        # We'll build a small DataFrame containing those missing keys
-        to_insert = pd.DataFrame(missing, columns=['mutation_chrom','mutation'])
-        # Add default columns for the new rows
-        # We'll also ensure that for columns not in (some minimal set),
-        # we fill with e.g. NaN or 0 if you prefer. 
-        # But the user specifically asked:
-        #  major_cn=1, minor_cn=1, normal_cn=2, tumour_purity=df_purity, 
-        #  startpos=1, endpos=1
+        # Provide default values for required columns
         to_insert['major_cn']      = 1
         to_insert['minor_cn']      = 1
         to_insert['normal_cn']     = 2
@@ -208,135 +189,26 @@ def insert_distinct_rows_multi(df_list):
         to_insert['startpos']      = 1
         to_insert['endpos']        = 1
 
-        # For other columns that exist in df but not in this minimal set 
-        # (like 'position','ref_counts','alt_counts'), 
-        # we can fill them with e.g. np.nan, or 0, or do nothing if we prefer:
-        # We'll fill them with NaN as an example:
+        # If you want defaults for alt_counts, ref_counts, etc., do it here:
+        # Example:
+        to_insert['ref_counts'] = 1000
+        to_insert['alt_counts'] = 1
+
+        # For columns that exist in df but are still missing in to_insert,
+        # fill them with e.g. np.nan or some default:
         needed_cols = set(df.columns) - set(to_insert.columns)
         for c in needed_cols:
             to_insert[c] = np.nan
 
-        # Now the new rows have every column that DF has.
-        # We can reorder columns to match df's column order
+        # Reorder columns to match the original DataFrame's columns
         to_insert = to_insert[df.columns]
 
-        # 3) Append them to df
+        # Append the missing rows to the original DataFrame
         df_out = pd.concat([df, to_insert], ignore_index=True)
+        df_out['total_cn'] = df_out['major_cn'] + df_out['minor_cn']
         new_list.append(df_out)
 
     return new_list
-
-def insert_distinct_rows_multi(df_list):
-    """
-    Given a list of M DataFrames (df_list), each DataFrame has columns including:
-      ['mutation_chrom', 'mutation', 'position', 'ref_counts', 'alt_counts',
-       'major_cn', 'minor_cn', 'normal_cn', 'tumour_purity', 'startpos', 'endpos']
-    We want to ensure that each DataFrame has *all* the rows (by key) 
-    that appear in any DataFrame in df_list.
-
-    Steps:
-      1) Identify the key columns: ['mutation_chrom','mutation'].
-      2) Gather the union of *all* (key) rows across all DataFrames.
-      3) For each DataFrame, find which key rows are missing 
-         and create new rows with default columns:
-            major_cn     = 1
-            minor_cn     = 1
-            normal_cn    = 2
-            startpos     = 1
-            endpos       = 1
-            tumour_purity = (the DataFrame's own tumour_purity 
-                             => we take the first row's value as a default)
-      4) Insert those new rows into the DataFrame. 
-         This ensures each DataFrame ends up with all keys 
-         from the union of keys in df_list.
-    Returns
-    -------
-    new_list : list of pd.DataFrame
-        The updated DataFrames after insertion of missing rows.
-
-    Notes
-    -----
-    - This example picks the DataFrame's first row's 'tumour_purity' 
-      as the default for all newly inserted rows in that DataFrame.
-    - If you have multiple different purities in a single DataFrame,
-      adapt the logic (e.g. group by region or something else).
-    - All DataFrames must have the same columns. If some have no rows,
-      we fallback to tumour_purity=0.5 or an arbitrary choice.
-    """
-
-    # 1) define key columns
-    key_cols = ['mutation_chrom','mutation']
-
-    # 2) gather union of all keys across all dfs
-    #    We'll build a big set or use a DataFrame index approach
-    #    For convenience, convert each DF to an index on those key_cols,
-    #    then combine.
-    all_key_tuples = set()
-    for df in df_list:
-        # Convert to a MultiIndex of (mutation_chrom,mutation)
-        #   zip => each row => (chr, mut)
-        for row in zip(df['mutation_chrom'], df['mutation']):
-            all_key_tuples.add(row)
-
-    #  Now we have the union of keys across all DataFrames
-    #  We'll convert that set to a list of dict with columns
-    all_keys_list = list(all_key_tuples)
-
-    new_list = []
-
-    for i, df in enumerate(df_list):
-        # If the DataFrame is empty, we pick a fallback purity (say 0.5)
-        if not df.empty:
-            # pick the first row's tumour_purity as this DF's default
-            df_purity = df['tumour_purity'].iloc[0]
-        else:
-            df_purity = 0.5
-
-        # build an index for the DF on (mutation_chrom, mutation) 
-        # to see which keys it already has
-        existing_keys = set(zip(df['mutation_chrom'], df['mutation']))
-
-        # find the missing ones: those in all_key_tuples but not in this DF
-        missing = [k for k in all_keys_list if k not in existing_keys]
-
-        if len(missing) == 0:
-            # No distinct rows to insert -> just keep the same DF
-            new_list.append(df)
-            continue
-
-        # We'll build a small DataFrame containing those missing keys
-        to_insert = pd.DataFrame(missing, columns=['mutation_chrom','mutation'])
-        # Add default columns for the new rows
-        # We'll also ensure that for columns not in (some minimal set),
-        # we fill with e.g. NaN or 0 if you prefer. 
-        # But the user specifically asked:
-        #  major_cn=1, minor_cn=1, normal_cn=2, tumour_purity=df_purity, 
-        #  startpos=1, endpos=1
-        to_insert['major_cn']      = 1
-        to_insert['minor_cn']      = 1
-        to_insert['normal_cn']     = 2
-        to_insert['tumour_purity'] = df_purity
-        to_insert['startpos']      = 1
-        to_insert['endpos']        = 1
-
-        # For other columns that exist in df but not in this minimal set 
-        # (like 'position','ref_counts','alt_counts'), 
-        # we can fill them with e.g. np.nan, or 0, or do nothing if we prefer:
-        # We'll fill them with NaN as an example:
-        needed_cols = set(df.columns) - set(to_insert.columns)
-        for c in needed_cols:
-            to_insert[c] = 1
-
-        # Now the new rows have every column that DF has.
-        # We can reorder columns to match df's column order
-        to_insert = to_insert[df.columns]
-
-        # 3) Append them to df
-        df_out = pd.concat([df, to_insert], ignore_index=True)
-        new_list.append(df_out)
-
-    return new_list
-
 
 def export_snv_cna_and_purity(df, dir, snv_path, cna_path, purity_path):
     """
@@ -384,6 +256,7 @@ def export_snv_cna_and_purity(df, dir, snv_path, cna_path, purity_path):
     os.makedirs(dir, exist_ok=True)
 
     # ---------- 1) SNV subset / rename / add total_cn / save to snv_path ----------
+    df = df.sort_values(by=['mutation_chrom', 'position'])
     df_snv = df[['mutation_chrom', 'position', 'alt_counts', 'ref_counts']].rename(
         columns={
             'mutation_chrom': 'chromosome_index',
@@ -392,34 +265,26 @@ def export_snv_cna_and_purity(df, dir, snv_path, cna_path, purity_path):
             'ref_counts':     'ref_count'
         }
     )
-    # Add total_cn = df['major_cn'] + df['minor_cn']
-    df_snv['total_cn'] = df['major_cn'] + df['minor_cn']
-
     # Save to snv_path within `dir`
     snv_fullpath = os.path.join(dir, snv_path)
     df_snv.to_csv(snv_fullpath, sep='\t', index=False)
 
-    # ---------- 2) Copy df, add total_cn => save to cna_path ----------
-    df_cna_1 = df.copy()
-    df_cna_1['total_cn'] = df_cna_1['major_cn'] + df_cna_1['minor_cn']
-
-    cna_fullpath = os.path.join(dir, cna_path)
-    df_cna_1.to_csv(cna_fullpath, sep='\t', index=False)
-
     # ---------- 3) Another cna snippet => rename columns, add total_cn, 
     #     and save to the same cna_path again (overwriting).
-    df_cna_2 = df[['mutation_chrom','startpos','endpos','major_cn','minor_cn']].rename(
+    df_cna_2 = df[['mutation_chrom','startpos','endpos','major_cn','minor_cn', 'total_cn']].rename(
         columns={
             'mutation_chrom': 'chromosome_index',
             'startpos':       'startpos',
             'endpos':         'endpos',
             'major_cn':       'major_cn',
-            'minor_cn':       'minor_cn'
+            'minor_cn':       'minor_cn',
+            'total_cn' : 'total_cn'
         }
     )
     df_cna_2['total_cn'] = df_cna_2['major_cn'] + df_cna_2['minor_cn']
 
     # Overwrite or append the same cna_path: 
+    cna_fullpath = os.path.join(dir, cna_path)
     df_cna_2.to_csv(cna_fullpath, sep='\t', index=False)
 
     # ---------- 4) Write tumour_purity scalar to purity_path ----------
@@ -529,314 +394,442 @@ def CombineReasons(chrom, pos, indices, reason):
 # 2) Main function (translated from your R script) 
 ##############################################################################
 
-def process_data(
-        snv_file, cn_file, purity_file, sample_id, output_prefix, 
-        drop_data=True
-    ):
+def preprocess(
+    snv_file, cn_file, purity_file, sample_id, output_prefix, 
+    drop_data=True
+):
     """
-    Python translation of your R code snippet. 
-    snv_file    : str => e.g. '/AVPC/ACC9/9-post.snv.txt'
-    cn_file     : str => e.g. '/AVPC/ACC9/9-post.cna.txt'
-    purity_file : str => e.g. '/AVPC/ACC9/9-post.purity.txt'
-    sample_id   : str => e.g. '--sample_id'
-    output_prefix : str => e.g. 'E:/Dropbox/GitHub/Multi_Region_CliPP/processed_data'
-
-    drop_data   : bool => if True, we apply the R logic for dropping rows 
-                          that fail certain conditions (like negative reads, no CN, etc.).
-                          If False, we skip those filtering steps.
-
-    The function does the steps:
-      1) Check existence of input files
-      2) Create output_prefix dir if not existing
-      3) Read purity, read snv, read cna
-      4) Possibly drop certain rows based on R logic (if drop_data=True)
-      5) Attempt the piecewise linear approximation
-      6) Write results to r.txt, n.txt, minor.txt, total.txt, multiplicity.txt, etc.
+    Python translation of your R code snippet, with the ability to skip row dropping.
+    
+    Parameters
+    ----------
+    snv_file : str
+        Path to SNV file (e.g. '/AVPC/ACC9/9-post.snv.txt')
+    cn_file : str
+        Path to CNV file (e.g. '/AVPC/ACC9/9-post.cna.txt')
+    purity_file : str
+        Path to purity file (e.g. '/AVPC/ACC9/9-post.purity.txt')
+    sample_id : str
+        Sample ID for reference (not heavily used in this function except for log messages)
+    output_prefix : str
+        Directory/path prefix where outputs should be written
+    drop_data : bool
+        If True (default), rows failing filters (negative reads, invalid CN, etc.) are dropped.
+        If False, all data is retained, and any "failures" are merely logged but not removed.
+    
+    The function performs the following steps:
+      1) Check existence of input files.
+      2) Create output directory if not existing.
+      3) Read purity, read SNV, read CNV.
+      4) Possibly drop certain rows based on R logic (if drop_data=True).
+      5) Attempt the piecewise linear approximation.
+      6) Write results to output files: r.txt, n.txt, minor.txt, total.txt, multiplicity.txt, etc.
+         Also outputs excluded_SNVs.txt (logged failures).
     """
 
-    import os
-    # check input files
-    if not os.path.isfile(snv_file):
-        raise ValueError(f"The Input SNV file: {snv_file} does not exist.")
-    if not os.path.isfile(cn_file):
-        raise ValueError(f"The Input CNV file: {cn_file} does not exist.")
-    if not os.path.isfile(purity_file):
-        raise ValueError(f"The Input Purity file: {purity_file} does not exist.")
+    print("SNV file:     ", snv_file)
+    print("CNV file:     ", cn_file)
+    print("Purity file:  ", purity_file)
+    print("Sample ID:    ", sample_id)
+    print("Output dir:   ", output_prefix)
+    print("drop_data:    ", drop_data)
 
-    # create output_prefix dir if needed
+    # 1) Check existence of input files
+    if not os.path.exists(snv_file):
+        sys.exit(f"The Input SNV file: {snv_file} does not exist.")
+    if not os.path.exists(cn_file):
+        sys.exit(f"The Input CNV file: {cn_file} does not exist.")
+    if not os.path.exists(purity_file):
+        sys.exit(f"The Input Purity file: {purity_file} does not exist.")
+
+    # 2) Create output directory if it does not exist
     if not os.path.isdir(output_prefix):
         os.makedirs(output_prefix, exist_ok=True)
 
-    # read purity
+    # 3) Define utility functions
+    def theta(w, bv, cv, cn, purity):
+        """
+        Equivalent to the R function:
+           theta = (exp(w)*bv) / ((1+exp(w))*cn*(1-purity) + (1+exp(w))*cv*purity)
+        """
+        return (np.exp(w)*bv) / (
+            (1 + np.exp(w))*cn*(1 - purity) + (1 + np.exp(w))*cv*purity
+        )
+
+    def LinearEvaluate(x, a, b):
+        """
+        Equivalent to the R function:
+           LinearEvaluate(x, a, b) = a*x + b
+        """
+        return a*x + b
+
+    def LinearApproximate(bv, cv, cn, purity, diag_plot=False):
+        """
+        Equivalent to the R function LinearApproximate.
+        Attempts to approximate the function theta(w, bv, cv, cn, purity)
+        with 3 line segments, returning the combination that yields the
+        minimum maximum difference from the true function.
+        """
+        w_arr = np.arange(-40, 41) / 10.0  # -4.0 to +4.0 in steps of 0.1
+        actual_theta = theta(w_arr, bv, cv, cn, purity)
+
+        No_w = len(w_arr)
+        # We'll store results in arrays or lists
+        total_combos = (No_w - 3) * (No_w - 2) // 2
+        diff_vals = np.zeros(total_combos, dtype=float)
+        coef_vals = np.zeros((total_combos, 6), dtype=float)
+        w_cut_vals = np.zeros((total_combos, 2), dtype=float)
+        approximations = [None]*total_combos
+
+        k = 0
+        # The R loops: for(i in 2:(length(w)-2)) for(j in (i+1):(length(w)-1))
+        # Because R is 1-based, we want i in [2..(No_w-2)], j in [i+1..(No_w-1)].
+        for i in range(2, No_w-1):        # i in [2..No_w-2]
+            for j in range(i+1, No_w):    # j in [i+1..No_w-1]
+                # Coefficients for line segments
+                denom_1 = (w_arr[i] - w_arr[1])
+                a1 = (actual_theta[i] - actual_theta[1]) / denom_1
+                b1 = actual_theta[1] - w_arr[1]*a1
+
+                denom_2 = (w_arr[j] - w_arr[i])
+                a2 = (actual_theta[j] - actual_theta[i]) / denom_2
+                b2 = actual_theta[i] - w_arr[i]*a2
+
+                denom_3 = (w_arr[No_w-1] - w_arr[j])
+                a3 = (actual_theta[No_w-1] - actual_theta[j]) / denom_3
+                b3 = actual_theta[No_w-1] - w_arr[No_w-1]*a3
+
+                # Build the piecewise approximation
+                seg1_x = w_arr[1:i+1]
+                seg1_y = LinearEvaluate(seg1_x, a1, b1)
+
+                seg2_x = w_arr[i+1:j+1]
+                seg2_y = LinearEvaluate(seg2_x, a2, b2)
+
+                seg3_x = w_arr[j+1:No_w]
+                seg3_y = LinearEvaluate(seg3_x, a3, b3)
+
+                full_approx = np.zeros(No_w, dtype=float)
+                full_approx[1:i+1] = seg1_y
+                full_approx[i+1:j+1] = seg2_y
+                full_approx[j+1:No_w] = seg3_y
+
+                the_diff = np.max(np.abs(actual_theta[1:] - full_approx[1:]))
+
+                diff_vals[k] = the_diff
+                coef_vals[k, :] = [a1, b1, a2, b2, a3, b3]
+                w_cut_vals[k, :] = [w_arr[i], w_arr[j]]
+                approximations[k] = full_approx
+                k += 1
+
+        # Find best difference
+        best_idx = np.argmin(diff_vals)
+        best_cut = w_cut_vals[best_idx, :]
+        best_diff = diff_vals[best_idx]
+        best_coef = coef_vals[best_idx, :]
+
+        if diag_plot:
+            import matplotlib.pyplot as plt
+            plt.figure()
+            plt.plot(w_arr, actual_theta, label='Actual theta')
+            plt.plot(w_arr, approximations[best_idx], label='Approx theta', color='red')
+            plt.ylim([0,1])
+            plt.xlim([-5,5])
+            plt.legend()
+            plt.show()
+
+        return {
+            'w_cut': best_cut,
+            'diff': best_diff,
+            'coef': best_coef
+        }
+
+    def CombineReasons(chrom_list, pos_list, ind_list, reason):
+        """
+        Equivalent to R's CombineReasons function:
+          'chrom pos reason' lines for each index in ind_list.
+        """
+        results = []
+        for idx in ind_list:
+            results.append(f"{chrom_list[idx]}\t{pos_list[idx]}\t{reason}")
+        return results
+
+    # 4) Read purity, read SNV, read CNA
     pp_table = pd.read_csv(purity_file, header=None, sep="\t")
-    purity = float(pp_table.iloc[0,0])
+    purity = pp_table.iloc[0,0]  # first row, first column
 
-    # read SNV
-    tmp_vcf = pd.read_csv(snv_file, sep="\t", header=0)
-    # expecting columns: chromosome_index, position, alt_count, ref_count
-    # plus possibly others.
+    # Set threshold to check if we have enough valid SNVs
+    VALID_CONT = 0
 
-    # read CN
-    cn_tmp = pd.read_csv(cn_file, sep="\t", header=0)
-    # expecting columns like: chromosome_index, startpos, endpos,
-    #   major_cn, minor_cn, total_cn, etc.
+    # Initialize arrays to store meta
+    case_store     = []
+    cutbeta_store  = []
+    valid_store    = []
+    invalid_store  = []
+    dropped_SNV    = []
 
-    # define some variables as in R
-    dropped_SNV = []
+    # Read SNV file
+    snv_df = pd.read_csv(snv_file, header=0, sep="\t")
+    mutation_chrom = snv_df["chromosome_index"].values.astype(float)
+    mutation_pos   = snv_df["position"].values.astype(float)
+    minor_read     = snv_df["alt_count"].values.astype(float)
+    ref_read       = snv_df["ref_count"].values.astype(float)
+    total_read     = minor_read + ref_read
 
-    # from your code:
-    # mutation.chrom <- as.numeric(tmp.vcf$chromosome_index)
-    # mutation.pos   <- as.numeric(tmp.vcf$position)
-    # minor.read     <- tmp.vcf$alt_count
-    # total.read     <- alt + ref
-    mutation_chrom = np.array(tmp_vcf['chromosome_index'], dtype=float)
-    mutation_pos   = np.array(tmp_vcf['position'], dtype=float)
-    minor_read     = np.array(tmp_vcf['alt_count'], dtype=float)
-    total_read     = minor_read + np.array(tmp_vcf['ref_count'], dtype=float)
+    # 5) Possibly drop data (or not) based on filters
 
-    # drop_data logic
-    VALID_CONT = 0  # from R code
+    #--- Filter 1: sex chromosomes (where chromosome_index is NaN) ---
+    # Indices for passing or failing
+    valid_ind_1 = np.where(~np.isnan(mutation_chrom))[0]
+    drop_ind_1  = np.where(np.isnan(mutation_chrom))[0]
+    dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_1,
+                                      "The SNV is on sex chromosomes."))
+
     if drop_data:
-        # 1) remove NA in mutation.chrom => in R code:
-        # valid.ind = which(!is.na(mutation.chrom))
-        valid_ind = np.where(~np.isnan(mutation_chrom))[0]
-        drop_ind  = np.setdiff1d(np.arange(len(mutation_chrom)), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, "The SNV is on sex chromosomes (NA).")
+        if len(valid_ind_1) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs on autosomes.")
+        # Keep only valid
+        mutation_chrom = mutation_chrom[valid_ind_1]
+        mutation_pos   = mutation_pos[valid_ind_1]
+        minor_read     = minor_read[valid_ind_1]
+        total_read     = total_read[valid_ind_1]
 
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-
-        if len(valid_ind) < VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} has < {VALID_CONT} SNVs that are on non-sex chromosomes.")
-
-        # 2) remove negative reads
-        valid_ind = np.where((minor_read >= 0) & (total_read >= 0))[0]
-        drop_ind  = np.setdiff1d(np.arange(len(minor_read)), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, "The SNV has negative reads.")
-        if len(valid_ind) < VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} has < {VALID_CONT} SNVs that have non-negative reads.")
-
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-
-    # after dropping logic or not, gather final sets
-    No_mutations = len(minor_read)
-
-    # process copy number => replicate logic from R
-    # "cn.tmp <- cn.tmp[which(!is.na(cn.tmp[,'minor_cn'])),]"
+    #--- Filter 2: negative reads ---
     if drop_data:
-        cn_tmp = cn_tmp[~cn_tmp['minor_cn'].isna()]
-        if len(cn_tmp) == 0:
-            raise ValueError(f"The sample with SNV {snv_file} does not have valid copy number status (no minor_cn).")
+        valid_ind_2 = np.where((minor_read >= 0) & (total_read >= 0))[0]
+        drop_ind_2  = np.setdiff1d(np.arange(len(minor_read)), valid_ind_2)
+        dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_2,
+                                          "The SNV has negative reads."))
 
-    # find the index of each SNV's row in cn_tmp
-    # R code: 
-    #   mut.cna.id = unlist( lapply(1:No.mutations, function(x){ ret.val=-1; for(...) if(...)ret.val=i...}) )
-    mut_cna_id = np.full(No_mutations, -1, dtype=int)
-    # naive approach => for each mutation, loop cn
+        if len(valid_ind_2) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs with non-negative reads.")
+        # Keep only valid
+        mutation_chrom = mutation_chrom[valid_ind_2]
+        mutation_pos   = mutation_pos[valid_ind_2]
+        minor_read     = minor_read[valid_ind_2]
+        total_read     = total_read[valid_ind_2]
+
+    # (Recompute No_mutations after filters so far)
+    No_mutations = len(mutation_chrom)
+
+    # 6) Process copy number
+    cn_df = pd.read_csv(cn_file, header=0, sep="\t")
+    # remove rows with NA in 'minor_cn' (R code)
+    cn_df = cn_df.dropna(subset=["minor_cn"])
+    if cn_df.shape[0] == 0:
+        sys.exit("No valid copy number entries (all minor_cn were NaN?).")
+
+    cn_chr   = cn_df["chromosome_index"].values
+    # Adjust column names as needed for your real data:
+    cn_start = cn_df["startpos"].values
+    cn_end   = cn_df["endpos"].values
+    cn_minor = cn_df["minor_cn"].values
+    cn_major = cn_df["major_cn"].values
+    cn_total = cn_df["total_cn"].values
+
+    #--- For each mutation, find segment covering that position ---
+    mut_cna_id = []
     for x in range(No_mutations):
-        mut_cna_id[x] = x
+        found_segment = -1
+        for i in range(cn_df.shape[0]):
+            if (mutation_chrom[x] == cn_chr[i] and
+                mutation_pos[x] >= cn_start[i] and
+                mutation_pos[x] <= cn_end[i]):
+                found_segment = i
+                break
+        mut_cna_id.append(found_segment)
 
-    # R code => valid.ind = which(mut.cna.id > 0), drop the rest
+    mut_cna_id = np.array(mut_cna_id)
+
+    #--- Filter 3: invalid CN segments ---
+    valid_ind_3 = np.where(mut_cna_id >= 0)[0]
+    drop_ind_3  = np.setdiff1d(np.arange(No_mutations), valid_ind_3)
+    dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_3,
+                                      "The SNV does not have valid copy number."))
+
     if drop_data:
-        valid_ind = np.where(mut_cna_id > -1)[0]
-        drop_ind  = np.setdiff1d(np.arange(No_mutations), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, "No valid copy number.")
-        if len(valid_ind) < VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} has < {VALID_CONT} SNVs with valid CN status.")
-        # keep only valid_ind
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-        mut_cna_id     = mut_cna_id[valid_ind]
-        No_mutations   = len(valid_ind)
+        if len(valid_ind_3) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs with valid CN status.")
+        # Keep only valid
+        mutation_chrom = mutation_chrom[valid_ind_3]
+        mutation_pos   = mutation_pos[valid_ind_3]
+        minor_read     = minor_read[valid_ind_3]
+        total_read     = total_read[valid_ind_3]
+        mut_cna_id     = mut_cna_id[valid_ind_3]
+        No_mutations   = len(valid_ind_3)
 
-    # gather total.copy, etc.
-    # R code: minor.copy.lim = apply(...,1,max); total.count=cn.tmp[mut.cna.id,"total_cn"]
-    # we'll do:
-    total_count = np.array([cn_tmp.iloc[idx]['total_cn'] for idx in mut_cna_id])
-    major_cn    = np.array([cn_tmp.iloc[idx]['major_cn'] for idx in mut_cna_id])
-    minor_cn    = np.array([cn_tmp.iloc[idx]['minor_cn'] for idx in mut_cna_id])
-    minor_copy_lim = np.maximum(major_cn, minor_cn)
+    # Now gather copy number info for *all* or valid subset
+    if drop_data:
+        minor_copy_lim = np.array([max(cn_minor[idx], cn_major[idx]) for idx in mut_cna_id])
+        total_count    = cn_total[mut_cna_id]
+    else:
+        # If not dropping data, construct the arrays for the entire dataset:
+        minor_copy_lim = np.array([
+            max(cn_minor[idx], cn_major[idx]) if idx >= 0 else np.nan 
+            for idx in mut_cna_id
+        ])
+        total_count = np.array([
+            cn_total[idx] if idx >= 0 else np.nan
+            for idx in mut_cna_id
+        ])
 
-    # R code => multiplicity = round(minor.read / total.read / purity * (total.count*purity + (1-purity)*2))
+    # 7) Calculate multiplicity
     multiplicity = np.round(
-        (minor_read / total_read / purity) * (total_count*purity + (1 - purity)*2)
+        (minor_read / total_read) / purity * (total_count * purity + (1 - purity)*2)
     )
-    # then minor.count = apply( cbind(minor.copy.lim, multiplicity), 1, min )
+
+    #--- Filter 4: clamp multiplicity and ensure minor_count>0 ---
     minor_count = np.minimum(minor_copy_lim, multiplicity)
-    # minor_count[minor_count == 0] = 1
-    # in python:
-    minor_count[minor_count <= 0] = 1
+    # Force minor_count to at least 1
+    minor_count[minor_count < 1] = 1
 
     if drop_data:
-        valid_ind = np.where((minor_count>0) & (total_count>0))[0]
-        drop_ind  = np.setdiff1d(np.arange(No_mutations), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, "SNV => negative multiplicities.")
-        if len(valid_ind) < VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} < {VALID_CONT} SNVs with positive multiplicities.")
-        # keep
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-        minor_count    = minor_count[valid_ind]
-        total_count    = total_count[valid_ind]
-        major_cn       = major_cn[valid_ind]
-        minor_cn       = minor_cn[valid_ind]
-        No_mutations   = len(valid_ind)
+        valid_ind_4 = np.where((minor_count > 0) & (total_count > 0))[0]
+        drop_ind_4  = np.setdiff1d(np.arange(len(minor_read)), valid_ind_4)
+        dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_4,
+                                          "The SNV has negative or zero multiplicities."))
 
-    # piecewise linear approximation => "sample.diff" array 
-    sample_diff    = np.zeros(No_mutations)
-    # "sample.coef" => shape (No_mutations,6)
-    sample_coef    = np.zeros((No_mutations, 6))
-    sample_cutbeta = np.zeros((No_mutations, 2))
+        if len(valid_ind_4) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs that pass multiplicity checks.")
+        # Keep only valid
+        mutation_chrom = mutation_chrom[valid_ind_4]
+        mutation_pos   = mutation_pos[valid_ind_4]
+        minor_read     = minor_read[valid_ind_4]
+        total_read     = total_read[valid_ind_4]
+        minor_count    = minor_count[valid_ind_4]
+        total_count    = total_count[valid_ind_4]
+        No_mutations   = len(valid_ind_4)
 
-    valid_store    = set()
-    invalid_store  = set()
-    # replicate the logic of not storing a big 'case.store' or 'cutbeta.store' in the environment
-    # We'll do a local cache: a dict from (cn, tot, min) -> (coefs, w_cut, diff)
-    local_cache    = {}
+    # 8) Piecewise approximation
+    sample_coef    = np.zeros((No_mutations, 6), dtype=float)
+    sample_cutbeta = np.zeros((No_mutations, 2), dtype=float)
+    sample_diff    = np.zeros(No_mutations, dtype=float)
+
+    # We track (cn=2, total_count[m], minor_count[m]) as a key
+    case_store     = []
+    cutbeta_store  = []
+    valid_store    = []
+    invalid_store  = []
 
     for m in range(No_mutations):
-        key_str = f"2_{total_count[m]}_{minor_count[m]}"
-        # check if key in local_cache
-        if key_str in local_cache:
-            dat = local_cache[key_str]
-            sample_coef[m,:]    = dat['coef']
-            sample_cutbeta[m,:] = dat['w_cut']
-            sample_diff[m]      = dat['diff']
+        # If not dropping, watch out for any NaNs:
+        if np.isnan(total_count[m]) or np.isnan(minor_count[m]):
+            # If there's invalid CN, skip approximation
+            sample_diff[m] = 9999
+            continue
+
+        key = f"2_{total_count[m]}_{minor_count[m]}"
+        if key in valid_store:
+            idx_key = valid_store.index(key)
+            sample_coef[m,:]    = case_store[idx_key]
+            sample_cutbeta[m,:] = cutbeta_store[idx_key]
+            sample_diff[m]      = 0.0
+        elif key in invalid_store:
+            sample_diff[m] = 1.0
         else:
-            # check if it's in invalid_store?
-            if key_str in invalid_store:
-                sample_diff[m] = 1.0
+            res = LinearApproximate(minor_count[m], total_count[m], 2, purity, diag_plot=False)
+            if res['diff'] <= 0.1:
+                sample_coef[m,:]    = res['coef']
+                sample_cutbeta[m,:] = res['w_cut']
+                sample_diff[m]      = res['diff']
+
+                valid_store.append(key)
+                case_store.append(res['coef'])
+                cutbeta_store.append(res['w_cut'])
             else:
-                # compute
-                res = LinearApproximate(
-                    bv=minor_count[m], 
-                    cv=total_count[m], 
-                    cn=2, 
-                    purity=purity, 
-                    diag_plot=False
-                )
-                if res['diff'] <= 0.1:
-                    sample_coef[m,:]    = res['coef']
-                    sample_cutbeta[m,:] = res['w.cut']
-                    sample_diff[m]      = res['diff']
-                    # store in cache
-                    local_cache[key_str] = {
-                        'coef': res['coef'],
-                        'w_cut': res['w.cut'],
-                        'diff': res['diff']
-                    }
-                    valid_store.add(key_str)
-                else:
-                    sample_diff[m] = 1.0
-                    invalid_store.add(key_str)
+                sample_diff[m] = 1.0
+                invalid_store.append(key)
 
-    # filter => valid_ind = where(sample_diff <=0.1)
+    #--- Filter 5: sample_diff <= 0.1 ---
     if drop_data:
-        valid_ind = np.where(sample_diff <= 0.1)[0]
-        drop_ind  = np.setdiff1d(np.arange(No_mutations), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, 
-            "copy numbers => not stable for approximated line.")
-        if len(valid_ind) < VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} has < {VALID_CONT} SNVs that have valid approximated theta.")
-        # keep
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-        minor_count    = minor_count[valid_ind]
-        total_count    = total_count[valid_ind]
-        sample_coef    = sample_coef[valid_ind,:]
-        sample_cutbeta = sample_cutbeta[valid_ind,:]
-        No_mutations   = len(valid_ind)
+        valid_ind_5 = np.where(sample_diff <= 0.1)[0]
+        drop_ind_5  = np.setdiff1d(np.arange(No_mutations), valid_ind_5)
+        dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_5,
+                                          "The copy numbers for the SNV are not stable enough to approximate."))
 
-    # next check => phi = 2 / ( minor_count/(minor_read/total_read) - total_count + 2 )
-    # replicate logic:
-    phi_arr = 2.0 / ( (minor_count / (minor_read/total_read)) - total_count + 2.0 )
-    # valid_ind = intersect which phi <=1.5, phi>0 => in python:
+        if len(valid_ind_5) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs that have valid approximated theta.")
+        mutation_chrom = mutation_chrom[valid_ind_5]
+        mutation_pos   = mutation_pos[valid_ind_5]
+        minor_read     = minor_read[valid_ind_5]
+        total_read     = total_read[valid_ind_5]
+        minor_count    = minor_count[valid_ind_5]
+        total_count    = total_count[valid_ind_5]
+        sample_coef    = sample_coef[valid_ind_5, :]
+        sample_cutbeta = sample_cutbeta[valid_ind_5, :]
+        sample_diff    = sample_diff[valid_ind_5]
+        No_mutations   = len(valid_ind_5)
+
+    # 9) Calculate phi and filter outliers
+    phi = 2.0 / ((minor_count / (minor_read / total_read)) - total_count + 2.0)
+
+    # Outliers = phi > 1.5
+    clonal_ind = np.where(phi > 1.5)[0]
     if drop_data:
-        valid_ind = np.where((phi_arr <= 1.5) & (phi_arr>0))[0]
-        clonal_ind = np.where(phi_arr>1.5)[0]
-        # if clonal_ind >0 => write them out as outPosition.txt
-        if len(clonal_ind)>0:
-            outlier_file = os.path.join(output_prefix,"outPosition.txt")
-            outlier_arr = []
-            for idx in clonal_ind:
-                outlier_arr.append([
-                    mutation_chrom[idx], 
-                    mutation_pos[idx],
-                    total_count[idx],
-                    minor_count[idx]
-                ])
-            # write
-            pd.DataFrame(outlier_arr).to_csv(outlier_file, sep="\t", header=False, index=False)
-        drop_ind = np.setdiff1d(np.arange(No_mutations), valid_ind)
-        dropped_SNV += CombineReasons(mutation_chrom, mutation_pos, drop_ind, "empirical CP is off chart.")
-        if len(valid_ind)<VALID_CONT:
-            raise ValueError(f"The sample with SNV {snv_file} < {VALID_CONT} SNVs with valid empirical phi.")
-        # keep
-        mutation_chrom = mutation_chrom[valid_ind]
-        mutation_pos   = mutation_pos[valid_ind]
-        minor_read     = minor_read[valid_ind]
-        total_read     = total_read[valid_ind]
-        minor_count    = minor_count[valid_ind]
-        total_count    = total_count[valid_ind]
-        sample_coef    = sample_coef[valid_ind,:]
-        sample_cutbeta = sample_cutbeta[valid_ind,:]
-        phi_arr        = phi_arr[valid_ind]
-        No_mutations   = len(valid_ind)
+        if len(clonal_ind) > 0:
+            outlier_higherEnd = np.column_stack((
+                mutation_chrom[clonal_ind],
+                mutation_pos[clonal_ind],
+                total_count[clonal_ind],
+                minor_count[clonal_ind]
+            ))
+            pd.DataFrame(outlier_higherEnd).to_csv(
+                os.path.join(output_prefix, "outPosition.txt"),
+                header=False, index=False, sep="\t"
+            )
 
-    # done dropping. We'll produce outputs:
-    # r.txt => minor_read
-    # n.txt => total_read
-    # minor.txt => minor_count
-    # total.txt => total_count
-    # multiplicity.txt => cbind( chromosome, pos, total_count, minor_count )
-    # purity_ploidy.txt => purity
-    # coef.txt => sample_coef
-    # cutbeta.txt => sample_cutbeta
-    # excluded_SNVs.txt => dropped_SNV lines
+    #--- Filter 6: keep 0 < phi <= 1.5 ---
+    if drop_data:
+        valid_ind_6 = np.where((phi <= 1.5) & (phi > 0))[0]
+        drop_ind_6  = np.setdiff1d(np.arange(No_mutations), valid_ind_6)
+        dropped_SNV.extend(CombineReasons(mutation_chrom, mutation_pos, drop_ind_6,
+                                          "The empirical CP is off, possibly due to incorrect CN or super cluster(s)."))
 
-    # define file paths
-    output_r    = os.path.join(output_prefix,"r.txt")
-    output_n    = os.path.join(output_prefix,"n.txt")
-    output_minor= os.path.join(output_prefix,"minor.txt")
-    output_total= os.path.join(output_prefix,"total.txt")
-    output_index= os.path.join(output_prefix,"multiplicity.txt")
-    output_pp   = os.path.join(output_prefix,"purity_ploidy.txt")
-    output_coef = os.path.join(output_prefix,"coef.txt")
-    output_cutbeta = os.path.join(output_prefix,"cutbeta.txt")
-    output_dropped= os.path.join(output_prefix,"excluded_SNVs.txt")
+        if len(valid_ind_6) < VALID_CONT:
+            sys.exit(f"Fewer than {VALID_CONT} SNVs with valid empirical phi.")
+        mutation_chrom = mutation_chrom[valid_ind_6]
+        mutation_pos   = mutation_pos[valid_ind_6]
+        minor_read     = minor_read[valid_ind_6]
+        total_read     = total_read[valid_ind_6]
+        minor_count    = minor_count[valid_ind_6]
+        total_count    = total_count[valid_ind_6]
+        sample_coef    = sample_coef[valid_ind_6, :]
+        sample_cutbeta = sample_cutbeta[valid_ind_6, :]
+        phi            = phi[valid_ind_6]
+        No_mutations   = len(valid_ind_6)
 
-    # write
-    pd.DataFrame(minor_read).to_csv(output_r, sep="\t", header=False, index=False)
-    pd.DataFrame(total_read).to_csv(output_n, sep="\t", header=False, index=False)
-    pd.DataFrame(minor_count).to_csv(output_minor, sep="\t", header=False, index=False)
-    pd.DataFrame(total_count).to_csv(output_total, sep="\t", header=False, index=False)
+    # 10) Prepare output
+    # index => (chrom, pos, total_count, minor_count)
+    index_matrix = np.column_stack((mutation_chrom, mutation_pos, total_count, minor_count))
 
-    # cbind => chromosome, pos, total_count, minor_count
-    mult_array = np.column_stack([mutation_chrom, mutation_pos, total_count, minor_count])
-    pd.DataFrame(mult_array).to_csv(output_index, sep="\t", header=False, index=False)
+    # Build output file names
+    output_r        = os.path.join(output_prefix, "r.txt")
+    output_n        = os.path.join(output_prefix, "n.txt")
+    output_minor    = os.path.join(output_prefix, "minor.txt")
+    output_total    = os.path.join(output_prefix, "total.txt")
+    output_index    = os.path.join(output_prefix, "multiplicity.txt")
+    output_pp       = os.path.join(output_prefix, "purity_ploidy.txt")
+    output_coef     = os.path.join(output_prefix, "coef.txt")
+    output_cutbeta  = os.path.join(output_prefix, "cutbeta.txt")
+    output_dropped  = os.path.join(output_prefix, "excluded_SNVs.txt")
 
-    # purity => single line
-    pd.DataFrame([purity]).to_csv(output_pp, sep="\t", header=False, index=False)
+    # Write outputs
+    np.savetxt(output_r, minor_read,    fmt="%.0f", delimiter="\t")
+    np.savetxt(output_n, total_read,    fmt="%.0f", delimiter="\t")
+    np.savetxt(output_minor, minor_count, fmt="%.0f", delimiter="\t")
+    np.savetxt(output_total, total_count, fmt="%.0f", delimiter="\t")
+    np.savetxt(output_index, index_matrix, fmt="%.6g", delimiter="\t")
+    # Purity
+    np.savetxt(output_pp, [purity], fmt="%.5f", delimiter="\t")
+    # Coefficients
+    np.savetxt(output_coef, sample_coef, fmt="%.6g", delimiter="\t")
+    np.savetxt(output_cutbeta, sample_cutbeta, fmt="%.6g", delimiter="\t")
 
-    # sample_coef => write as tsv
-    pd.DataFrame(sample_coef).to_csv(output_coef, sep="\t", header=False, index=False)
-    # sample_cutbeta => also tsv
-    pd.DataFrame(sample_cutbeta).to_csv(output_cutbeta, sep="\t", header=False, index=False)
-
-    # dropped_SNV => lines
     with open(output_dropped, 'w') as f:
         for line in dropped_SNV:
             f.write(line + "\n")
 
-    print(f"Process done. Created outputs in {output_prefix}.")
+    print("Finished processing. Results saved under:", output_prefix)
+    if not drop_data:
+        print("Note: drop_data=False, so no rows were actually removed. "
+              "All data are included in the output files.")

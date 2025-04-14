@@ -1,6 +1,6 @@
 # SCAD-Penalized ADMM for Multi-region Subclone Reconstruction
 
-This project implements a **CUDA-accelerated**, research-oriented pipeline to perform **SCAD-penalized ADMM** for subclone reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The newest version removes the need to build large dense matrices on CPU, instead using **iterative Conjugate Gradient** (CG) on the GPU to solve the ADMM subproblems efficiently. Additionally, we avoid Python `for` loops in the main numeric routine, relying on **vectorized** or **sparse** operations in PyTorch.
+This project implements a **CUDA-accelerated**, research-oriented pipeline to perform **SCAD-penalized ADMM** for subclone reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The newest version removes the need to build large dense matrices on CPU, instead using **iterative Conjugate Gradient** (CG) on the GPU to solve the ADMM subproblems efficiently. Additionally, we avoid Python `for` loops in the main numeric routine, relying on **vectorized** or **sparse** operations in PyTorch. See [CliPP2.pdf](/CliPP2.pdf) and [gpu_implementation.pdf](/gpu_implementation.pd) for details.
 
 ## Table of Contents
 1. [Introduction](#introduction)  

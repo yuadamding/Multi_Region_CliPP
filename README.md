@@ -158,12 +158,4 @@ Key functions in `scad_admm.py` (or `core3.py`):
 - **Email**: yding4@mdanderson.org, yding1995@gmail.com
 
 For questions, bug reports, or contributions, please reach out or open an issue. Feel free to adapt this pipeline to your subclone modeling or SCAD-penalized tasks!
-```
 
----
-
-### Key Points
-
-1. **`device='cuda'`** argument in `clipp2(...)` ensures GPU acceleration.  
-2. **Iterative CG** means no large dense matrix is ever built, improving memory usage and speed.  
-3. **No Python `for` loops** for pairwise expansions—PyTorch sparse operators handle them.

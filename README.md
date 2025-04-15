@@ -1,6 +1,6 @@
-# SCAD-Penalized ADMM for Multi-region Subclone Reconstruction
+# SCAD-Penalized ADMM for Multi-region subclonal Reconstruction
 
-This project implements a **CUDA-accelerated**, research-oriented pipeline to perform **SCAD-penalized ADMM** for subclone reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The newest version removes the need to build large dense matrices on CPU, instead using **iterative Conjugate Gradient** (CG) on the GPU to solve the ADMM subproblems efficiently, relying on **vectorized** or **sparse** operations in PyTorch. See [CliPP2.pdf](/CliPP2.pdf) and [gpu_implementation.pdf](/gpu_implementation.pdf) for details.
+This project implements a **CUDA-accelerated**, research-oriented pipeline to perform **SCAD-penalized ADMM** for subclonal reconstruction. It supports both single-sample \((M=1)\) and multi-sample \((M>1)\) scenarios. The newest version removes the need to build large dense matrices on CPU, instead using **iterative Conjugate Gradient** (CG) on the GPU to solve the ADMM subproblems efficiently, relying on **vectorized** or **sparse** operations in PyTorch. See [CliPP2.pdf](/CliPP2.pdf) and [gpu_implementation.pdf](/gpu_implementation.pdf) for details.
 
 ## Table of Contents
 1. [Introduction](#introduction)  
@@ -15,7 +15,7 @@ This project implements a **CUDA-accelerated**, research-oriented pipeline to pe
 ## Introduction
 
 **Goal:**  
-Subclone reconstruction by grouping single nucleotide variants (SNVs) that share similar frequency patterns, in either a single-sample or multi-sample context. The penalty is a group-SCAD that encourages merging of pairwise differences in logistic-scale parameters.
+subclonal reconstruction by grouping single nucleotide variants (SNVs) that share similar frequency patterns, in either a single-sample or multi-sample context. The penalty is a group-SCAD that encourages merging of pairwise differences in logistic-scale parameters.
 
 **Key Changes in the CUDA Implementation:**
 1. **GPU (CUDA) Acceleration**:  
@@ -108,7 +108,7 @@ pip install numpy scipy torch
        device='cuda'    # GPU acceleration
    )
 
-   print("Final subclone logistic-scale means (phi):", result['phi'])
+   print("Final subclonal logistic-scale means (phi):", result['phi'])
    print("Cluster assignments (label):", result['label'])
    ```
 
@@ -117,8 +117,8 @@ pip install numpy scipy torch
    - The main linear system `(B^T B + alpha * Delta^T Delta)*w = ...` is solved **iteratively** with a **manual Conjugate Gradient** approach, **no** Python `for` loops.
 
 4. **Results**  
-   - **`result['phi']`**: The final logistic-scale estimates (subclone means) for each SNV in shape `(No_mutation, M)`.  
-   - **`result['label']`**: The integer cluster labels for each SNV, indicating subclone membership.
+   - **`result['phi']`**: The final logistic-scale estimates (subclonal means) for each SNV in shape `(No_mutation, M)`.  
+   - **`result['label']`**: The integer cluster labels for each SNV, indicating subclonal membership.
 
 ---
 
@@ -157,5 +157,5 @@ Key functions in `scad_admm.py` (or `core3.py`):
 - **Date**: October 2024  
 - **Email**: yding4@mdanderson.org, yding1995@gmail.com
 
-For questions, bug reports, or contributions, please reach out or open an issue. Feel free to adapt this pipeline to your subclone modeling or SCAD-penalized tasks!
+For questions, bug reports, or contributions, please reach out or open an issue. Feel free to adapt this pipeline to your subclonal modeling or SCAD-penalized tasks!
 

@@ -56,7 +56,6 @@ MUITI_REGION_CLIPP/
 
 - **`input_files/`**: Example or raw input data with one subdirectory per region (`regionA`, `regionB`, etc.).  
 - **`preprocess_result/`**: (Optional) where you might store processed data.  
-- **`scad_admm.py`**: The main script containing your SCAD-based ADMM code (or in some versions, `core.py`).  
 - **`README.md`**: This documentation file, which you are reading now.
 
 ---

@@ -69,7 +69,7 @@ MUITI_REGION_CLIPP/
 - **SciPy**  
 - **PyTorch (>=1.10)** or ideally **PyTorch 2.0+** for advanced CUDA/sparse ops
   - If you want to use the **built-in** `torch.sparse.linalg.cg`, you need **PyTorch ≥2.0** (experimental).
-  - Otherwise, a **manual CG** loop is provided (no Python `for` loops).
+  - Otherwise, a **manual CG** loop is provided.
 
 Install example:
 ```bash

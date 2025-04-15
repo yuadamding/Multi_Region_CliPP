@@ -50,7 +50,6 @@ MUITI_REGION_CLIPP/
   │   └── regionB/ 
   │        └── ...
   ├── preprocess_result/
-  ├── scad_admm.py      (or clipp2/core.py, etc.)
   ├── README.md
   └── ...
 ```

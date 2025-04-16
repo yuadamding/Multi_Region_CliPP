@@ -112,7 +112,7 @@ pip install numpy scipy torch
 
    - Set `device='cuda'` if you have a GPU and want to accelerate.  
    - The code now uses **vectorized** sparse operations to compute pairwise differences.  
-   - The main linear system `(B^T B + alpha * Delta^T Delta)*w = ...` is solved **iteratively** with a **manual Conjugate Gradient** approach, **no** Python `for` loops.
+   - The main linear system `(B^T B + alpha * Delta^T Delta) * w = \alpha Delta^T (\eta_old - \tau_old) - B^T A` is solved **iteratively** with a **manual Conjugate Gradient** approach, **no** Python `for` loops.
 
 4. **Results**  
    - **`result['phi']`**: The final logistic-scale estimates (subclonal means) for each SNV in shape `(No_mutation, M)`.  

@@ -101,6 +101,8 @@ def run_clipp2(args):
         r,n,minor,total = [arr[idxs] for arr in (r,n,minor,total)]
         coef_list = [mat[idxs] for mat in coef_list]
         for arr in (r,n,minor,total): arr[np.isnan(arr)] = 1
+    else:
+        idxs = range(r.shape[0])
     log("Running CliPP2 clustering")
     try:
         res = clipp2(r,n,minor,total,pur_arr,coef_list,
@@ -118,20 +120,37 @@ def run_clipp2(args):
     # Step 6: build result with ordering from loci_list
     rows = []
     R = len(region_names)
-    for j, (chrom, pos) in enumerate(loci_list):
-        for i, region in enumerate(region_names):
-            val = phi_hat[j, i] 
-            lab = labels[j]
-            phi = phi_cent[j, i] 
-            rows.append({
-                'chromosome_index': chrom,
-                'position': pos,
-                'region': region,
-                'label': lab,
-                'phi': phi,
-                'phi_hat': val,
-                'dropped': 0
-            })
+    mutation_ind = 0
+    j = 0
+    for _, (chrom, pos) in enumerate(loci_list):
+        if mutation_ind in idxs:
+            for i, region in enumerate(region_names):
+                val = phi_hat[j, i] 
+                lab = labels[j]
+                phi = phi_cent[j, i] 
+                rows.append({
+                    'chromosome_index': chrom,
+                    'position': pos,
+                    'region': region,
+                    'label': lab,
+                    'phi': phi,
+                    'phi_hat': val,
+                    'dropped': 0 
+                })
+            
+            j += 1
+        else:
+            for _, region in enumerate(region_names):
+                rows.append({
+                    'chromosome_index': chrom,
+                    'position': pos,
+                    'region': region,
+                    'label': np.nan,
+                    'phi': np.nan,
+                    'phi_hat': np.nan,
+                    'dropped': 1
+                })
+        mutation_ind += 1
     result_df = pd.DataFrame(rows)
     result_df.to_csv(os.path.join(args.output_root,'result.txt'),
                      sep='\t', index=False)

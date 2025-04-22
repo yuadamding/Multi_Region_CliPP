@@ -864,7 +864,6 @@ def clipp2(
         linear_t = RHS_1 - (B_flat_t * A_flat_t)      # shape => (NM,)
 
         # 5) Manual Conjugate Gradient solve
-        #    We'll do a 'while True' to avoid Python 'for' loops.
         #    x0: initial guess => use the old solution w_old_t.
         x = w_old_t.flatten().clone()
         r = linear_t - matvec_H(x)

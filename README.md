@@ -148,6 +148,9 @@ Key functions in `scad_admm.py` (or `core3.py`):
    - If you prefer the built-in `torch.sparse.linalg.cg` (PyTorch 2.0+), you can swap in that call.
 
 ---
+## Time Consumption
+<img src="time_comparison_clipp2_pyclone.png" width="700" height="500">
+
 
 ## Contact
 

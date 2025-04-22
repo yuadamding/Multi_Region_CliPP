@@ -93,7 +93,7 @@ python CliPP2_pipeline.py \
    - `chromosome_index`, `position`, `region`,  
    - `label` (cluster ID),  
    - `phi` (ADMM estimate),  
-   - `phi_hat` (raw CCF),  
+   - `phi_hat` (raw CP),  
    - `dropped` (0/1).  
 9. Cleans up temporary work files.
 

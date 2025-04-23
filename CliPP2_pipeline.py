@@ -15,8 +15,6 @@ import argparse
 import datetime
 import warnings
 import shutil
-import pickle
-
 import numpy as np
 import pandas as pd
 
@@ -106,7 +104,7 @@ def run_clipp2(args):
     log("Running CliPP2 clustering")
     try:
         res = clipp2(r,n,minor,total,pur_arr,coef_list,
-                     Lambda=args.Lambda, device=args.device)
+                     Lambda=args.Lambda, device=args.device, dtype=args.dtype)
     except Exception as e:
         return log(f"Clustering error: {e}")
     labels, phi_cent = res['label'], res['phi']
@@ -167,5 +165,6 @@ if __name__=='__main__':
     parser.add_argument('--Lambda', type=float, default=0.1)
     parser.add_argument('--subsample_rate', type=float, default=1.0)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--dtype', default='float8')
     args = parser.parse_args()
     run_clipp2(args)

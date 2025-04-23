@@ -78,7 +78,8 @@ python CliPP2_pipeline.py \
   --output_root output \
   --Lambda 0.1 \
   --subsample_rate 1.0 \
-  --device cuda
+  --device cuda \ # GPU computing
+  --dtype float8 # default is float8 for speed and memory consideration, you can choose from (float8, float16, float32)
 ```
 
 **Steps performed:**

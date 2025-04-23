@@ -698,7 +698,8 @@ def clipp2(
     Lambda=0.01,
     post_th=0.05,
     least_diff=0.01,
-    device='cuda'
+    device='cuda', 
+    dtype = torch.float32,
 ):
     """
     Perform the ADMM + SCAD approach for multi-sample subclone reconstruction,
@@ -751,19 +752,25 @@ def clipp2(
     minor = ensure_2D_and_no_zeros(minor)
     total = ensure_2D_and_no_zeros(total)
 
-    def to_torch_gpu(arr):
-        return torch.as_tensor(arr, dtype=torch.float32, device=device)
-
-    r_t     = to_torch_gpu(r)
-    n_t     = to_torch_gpu(n)
-    minor_t = to_torch_gpu(minor)
-    total_t = to_torch_gpu(total)
+    def to_torch_gpu(arr, dtype):
+        arr = arr.astype(np.float32)
+        if dtype== 'float8':
+            return torch.as_tensor(arr, dtype=torch.float8, device=device)
+        elif dtype== 'float16':
+            return torch.as_tensor(arr, dtype=torch.float16, device=device)
+        else:
+            return torch.as_tensor(arr, dtype=torch.float32, device=device)
+        
+    r_t     = to_torch_gpu(r, dtype)
+    n_t     = to_torch_gpu(n, dtype)
+    minor_t = to_torch_gpu(minor, dtype)
+    total_t = to_torch_gpu(total, dtype)
 
     # Build c_all => shape(No_mutation, M, 6)
     c_stack = []
     for c in coef_list:
         # Each c => shape(No_mutation, 6)
-        c_stack.append(to_torch_gpu(c))
+        c_stack.append(to_torch_gpu(c, dtype))
     c_all_t = torch.stack(c_stack, dim=1)  # shape => (No_mutation, M, 6)
 
     No_mutation, M = r_t.shape
@@ -772,7 +779,7 @@ def clipp2(
     if isinstance(purity, (float, int)):
         purity_t = torch.full((No_mutation, M), float(purity), device=device)
     else:
-        purity_vec = to_torch_gpu(purity)  # shape (M,)
+        purity_vec = to_torch_gpu(purity, dtype)  # shape (M,)
         purity_t   = purity_vec.unsqueeze(0).expand(No_mutation, -1)
 
     ploidy_t = torch.full((No_mutation, M), 2.0, device=device)

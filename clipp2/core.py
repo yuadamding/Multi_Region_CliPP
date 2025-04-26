@@ -755,7 +755,7 @@ def clipp2(
     def to_torch_gpu(arr, dtype):
         arr = arr.astype(np.float32)
         if dtype== 'float8':
-            return torch.as_tensor(arr, dtype=torch.float8, device=device)
+            return torch.as_tensor(arr, dtype=torch.float8_e4m3fn, device=device)
         elif dtype== 'float16':
             return torch.as_tensor(arr, dtype=torch.float16, device=device)
         else:

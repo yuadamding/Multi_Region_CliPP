@@ -165,6 +165,6 @@ if __name__=='__main__':
     parser.add_argument('--Lambda', type=float, default=0.1)
     parser.add_argument('--subsample_rate', type=float, default=1.0)
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--dtype', default='float8')
+    parser.add_argument('--dtype', default='float16')
     args = parser.parse_args()
     run_clipp2(args)

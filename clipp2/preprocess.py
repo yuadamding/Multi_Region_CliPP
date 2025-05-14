@@ -1,296 +1,297 @@
 import os
-import sys
-import numpy as np
+import glob
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
-
-def process_files(snvfile, cnafile, purityfile):
+def load_snv_cna_purity(root_dir):
     """
-    Process SNV, CNA, and purity files into a DataFrame.
-    - snvfile: path to SNV with ['chromosome_index','position','alt_count','ref_count']
-    - cnafile: path to CNA with ['chromosome_index','start_position','end_position','major_cn','minor_cn','total_cn']
-    - purityfile: single-value file with tumour purity
-    Returns DataFrame with columns:
-      ['chromosome_index','position','ref_counts','alt_counts',
-       'major_cn','minor_cn','normal_cn','tumour_purity','start_position','end_position']
+    Traverse each subdirectory of `root_dir`, loading:
+      - the first '*snv.txt'  as a DataFrame
+      - the first '*cna.txt'  as a DataFrame
+      - the first '*purity.txt' as a float
+    Returns three dicts: snv_dict, cna_dict, purity_dict keyed by subdir name.
     """
-    # Load input files
-    df_snv = pd.read_csv(snvfile, sep='\t')
-    df_cna = pd.read_csv(cnafile, sep='\t')
-    with open(purityfile, 'r') as f:
-        purity = float(f.read().strip())
+    snv_dict    = {}
+    cna_dict    = {}
+    purity_dict = {}
 
-    # Validate required columns
-    req_snv = {'chromosome_index','position','alt_count','ref_count'}
-    req_cna = {'chromosome_index','start_position','end_position','major_cn','minor_cn','total_cn'}
-    missing = req_snv - set(df_snv.columns)
-    assert not missing, f"Missing SNV columns: {missing}"
-    missing = req_cna - set(df_cna.columns)
-    assert not missing, f"Missing CNA columns: {missing}"
-    assert 0 <= purity <= 1, f"Purity must be in [0,1], got {purity}"
+    for name in os.listdir(root_dir):
+        subdir = os.path.join(root_dir, name)
+        if not os.path.isdir(subdir):
+            continue
 
-    # Map each SNV to its CNA segment
-    major_cn = []
-    minor_cn = []
-    start_pos = []
-    end_pos = []
-    for _, row in df_snv.iterrows():
-        seg = df_cna[
-            (df_cna['chromosome_index'] == row['chromosome_index']) &
-            (df_cna['start_position'] <= row['position']) &
-            (df_cna['end_position'] >= row['position'])
-        ]
-        if not seg.empty:
-            major_cn.append(int(seg['major_cn'].iloc[0]))
-            minor_cn.append(int(seg['minor_cn'].iloc[0]))
-            start_pos.append(int(seg['start_position'].iloc[0]))
-            end_pos.append(int(seg['end_position'].iloc[0]))
+        # look *inside* this subdir for each file type
+        snv_files    = glob.glob(os.path.join(subdir, '*snv.txt'))
+        cna_files    = glob.glob(os.path.join(subdir, '*cna.txt'))
+        purity_files = glob.glob(os.path.join(subdir, '*purity.txt'))
+
+        if snv_files:
+            snv_dict[name] = pd.read_csv(snv_files[0], sep='\t', comment='#')
+        if cna_files:
+            cna_dict[name] = pd.read_csv(cna_files[0], sep='\t', comment='#')
+
+        # --- purity, per‐sample ---
+        if purity_files:
+            purity_path = purity_files[0]
+            with open(purity_path, 'r') as f:
+                txt = f.read().strip()
+            try:
+                purity_dict[name] = float(txt)
+            except ValueError:
+                raise ValueError(f"Could not parse purity value '{txt}' in {purity_path}")
         else:
-            # default copy number if no segment matches
-            major_cn.append(1)
-            minor_cn.append(1)
-            start_pos.append(int(row['position'] - 1))
-            end_pos.append(int(row['position'] + 1))
+            # No purity file in this subdir: set None or raise
+            purity_dict[name] = 0.0
 
-    # Construct output DataFrame
-    df_out = pd.DataFrame({
-        'chromosome_index':  df_snv['chromosome_index'],
-        'position':        df_snv['position'],
-        'ref_counts':      df_snv['ref_count'],
-        'alt_counts':      df_snv['alt_count'],
-        'major_cn':        major_cn,
-        'minor_cn':        minor_cn,
-        'normal_cn':       2,
-        'tumour_purity':   purity,
-        'start_position':  start_pos,
-        'end_position':    end_pos
-    })
-    return df_out
+    return snv_dict, cna_dict, purity_dict
 
 
-def insert_distinct_rows_multi(df_list):
+def combine_snv_cna(snv_df: pd.DataFrame,
+                    cna_df: pd.DataFrame,
+                    purity: float,
+                    default_cn: tuple = (1, 1, 2)
+                   ) -> pd.DataFrame:
     """
-    Ensure each DataFrame in df_list contains all mutation loci observed across the list.
-    Inserts missing rows with default copy numbers and purity.
-    Returns list of updated DataFrames.
-    """
-    # Collect all unique keys
-    keys = set()
-    for df in df_list:
-        keys.update(zip(df['chromosome_index'], df['position']))
+    Merge an SNV DataFrame and a CNA DataFrame, carrying along a single purity value.
 
-    # Insert missing rows into each DataFrame
-    updated = []
-    for df in df_list:
-        present = set(zip(df['chromosome_index'], df['position']))
-        missing = [k for k in keys if k not in present]
-        if missing:
-            to_add = pd.DataFrame(missing, columns=['chromosome_index','position'])
-            to_add['ref_counts']    = 0
-            to_add['alt_counts']    = 0
-            to_add['major_cn']      = 1
-            to_add['minor_cn']      = 1
-            to_add['normal_cn']     = 2
-            to_add['tumour_purity'] = df['tumour_purity'].iat[0]
-            to_add['start_position']= to_add['position'] - 1
-            to_add['end_position']  = to_add['position'] + 1
-            to_add = to_add[df.columns]
-            df = pd.concat([df, to_add], ignore_index=True)
-        updated.append(df)
-    return updated
+    Parameters
+    ----------
+    snv_df : pd.DataFrame
+        Columns: ['chromosome_index','position','alt_count','ref_count']
+    cna_df : pd.DataFrame
+        Columns: ['chromosome_index','start_position','end_position',
+                  'major_cn','minor_cn','total_cn']
+    purity : float
+        Tumor purity to annotate every SNV.
+    default_cn : (int,int,int), optional
+        Fallback (major, minor, total) copy‐number if no CNA segment contains the SNV.
+
+    Returns
+    -------
+    merged : pd.DataFrame
+        Columns: ['chromosome_index','position','alt_count','ref_count',
+                  'major_cn','minor_cn','total_cn','purity']
+    """
+    # bucket CNA segments by chromosome for fast lookup
+    cna_groups = {}
+    for _, row in cna_df.iterrows():
+        chrom = row['chromosome_index']
+        cna_groups.setdefault(chrom, []).append(row)
+
+    records = []
+    for _, snv in snv_df.iterrows():
+        chrom = snv['chromosome_index']
+        pos   = snv['position']
+
+        maj, mino, tot = default_cn
+        for seg in cna_groups.get(chrom, []):
+            if seg['start_position'] <= pos <= seg['end_position']:
+                maj, mino, tot = seg['major_cn'], seg['minor_cn'], seg['total_cn']
+                break
+
+        records.append({
+            'chromosome_index': chrom,
+            'position':         pos,
+            'alt_count':        snv['alt_count'],
+            'ref_count':        snv['ref_count'],
+            'major_cn':         maj,
+            'minor_cn':         mino,
+            'total_cn':         tot,
+            'purity':           purity
+        })
+
+    return pd.DataFrame.from_records(records)
+
+def combine_patient_samples(root):
+    # === Step 1: load everything ===
+    snv_dict, cna_dict, purity_dict = load_snv_cna_purity(root)
+
+    # === Step 2: per‐sample merge ===
+    merged_dict = {}
+    for sample, snv_df in snv_dict.items():
+        cna_df = cna_dict.get(
+            sample,
+            pd.DataFrame(columns=[
+                'chromosome_index','start_position','end_position',
+                'major_cn','minor_cn','total_cn'
+            ])
+        )
+        purity = purity_dict.get(sample, 1.0)
+        merged_dict[sample] = combine_snv_cna(snv_df, cna_df, purity)
+
+    # === Step 3: get the union of all (chrom, pos) pairs ===
+    all_pairs = pd.concat(
+        [df[['chromosome_index','position']] for df in merged_dict.values()],
+        ignore_index=True
+    ).drop_duplicates()
+
+    # === Step 4: re‐index each sample to that union ===
+    filled_dfs = []
+    for sample, df in merged_dict.items():
+        # drop purity/sample so they don't interfere with merge
+        df_core = df.drop(columns=['purity','sample'], errors='ignore')
+
+        # ensure every pair is present
+        full = all_pairs.merge(
+            df_core,
+            on=['chromosome_index','position'],
+            how='left'
+        )
+
+        # fill zeros for the count/CN columns
+        for col in ['ref_count','major_cn','minor_cn','total_cn']:
+            full[col] = full[col].fillna(1).astype(int)
+        full['alt_count'] = full['alt_count'].fillna(0).astype(int)
+        # re‐add purity & sample
+        full['purity'] = purity_dict.get(sample, 1.0)
+        full['sample'] = sample
+
+        filled_dfs.append(full)
 
 
-def export_snv_cna_and_purity(df, dir, snv_path, cna_path, purity_path):
-    """
-    Export standardized SNV, CNA, and purity files from df.
-    """
-    os.makedirs(dir, exist_ok=True)
-    # SNV file
-    snv_df = df[['chromosome_index','position','alt_counts','ref_counts']].rename(
-        columns={
-            'chromosome_index': 'chromosome_index',
-            'alt_counts':     'alt_count',
-            'ref_counts':     'ref_count'
-        }
+    # === Step 5: concatenate into one final DataFrame ===
+    final_df = pd.concat(filled_dfs, ignore_index=True)
+    final_df = final_df.sort_values(['chromosome_index', 'position']).reset_index(drop=True)
+    
+    # --- ENSURE minor_cn ≤ major_cn ---
+    minor = final_df[['minor_cn','major_cn']].min(axis=1)
+    major = final_df[['minor_cn','major_cn']].max(axis=1)
+    final_df['minor_cn'] = minor.astype(int)
+    final_df['major_cn'] = major.astype(int)
+    
+    return final_df
+
+def add_to_df(df):
+    # pull out vectors
+    alt = df['alt_count'].to_numpy()
+    ref = df['ref_count'].to_numpy()
+    n   = alt + ref
+    rho = df['purity'].fillna(0).to_numpy()
+    tot = df['total_cn'].to_numpy()
+    cN  = 2
+
+    # ensure minor_cn ≤ major_cn
+    maj = df['major_cn'].to_numpy()
+    mino = df['minor_cn'].to_numpy()
+    major = np.maximum(maj, mino)
+    minor = np.minimum(maj, mino)
+
+    # multiplicity: safe divide
+    denom = n * rho
+    ratio = np.zeros_like(alt, dtype=float)
+    np.divide(alt, denom, out=ratio, where=denom>0)
+
+    raw = ratio * (rho * tot + (1 - rho) * cN)
+    # no NaNs/inf because ratio is 0 where denom==0
+    mult = np.minimum(np.round(raw).astype(int), np.maximum(major, minor))
+    mult = np.where(mult == 0, 1, mult)
+
+    # linear‐approx parameters vectorized
+    w    = np.array([-4.0, -1.8, 1.8, 4.0])
+    expw = np.exp(w)                   # shape (4,)
+    onep = 1 + expw                    # shape (4,)
+
+    # build theta denominator (4 × N)
+    theta_den = onep[:, None] * (cN*(1 - rho)[None, :] + tot[None, :] * rho[None, :])
+    # compute act[k,i] = expw[k] * mult[i] / theta_den[k,i]
+    act = expw[:, None] * mult[None, :] / theta_den
+
+    # piecewise slopes & intercepts (N‐length each)
+    a1 = (act[1] - act[0]) / (w[1] - w[0])
+    b1 = act[0] - a1 * w[0]
+    a2 = (act[2] - act[1]) / (w[2] - w[1])
+    b2 = act[1] - a2 * w[1]
+    a3 = (act[3] - act[2]) / (w[3] - w[2])
+    b3 = act[2] - a3 * w[2]
+
+    # stack into (N,6)
+    params = np.stack([a1, b1, a2, b2, a3, b3], axis=1)
+    breaks = np.array([-1.8, 1.8])
+
+    # write back into a new DataFrame
+    out = df.copy()
+    out['minor_cn']          = minor.astype(int)
+    out['major_cn']          = major.astype(int)
+    out['multiplicity']      = mult
+    out['lin_approx_params'] = list(params)
+    out['lin_breakpoints']   = [breaks] * len(df)
+    return out
+
+
+def build_tensor_arrays(df):
+    # 1) Determine sample order and unique mutation pairs
+    samples = sorted(df['sample'].unique())
+    pairs = (
+        df[['chromosome_index','position']]
+        .drop_duplicates()
+        .sort_values(['chromosome_index','position'])
+        .reset_index(drop=True)
     )
-    snv_df.to_csv(os.path.join(dir, snv_path), sep='\t', index=False)
-    # CNA file
-    cna_df = df[['chromosome_index','start_position','end_position','major_cn','minor_cn']].rename(
-        columns={'chromosome_index': 'chromosome_index'}
-    )
-    # Include total_cn 
-    cna_df['total_cn'] = cna_df['major_cn'] + cna_df['minor_cn']
-    cna_df.to_csv(os.path.join(dir, cna_path), sep='\t', index=False)
-    # Purity file
-    purity_val = df['tumour_purity'].iat[0]
-    with open(os.path.join(dir, purity_path), 'w') as f:
-        f.write(f"{purity_val}\n")
+    No = len(pairs)
+    M  = len(samples)
 
+    # 2) Precompute n = alt + ref
+    df = df.copy()
+    df['n'] = df['alt_count'] + df['ref_count']
 
-def combine(chrom_list, pos_list, indices, reason):
-    """
-    Build list of "chromosome<TAB>position<TAB>reason" for each index.
-    """
-    return [f"{chrom_list[i]}\t{pos_list[i]}\t{reason}" for i in indices]
+    # 3) Pivot each metric into a (No × M) table, then convert to numpy
+    index = ['chromosome_index','position']
+    r_df     = df.pivot(index=index, columns='sample', values='alt_count')
+    n_df     = df.pivot(index=index, columns='sample', values='n')
+    minor_df = df.pivot(index=index, columns='sample', values='multiplicity')
+    total_df = df.pivot(index=index, columns='sample', values='total_cn')
 
+    # Reindex to ensure the same ordering
+    idx = pd.MultiIndex.from_frame(pairs)
+    r_df     = r_df.reindex(index=idx, columns=samples)
+    n_df     = n_df.reindex(index=idx, columns=samples)
+    minor_df = minor_df.reindex(index=idx, columns=samples)
+    total_df = total_df.reindex(index=idx, columns=samples)
 
-def preprocess(
-    snv_file, cn_file, purity_file, sample_id, output_prefix,
-    drop_data=True
-):
-    """
-    Full CLiPP2 preprocessing for a single sample, applying all filters,
-    computing multiplicity, performing piecewise linear approximation,
-    calculating phi, and writing output files.
-    """
-    # 1) Validate input paths
-    for path in (snv_file, cn_file, purity_file):
-        if not os.path.exists(path):
-            sys.exit(f"Missing file: {path}")
-    os.makedirs(output_prefix, exist_ok=True)
+    # convert to numpy and cast dtypes
+    r     = r_df.to_numpy(dtype=int)
+    n     = n_df.to_numpy(dtype=int)
+    minor = minor_df.to_numpy(dtype=int)
+    total = total_df.to_numpy(dtype=int)
 
-    # 2) Define helper functions for approximation
-    def theta(w, bv, cv, cn, pur):
-        return (np.exp(w)*bv)/((1+np.exp(w))*cn*(1-pur)+(1+np.exp(w))*cv*pur)
+    # 4) Purity array for each sample (float)
+    pur_arr = np.array([
+        df.loc[df['sample']==s, 'purity'].iat[0]
+        for s in samples
+    ], dtype=float)
 
-    def linear_approximation(bv, cv, cn, pur, diag_plot=False):
-        w = np.arange(-4.0, 4.1, 0.1)
-        act = theta(w, bv, cv, cn, pur)
-        i = np.argmin(np.abs(w + 1.8))
-        j = np.argmin(np.abs(w - 1.8))
-        # slopes & intercepts
-        a1 = (act[i] - act[0]) / (w[i] - w[0]); b1 = act[0] - a1*w[0]
-        a2 = (act[j] - act[i]) / (w[j] - w[i]); b2 = act[i] - a2*w[i]
-        a3 = (act[-1] - act[j]) / (w[-1] - w[j]); b3 = act[-1] - a3*w[-1]
-        # piecewise values
-        appr = np.zeros_like(w)
-        appr[:i+1]   = a1*w[:i+1]   + b1
-        appr[i+1:j+1] = a2*w[i+1:j+1] + b2
-        appr[j+1:]   = a3*w[j+1:]   + b3
-        diff = np.max(np.abs(act - appr))
-        coef = np.array([a1, b1, a2, b2, a3, b3])
-        cuts = np.array([w[i], w[j]])
-        return diff, coef, cuts
+    # 5) Build coef_list into a (No, M, 6) float array
+    coef_df = df.pivot(index=index, columns='sample', values='lin_approx_params')
+    coef_df = coef_df.reindex(index=idx, columns=samples)
 
-    # 3) Load data
-    purity = float(pd.read_csv(purity_file, header=None, sep='\t').iloc[0, 0])
-    snv_df = pd.read_csv(snv_file, sep='\t')
-    cn_df  = pd.read_csv(cn_file, sep='\t').dropna(subset=['minor_cn'])
+    coef_arr = np.empty((No, M, 6), dtype=float)
+    for i in range(No):
+        for j in range(M):
+            coef_arr[i, j, :] = coef_df.iat[i, j]
 
-    # Extract arrays
-    chrom = snv_df['chromosome_index'].astype(float).values
-    pos   = snv_df['position'].astype(float).values
-    alt   = snv_df['alt_count'].astype(float).values
-    ref   = snv_df['ref_count'].astype(float).values
-    total_read = alt + ref
-    cn_chr   = cn_df['chromosome_index'].astype(float).values
-    cn_start = cn_df['start_position'].astype(float).values
-    cn_end   = cn_df['end_position'].astype(float).values
-    cn_minor = cn_df['minor_cn'].astype(float).values
-    cn_major = cn_df['major_cn'].astype(float).values
-    cn_total = cn_df['total_cn'].astype(float).values
+    coef_list = [ coef_arr[:, j, :] for j in range(M) ]
 
-    dropped = []
+    # === Sanity checks ===
+    assert isinstance(pairs, pd.DataFrame) and pairs.shape == (No, 2)
+    assert isinstance(samples, list) and len(samples) == M
 
-    # FILTER 1: autosomes only
-    valid = ~np.isnan(chrom)
-    dropped += combine(chrom, pos, np.where(~valid)[0], "SNV on sex chromosome or missing")
-    if drop_data:
-        chrom, pos, alt, ref, total_read = chrom[valid], pos[valid], alt[valid], ref[valid], total_read[valid]
+    assert isinstance(r, np.ndarray) and r.dtype == np.int64
+    assert r.shape == (No, M)
+    assert n.shape == (No, M) and n.dtype == np.int64
+    assert minor.shape == (No, M) and minor.dtype == np.int64
+    assert total.shape == (No, M) and total.dtype == np.int64
 
-    # FILTER 2: non-negative reads
-    valid = (alt >= 0) & (total_read >= 0)
-    dropped += combine(chrom, pos, np.where(~valid)[0], "Negative read counts")
-    if drop_data:
-        chrom, pos, alt, ref, total_read = chrom[valid], pos[valid], alt[valid], ref[valid], total_read[valid]
-    N = len(chrom)
+    assert isinstance(pur_arr, np.ndarray) and pur_arr.dtype == np.float64
+    assert pur_arr.shape == (M,)
 
-    # Map SNVs to CNA segments
-    seg_ids = np.full(N, -1, dtype=int)
-    for i in range(N):
-        hits = np.where(
-            (cn_chr == chrom[i]) &
-            (cn_start <= pos[i]) &
-            (cn_end >= pos[i])
-        )[0]
-        if hits.size > 0:
-            seg_ids[i] = hits[0]
-    # FILTER 3: valid CNA segment
-    valid = seg_ids >= 0
-    dropped += combine(chrom, pos, np.where(~valid)[0], "No matching CNA segment")
-    if drop_data:
-        mask = valid
-        chrom, pos, alt, ref, total_read, seg_ids = (
-            chrom[mask], pos[mask], alt[mask], ref[mask], total_read[mask], seg_ids[mask]
-        )
-    N = len(chrom)
-    seg_total = cn_total[seg_ids]
-    seg_minor = np.maximum(cn_minor[seg_ids], cn_major[seg_ids])
-
-    # multiplicity calculation
-    multiplicity = np.round(
-        (alt / total_read) / purity * (seg_total * purity + (1 - purity) * 2)
-    )
-    minor_count = np.minimum(seg_minor, multiplicity)
-    minor_count[minor_count < 1] = 1
-
-    # FILTER 4: positive minor and total CN
-    valid = (minor_count > 0) & (seg_total > 0)
-    dropped += combine(chrom, pos, np.where(~valid)[0], "Invalid multiplicity or CN")
-    if drop_data:
-        mask = valid
-        chrom, pos, alt, ref, total_read, seg_total, minor_count = (
-            chrom[mask], pos[mask], alt[mask], ref[mask], total_read[mask], seg_total[mask], minor_count[mask]
-        )
-    N = len(chrom)
-
-    # Piecewise linear approximation for each SNV
-    coefs = np.zeros((N, 6), dtype=float)
-    cuts  = np.zeros((N, 2), dtype=float)
-    diffs = np.zeros(N, dtype=float)
-    cache = {}
-    for i in range(N):
-        key = (seg_total[i], minor_count[i])
-        if key in cache:
-            diffs[i], coefs[i], cuts[i] = cache[key]
-        else:
-            d, c, ct = linear_approximation(minor_count[i], seg_total[i], 2, purity)
-            diffs[i], coefs[i], cuts[i] = d, c, ct
-            cache[key] = (d, c, ct)
-    # FILTER 5: approximation error ≤ 0.1
-    valid = diffs <= 0.1
-    dropped += combine(chrom, pos, np.where(~valid)[0], "Approximation error > 0.1")
-    if drop_data:
-        mask = valid
-        chrom, pos, alt, ref, total_read, seg_total, minor_count, coefs, cuts = (
-            chrom[mask], pos[mask], alt[mask], ref[mask], total_read[mask], seg_total[mask], minor_count[mask], coefs[mask], cuts[mask]
-        )
-    N = len(chrom)
-
-    # Calculate phi and FILTER 6: 0 < phi ≤ 1.5
-    phi = 2.0 / ((minor_count / (alt / total_read)) - seg_total + 2.0)
-    out_hi = np.where(phi > 1.5)[0]
-    if drop_data and out_hi.size > 0:
-        pd.DataFrame(np.column_stack((chrom[out_hi], pos[out_hi], seg_total[out_hi], minor_count[out_hi]))).to_csv(
-            os.path.join(output_prefix, 'outPosition.txt'), sep='\t', index=False, header=False
-        )
-    valid = (phi > 0) & (phi <= 1.5)
-    dropped += combine(chrom, pos, np.where(~valid)[0], "Phi out of bounds")
-    if drop_data:
-        mask = valid
-        chrom, pos, alt, ref, total_read, seg_total, minor_count, phi, coefs, cuts = (
-            chrom[mask], pos[mask], alt[mask], ref[mask], total_read[mask], seg_total[mask], minor_count[mask], phi[mask], coefs[mask], cuts[mask]
-        )
-    # 7) Write outputs
-    os.makedirs(output_prefix, exist_ok=True)
-    np.savetxt(os.path.join(output_prefix, 'r.txt'), alt, fmt='%.0f', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'n.txt'), total_read, fmt='%.0f', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'minor.txt'), minor_count, fmt='%.0f', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'total.txt'), seg_total, fmt='%.0f', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'multiplicity.txt'), np.column_stack((chrom, pos, seg_total, minor_count)), fmt='%.6g', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'purity_ploidy.txt'), [purity], fmt='%.5f', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'coef.txt'), coefs, fmt='%.6g', delimiter='\t')
-    np.savetxt(os.path.join(output_prefix, 'cutbeta.txt'), cuts, fmt='%.6g', delimiter='\t')
-    with open(os.path.join(output_prefix, 'excluded_SNVs.txt'), 'w') as f:
-        f.write("\n".join(dropped))
-    print(f"Preprocessing complete for {sample_id}: retained {len(chrom)} SNVs.")
+    return {
+        'pairs': pairs,
+        'samples': samples,
+        'r': r,
+        'n': n,
+        'minor': minor,
+        'total': total,
+        'pur_arr': pur_arr,
+        'coef_list': coef_list
+    }

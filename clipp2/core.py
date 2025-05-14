@@ -217,194 +217,6 @@ def find_min_row_by_2norm(x):
 
     return min_index, min_row
 
-def group_all_regions_for_ADMM(root_dir):
-    """
-    Search all subdirectories under root_dir. Each subdirectory is one region (one sample).
-    Load r.txt, n.txt, minor.txt, total.txt, purity_ploidy.txt, coef.txt,
-    and combine them into the multi-sample arrays for run_clipp2_ADMM.
-
-    We assume:
-      - Each file is shape (No_mutation,) or (No_mutation,1).
-      - purity_ploidy.txt has a single scalar => the region's purity. We'll fix ploidy=2.0.
-      - coef.txt is shape (No_mutation, 6) for each region, stored in a list of length M.
-      - All regions have the same No_mutation => we can stack horizontally.
-      - We define wcut = np.array([-0.18, 1.8]) globally.
-
-    Returns
-    -------
-    r_final     : np.ndarray, shape (No_mutation_filtered, M)
-    n_final     : np.ndarray, shape (No_mutation_filtered, M)
-    minor_final : np.ndarray, shape (No_mutation_filtered, M)
-    total_final : np.ndarray, shape (No_mutation_filtered, M)
-    purity_list : list of floats, length M
-    coef_list   : list of np.ndarray, length M, each shape (No_mutation_filtered, 6)
-    wcut        : np.ndarray of shape (2,)
-    drop_rows   : np.ndarray of int, the row indices that were dropped
-    """
-
-    # 1) Find all subdirectories => each subdir is one region => M subdirs total.
-    subdirs = [
-        d for d in os.listdir(root_dir)
-        if os.path.isdir(os.path.join(root_dir, d))
-    ]
-    subdirs.sort()  # for stable ordering
-
-    if not subdirs:
-        raise ValueError(f"No subdirectories found in {root_dir}. Each region must be in its own subdir.")
-
-    # Prepare lists to accumulate region data
-    r_list      = []
-    n_list      = []
-    minor_list  = []
-    total_list  = []
-    purity_list = []
-    coef_list   = []  # length M, each is (No_mutation, 6)
-
-    # 2) Loop over each region subdir
-    for region_name in subdirs:
-        region_path = os.path.join(root_dir, region_name)
-        if not os.path.isdir(region_path):
-            continue  # skip non-directory
-
-        # Construct file paths
-        r_file     = os.path.join(region_path, "r.txt")
-        n_file     = os.path.join(region_path, "n.txt")
-        minor_file = os.path.join(region_path, "minor.txt")
-        total_file = os.path.join(region_path, "total.txt")
-        purity_file= os.path.join(region_path, "purity_ploidy.txt")
-        coef_file  = os.path.join(region_path, "coef.txt")
-
-        # Read each file (adjust delimiter if needed)
-        r_data     = np.genfromtxt(r_file,     delimiter="\t")
-        n_data     = np.genfromtxt(n_file,     delimiter="\t")
-        minor_data = np.genfromtxt(minor_file, delimiter="\t")
-        total_data = np.genfromtxt(total_file, delimiter="\t")
-
-        # Single scalar in purity_ploidy.txt => the region's purity
-        purity_val = np.genfromtxt(purity_file, delimiter="\t")
-        if purity_val.ndim != 0:
-            raise ValueError(
-                f"purity_ploidy.txt in {region_name} must be a single scalar. "
-                f"Got shape {purity_val.shape}."
-            )
-        purity_val = float(purity_val)
-
-        # Read coef => shape (No_mutation, 6)
-        coef_data  = np.genfromtxt(coef_file, delimiter="\t")
-        if coef_data.ndim != 2 or coef_data.shape[1] != 6:
-            raise ValueError(
-                f"coef.txt in {region_name} must be 2D with 6 columns. Got shape {coef_data.shape}."
-            )
-
-        # Flatten any (No_mutation,1) arrays to 1D
-        def flatten_1d(arr):
-            if arr.ndim == 2 and arr.shape[1] == 1:
-                return arr[:,0]
-            elif arr.ndim == 1:
-                return arr
-            else:
-                raise ValueError(
-                    f"Expected shape (No_mutation,) or (No_mutation,1). Got {arr.shape}"
-                )
-
-        r_data     = flatten_1d(r_data)
-        n_data     = flatten_1d(n_data)
-        minor_data = flatten_1d(minor_data)
-        total_data = flatten_1d(total_data)
-
-        # Append to lists
-        r_list.append(r_data)
-        n_list.append(n_data)
-        minor_list.append(minor_data)
-        total_list.append(total_data)
-        purity_list.append(purity_val)
-        coef_list.append(coef_data)
-
-        print(f"Loaded region '{region_name}': "
-              f"r.shape={r_data.shape}, "
-              f"coef.shape={coef_data.shape}, purity={purity_val}")
-
-    # 3) Check consistency of No_mutation
-    M = len(subdirs)
-    No_mutation = len(r_list[0])
-    for arr in r_list[1:]:
-        if len(arr) != No_mutation:
-            raise ValueError("Inconsistent No_mutation across subdirs. "
-                             "All regions must have the same number of SNVs.")
-
-    # 4) Convert each list => 2D arrays (No_mutation, M)
-    r_final     = np.column_stack(r_list)       # shape (No_mutation, M)
-    n_final     = np.column_stack(n_list)
-    minor_final = np.column_stack(minor_list)
-    total_final = np.column_stack(total_list)
-
-    # 5) A single global wcut
-    wcut = np.array([-0.18, 1.8], dtype=float)
-
-    print("\n=== Summary of grouped data before dropping rows ===")
-    print(f"Found M={M} regions. r shape= {r_final.shape}, n= {n_final.shape}")
-    print(f"minor= {minor_final.shape}, total= {total_final.shape}")
-    print(f"coef_list length= {len(coef_list)} (each is (No_mutation,6))")
-    print(f"wcut= {wcut}")
-
-    # ----------------------------------------------------------
-    # (A) Stack coef_list into a single 3D array: c_all shape = (No_mutation, M, 6)
-    #     c_all[i,m,:] is the 6 coefficients for SNV i in region m.
-    c_all = np.stack(coef_list, axis=1)  # shape (No_mutation, M, 6)
-
-    # (B) Identify which rows are all zeros in each array:
-    zero_r      = np.all(r_final     == 0, axis=1)  # shape = (No_mutation,)
-    zero_n      = np.all(n_final     == 0, axis=1)
-    zero_minor  = np.all(minor_final == 0, axis=1)
-    zero_total  = np.all(total_final == 0, axis=1)
-
-    # For coef: row i is "all 0" if c_all[i,:,:] is 0 for every region & col
-    zero_coef   = np.all(c_all == 0, axis=(1,2))     # shape = (No_mutation,)
-
-    # (C) Combine the masks => these rows should be dropped
-    drop_mask = (zero_r | zero_n | zero_minor | zero_total | zero_coef)
-    drop_rows = np.where(drop_mask)[0]  # actual indices
-
-    # (D) Build a "keep" mask
-    keep_mask = ~drop_mask
-
-    # (E) Filter out those rows from each final array
-    r_final     = r_final[    keep_mask, :]
-    n_final     = n_final[    keep_mask, :]
-    minor_final = minor_final[keep_mask, :]
-    total_final = total_final[keep_mask, :]
-
-    # Also remove them from c_all along axis=0 => shape becomes (No_mutation_kept, M, 6)
-    c_all       = c_all[keep_mask, :, :]
-
-    # (F) Re-split c_all into a new list of shape (M) each => (No_mutation_kept, 6)
-    new_coef_list = []
-    for m_idx in range(M):
-        # c_all[:, m_idx, :] shape => (No_mutation_kept, 6)
-        new_coef_list.append(c_all[:, m_idx, :])
-
-    coef_list = new_coef_list
-
-    print(f"\nDropped {len(drop_rows)} rows that were all-zero in r/n/minor/total/coef.")
-    if len(drop_rows) > 0:
-        print(f"Indices of dropped rows: {drop_rows}")
-
-    print("\n=== Summary of grouped data after dropping rows ===")
-    print(f"r shape= {r_final.shape}, n= {n_final.shape}")
-    print(f"minor= {minor_final.shape}, total= {total_final.shape}")
-    print(f"coef_list length= {len(coef_list)}, each => shape ({r_final.shape[0]}, 6)")
-
-    return (
-        r_final,
-        n_final,
-        minor_final,
-        total_final,
-        purity_list,
-        coef_list,
-        wcut,
-        drop_rows  
-    )
-
 def soft_threshold_group(vec, threshold):
     """
     Group soft-thresholding operator for a vector in R^M.
@@ -685,191 +497,224 @@ def matvec_H(x, B_sq, DTD, alpha):
 
 
 def clipp2(
-    r, n, minor, total,
+    r,
+    n,
+    minor,
+    total,
     purity,
     coef_list,
     wcut = [-1.8, 1.8],
-    alpha=0.8,
-    gamma=3.7,
-    rho=1.02,
-    precision= 0.01,
-    Run_limit=20,
-    control_large=5,
-    Lambda=0.01,
-    post_th=0.05,
-    least_diff=0.01,
-    device='cuda', 
-    dtype = torch.float32,
+    alpha = 0.8,
+    gamma = 3.7,
+    rho   = 1.02,
+    precision    = 0.01,
+    Run_limit    = 200,
+    control_large= 5,
+    Lambda       = 0.01,
+    post_th      = 0.001,
+    least_diff   = 0.01,
+    device       = 'cuda', 
+    dtype        = torch.float32,
 ):
     """
     Perform the ADMM + SCAD approach for multi-sample subclone reconstruction,
-    plus final cluster assignment.
+    then do a final cluster assignment.
 
-    Steps:
-    1) Convert r,n,minor,total => shape (No_mutation,M). Broadcast purity,ploidy => same shape.
-    2) Initialize w => logistic transform in [-control_large, control_large].
-    3) Build difference operator (DELTA).
-    4) Initialize eta, tau, diff => run ADMM:
-       - IRLS expansions => build A,B => flatten => solve (B^T B + alpha Delta^T Delta) w = ...
-       - group SCAD threshold => update eta,tau
-       - residual check => repeat
-    5) Post-processing:
-       - if ||eta|| <= post_th => set to 0 => same cluster
-       - refine small clusters => combine
-       - compute phi_out => cluster means
-       - combine clusters if 2norm difference < least_diff
-    6) Return final assignment: 
-       { 'phi': shape(No_mutation,M), 'label': shape(No_mutation,) }
+    Steps (high-level):
+    1) Ensure input shapes => (No_mutation, M). Replace zeros with 1 in n/minor/total arrays.
+    2) Convert NumPy arrays to Torch tensors on the specified device & dtype.
+    3) Build preliminary φ-hat estimates from r, n, minor, total, purity.
+    4) Convert φ-hat to logistic space => w in [-control_large, control_large].
+    5) Build the sparse difference operator Δ (size ≈ (No_pairs*M) × (No_mutation*M)).
+    6) Initialize η, τ from w.
+    7) ADMM loop:
+       - (A) IRLS expansions => build large linear system
+       - (B) Solve system with Conjugate Gradient
+       - (C) SCAD thresholding => update η, τ
+       - (D) Check residual => stop if below precision or max iterations
+    8) Post-processing to merge clusters with small differences
+    9) Combine clusters if needed
+    10) Return final assignment { 'phi': shape(No_mutation, M),
+                                 'label': shape(No_mutation,) }
+
+    Parameters
+    ----------
+    r : np.ndarray
+        Read counts of the mutated allele, shape (No_mutation, M) or (No_mutation,).
+    n : np.ndarray
+        Total read counts, same shape as r. Zeros replaced with 1.
+    minor : np.ndarray
+        Minor CN array, same shape as r. Zeros replaced with 1.
+    total : np.ndarray
+        Total CN array, same shape as r. Zeros replaced with 1.
+    purity : float or 1D array
+        Purity (one per sample or single float).
+    coef_list : list of np.ndarray
+        IRLS coefficient expansions, each shape (No_mutation, 6).
+    wcut : list of float, optional
+        Hard logistic boundaries [low_cut, up_cut].
+    alpha : float, optional
+        Initial weight on the Δ^TΔ penalty in ADMM.
+    gamma : float, optional
+        SCAD threshold parameter.
+    rho : float, optional
+        Factor for increasing alpha after each ADMM iteration.
+    precision : float, optional
+        Residual threshold for ADMM stopping.
+    Run_limit : int, optional
+        Maximum number of ADMM iterations.
+    control_large : float, optional
+        Clamps w in [-control_large, control_large].
+    Lambda : float, optional
+        Regularization strength used in SCAD thresholding.
+    post_th : float, optional
+        Post-processing threshold for zeroing out small edges (η).
+    least_diff : float, optional
+        Minimum 2-norm difference to keep clusters separate.
+    device : str, optional
+        'cuda' or 'cpu' for torch device.
+    dtype : torch.dtype, optional
+        Torch dtype, e.g. torch.float32, torch.float64, etc.
 
     Returns
     -------
-    results : dict with 
-       'phi'   => shape (No_mutation, M)
-       'label' => shape (No_mutation,)
-
-    This merges single-sample (M=1) approach with an extension for M>1 
-    using the L2 norm across coordinates + sign from first coordinate.
+    results : dict
+        {
+          'phi'   : np.ndarray of shape (No_mutation, M),
+          'label' : np.ndarray of shape (No_mutation,)
+        }
     """
 
-    # -------- 1) Ensure shape (No_mutation, M) for all inputs --------
+    # -------------------- Helper functions --------------------
+
     def ensure_2D_and_no_zeros(arr):
         """
-        - If arr is 1D, reshape to (No_mutation, 1).
-        - If arr is 2D, keep shape.
-        - Then replace any zeros with 1.
+        If arr is 1D, reshape to (No_mutation, 1).
+        If arr is 2D, keep shape.
+        Then replace any zeros with 1.
         """
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
         elif arr.ndim != 2:
             raise ValueError(f"Expected 1D or 2D array, got shape {arr.shape}")
-        # Replace zeros with 1
-        # This is vectorized, no Python loops:
         arr = np.where(arr == 0, 1, arr)
         return arr
-    
-    r     = ensure_2D_and_no_zeros(r)
+
+    def to_torch_gpu(arr, local_dtype):
+        """
+        Convert NumPy array to torch.Tensor on the specified device and dtype.
+        Also handles float8/float16 special cases if needed.
+        """
+        arr = arr.astype(np.float32)
+        if local_dtype == 'float8':
+            return torch.as_tensor(arr, dtype=torch.float8_e4m3fn, device=device)
+        elif local_dtype == 'float16':
+            return torch.as_tensor(arr, dtype=torch.float16, device=device)
+        else:
+            return torch.as_tensor(arr, dtype=torch.float32, device=device)
+
+    # -------------------- (1) Ensure shapes and handle zeros --------------------
     n     = ensure_2D_and_no_zeros(n)
     minor = ensure_2D_and_no_zeros(minor)
     total = ensure_2D_and_no_zeros(total)
 
-    def to_torch_gpu(arr, dtype):
-        arr = arr.astype(np.float32)
-        if dtype== 'float8':
-            return torch.as_tensor(arr, dtype=torch.float8_e4m3fn, device=device)
-        elif dtype== 'float16':
-            return torch.as_tensor(arr, dtype=torch.float16, device=device)
-        else:
-            return torch.as_tensor(arr, dtype=torch.float32, device=device)
-        
-    r_t     = to_torch_gpu(r, dtype)
-    n_t     = to_torch_gpu(n, dtype)
+    # -------------------- (2) Convert inputs to torch on GPU/CPU ----------------
+    r_t     = to_torch_gpu(r,     dtype)
+    n_t     = to_torch_gpu(n,     dtype)
     minor_t = to_torch_gpu(minor, dtype)
     total_t = to_torch_gpu(total, dtype)
 
-    # Build c_all => shape(No_mutation, M, 6)
-    c_stack = []
-    for c in coef_list:
-        # Each c => shape(No_mutation, 6)
-        c_stack.append(to_torch_gpu(c, dtype))
+    # Stack coef_list => shape(No_mutation, M, 6)
+    c_stack = [to_torch_gpu(c, dtype) for c in coef_list]
     c_all_t = torch.stack(c_stack, dim=1)  # shape => (No_mutation, M, 6)
 
     No_mutation, M = r_t.shape
 
-    # 1) Prepare purity => shape (No_mutation, M)
+    # Build purity_t => shape(No_mutation, M)
     if isinstance(purity, (float, int)):
         purity_t = torch.full((No_mutation, M), float(purity), device=device)
     else:
-        purity_vec = to_torch_gpu(purity, dtype)  # shape (M,)
+        purity_vec = to_torch_gpu(purity, dtype)   # shape (M,)
         purity_t   = purity_vec.unsqueeze(0).expand(No_mutation, -1)
 
+    # Constant ploidy => shape(No_mutation, M)
     ploidy_t = torch.full((No_mutation, M), 2.0, device=device)
 
-    # 2) Initialize w_new from logistic bounding
-    fraction_t = r_t / (n_t + 1e-12)
-    phi_hat_t  = fraction_t * ((ploidy_t - purity_t*ploidy_t) + (purity_t*total_t)) / (minor_t + 1e-12)
+    # -------------------- (3) Compute φ-hat and build initial w ----------------
+    fraction_t = (r_t + 1e-12) / (n_t + 1e-10)
+    phi_hat_t  = fraction_t * (
+        (ploidy_t - purity_t*ploidy_t) + (purity_t * (total_t + 1e-10))
+    ) / (minor_t)
 
+    # Where r==0, force φ-hat to small positive constant => 1e-12
+    phi_hat_t = torch.where(r_t == 0, torch.tensor(1e-12, device=phi_hat_t.device), phi_hat_t)
+
+    # Scale φ-hat so it remains in (0,1) => logistic transform
     scale_parameter = torch.clamp(torch.max(phi_hat_t), min=1.0)
-    phi_new_t = phi_hat_t / scale_parameter
+    phi_new_t       = phi_hat_t / scale_parameter
 
-    low_b = torch.sigmoid(torch.tensor(-control_large, device=device))
-    up_b  = torch.sigmoid(torch.tensor( control_large, device=device))
-    phi_new_t = torch.clamp(phi_new_t, low_b, up_b)
-
-    w_init_t = torch.log(phi_new_t) - torch.log(1 - phi_new_t + 1e-12)
+    w_init_t = torch.log(phi_new_t / (1 - phi_new_t))
     w_init_t = torch.clamp(w_init_t, -control_large, control_large)
     w_new_t  = w_init_t.clone()
 
-    # 3) Build the sparse DELTA operator (COO)
-    #    For i<j pairs, each row in the big (No_pairs*M) row-block has +1 at (i,m) and -1 at (j,m).
-    #    We'll do this *without* for-loops using advanced indexing.
+    # -------------------- (4) Build sparse Δ operator (Delta_coo) ----------------
     i_idx_np, j_idx_np = torch.triu_indices(No_mutation, No_mutation, offset=1)
-    # Move them to 'device'
     i_idx_np = i_idx_np.to(device)
     j_idx_np = j_idx_np.to(device)
 
     No_pairs = i_idx_np.size(0)
 
-    # Then proceed to build row/col indices for the sparse Delta operator:
     pair_range = torch.arange(No_pairs, device=device)
     m_range    = torch.arange(M, device=device)
 
-    # row_idx for the +1 block => shape (No_pairs, M)
-    row_plus_2D = pair_range.unsqueeze(1)*M + m_range  # broadcast
-    # row_idx for the -1 block => same row => row_plus_2D
-    row_combined = torch.cat([row_plus_2D, row_plus_2D], dim=1)  # shape => (No_pairs, 2*M)
+    # row indices for +1 and -1
+    row_plus_2D = pair_range.unsqueeze(1)*M + m_range
+    row_combined = torch.cat([row_plus_2D, row_plus_2D], dim=1)  # same row => +1 / -1
+    row_idx = row_combined.reshape(-1)
 
-    # col_idx for +1 => i_idx_np*M + m
-    col_plus_2D = i_idx_np.unsqueeze(1)*M + m_range
-    # col_idx for -1 => j_idx_np*M + m
+    # col indices for +1 => i_idx_np*M + m; for -1 => j_idx_np*M + m
+    col_plus_2D  = i_idx_np.unsqueeze(1)*M + m_range
     col_minus_2D = j_idx_np.unsqueeze(1)*M + m_range
     col_combined = torch.cat([col_plus_2D, col_minus_2D], dim=1)
-
-    row_idx = row_combined.reshape(-1)
     col_idx = col_combined.reshape(-1)
 
-    # data => +1 then -1
-    plus_block  = torch.ones_like(col_plus_2D, dtype=torch.float32)
+    # data => +1 for plus block, -1 for minus block
+    plus_block  = torch.ones_like(col_plus_2D,  dtype=torch.float32)
     minus_block = -torch.ones_like(col_minus_2D, dtype=torch.float32)
     vals_2D = torch.cat([plus_block, minus_block], dim=1)
-    vals = vals_2D.reshape(-1)
+    vals    = vals_2D.reshape(-1)
 
     total_rows = No_pairs*M
     total_cols = No_mutation*M
+
     Delta_coo = torch.sparse_coo_tensor(
         indices=torch.stack([row_idx, col_idx], dim=0),
-        values=vals,
-        size=(total_rows, total_cols),
-        device=device
+        values =vals,
+        size   =(total_rows, total_cols),
+        device =device
     ).coalesce()
 
-    # 4) Initialize eta, tau
-    #    We can get the difference directly: D_w => shape(No_pairs, M) = w[i_idx]-w[j_idx]
-    #    We'll re-use the code from scad_threshold_update for consistency.
-    #    For initialization, just do:
-    eta_new_t = (w_new_t[i_idx_np, :] - w_new_t[j_idx_np, :])
+    # -------------------- (5) Initialize η, τ ----------------
+    # η(i, j) = w[i] - w[j]; shape => (No_pairs, M)
+    eta_new_t = w_new_t[i_idx_np, :] - w_new_t[j_idx_np, :]
     tau_new_t = torch.ones_like(eta_new_t, device=device)
 
-    # 5) ADMM iteration
+    # -------------------- (6) ADMM iteration ----------------
     residual = 1e6
     k_iter   = 0
-
     low_cut, up_cut = wcut
 
-    while k_iter < Run_limit and residual > precision:
-
-        # Might also stop if we get nan
-        # (we do a small check below)
+    while (k_iter < Run_limit) and (residual > precision):
         k_iter += 1
 
-        w_old_t  = w_new_t.clone()
+        w_old_t   = w_new_t.clone()
         eta_old_t = eta_new_t.clone()
         tau_old_t = tau_new_t.clone()
 
-        # =========== (A) IRLS expansions (vectorized) ===========
-        expW_t = torch.exp(w_old_t)
-        denom_ = 2.0 + expW_t*total_t
-        denom_ = torch.clamp(denom_, min=1e-12)
-        theta_t = (expW_t * minor_t)/denom_
+        # === (A) IRLS expansions (vectorized) ===
+        expW_t  = torch.exp(w_old_t)
+        denom_  = (2.0 * (1 - purity_t) + purity_t*total_t) * (1 + expW_t)
+        theta_t = (expW_t * minor_t) / denom_
 
         maskLow_t = (w_old_t <= low_cut)
         maskUp_t  = (w_old_t >= up_cut)
@@ -877,209 +722,235 @@ def clipp2(
 
         # c_all_t => shape(No_mutation, M, 6)
         partA_full_t = (
-            maskLow_t * c_all_t[...,1]
-          + maskUp_t  * c_all_t[...,5]
-          + maskMid_t * c_all_t[...,3]
-        ) - (r_t/(n_t+1e-12))
+            maskLow_t * c_all_t[...,1] +
+            maskUp_t  * c_all_t[...,5] +
+            maskMid_t * c_all_t[...,3]
+        ) - (r_t + 1e-12)/(n_t + 1e-10)
 
         partB_full_t = (
-            maskLow_t * c_all_t[...,0]
-          + maskUp_t  * c_all_t[...,4]
-          + maskMid_t * c_all_t[...,2]
+            maskLow_t * c_all_t[...,0] +
+            maskUp_t  * c_all_t[...,4] +
+            maskMid_t * c_all_t[...,2]
         )
 
-        sqrt_n_t = torch.sqrt(n_t)
-        denom2_t = torch.sqrt(theta_t*(1-theta_t) + 1e-12)
+        sqrt_n_t = torch.sqrt(n_t + 1e-10)
+        denom2_t = torch.sqrt(theta_t*(1 - theta_t))
 
-        A_array_t = (sqrt_n_t * partA_full_t)/denom2_t
-        B_array_t = (sqrt_n_t * partB_full_t)/denom2_t
+        A_array_t = (sqrt_n_t * partA_full_t) / denom2_t
+        B_array_t = (sqrt_n_t * partB_full_t) / denom2_t
 
         A_flat_t = A_array_t.flatten()  # shape => (No_mutation*M,)
         B_flat_t = B_array_t.flatten()
 
-        # ---------------- (B) Build system & solve with manual CG ----------------
+        # === (B) Build & solve system with CG: (diag(B^2) + αΔ^TΔ) w = ...
+        NM      = B_flat_t.shape[0]   # = (No_mutation*M)
+        B_sq_t  = B_flat_t**2
 
-        # 1) Get dimensions and build diag(B^2):
-        NM = B_flat_t.shape[0]      # = (No_mutation * M)
-        B_sq_t = B_flat_t**2        # shape => (NM,)
+        # precompute Δ^TΔ (sparse)
+        Delta_t = Delta_coo.transpose(0, 1)
+        DTD     = torch.sparse.mm(Delta_t, Delta_coo)
 
-        # 2) Compute sparse Delta^T Delta => shape (NM, NM)
-        Delta_t = Delta_coo.transpose(0, 1)  # shape => (NM, No_pairs*M)
-        DTD = torch.sparse.mm(Delta_t, Delta_coo)  # shape => (NM, NM), still sparse
-
-        # 3) Define a function that multiplies H = (diag(B^2) + alpha * (Delta^T Delta)) by x
+        # matvec for H = diag(B^2) + αDTD
         def matvec_H(x):
-            # x shape => (NM,)
-            # (A) multiply by diag(B_sq_t)
             out = B_sq_t * x
-            # (B) add alpha * (DTD @ x)
-            out += alpha * torch.sparse.mm(DTD, x.unsqueeze(-1)).squeeze(-1)
+            out += alpha*torch.sparse.mm(DTD, x.unsqueeze(-1)).squeeze(-1)
             return out
 
-        # 4) Build the right-hand side: linear_t
-        big_eta_tau_t = alpha*eta_old_t + tau_old_t   # shape => (No_pairs, M)
-        big_eta_tau_flat_t = big_eta_tau_t.flatten()  # shape => (No_pairs*M,)
+        # RHS => linear_t
+        big_eta_tau_t = alpha*eta_old_t + tau_old_t
+        big_eta_tau_f = big_eta_tau_t.flatten()  # shape => (No_pairs*M,)
 
-        RHS_1 = torch.sparse.mm(Delta_t, big_eta_tau_flat_t.unsqueeze(1)).squeeze(1)
-        linear_t = RHS_1 - (B_flat_t * A_flat_t)      # shape => (NM,)
+        RHS_1    = torch.sparse.mm(Delta_t, big_eta_tau_f.unsqueeze(1)).squeeze(1)
+        linear_t = RHS_1 - (B_flat_t * A_flat_t)
 
-        # 5) Manual Conjugate Gradient solve
-        #    x0: initial guess => use the old solution w_old_t.
-        x = w_old_t.flatten().clone()
-        r = linear_t - matvec_H(x)
-        p = r.clone()
-        rs_old = torch.dot(r, r)
+        # Conjugate Gradient solve
+        x       = w_old_t.flatten().clone()
+        r_vec   = linear_t - matvec_H(x)
+        p       = r_vec.clone()
+        rs_old  = torch.dot(r_vec, r_vec)
 
         max_cg_iter = 500
-        tol = 1e-6
-        iter_cg = 0
+        tol         = 1e-6
+        iter_cg     = 0
 
         while True:
-            # Ap = H * p
-            Ap = matvec_H(p)
-            denom_ = torch.dot(p, Ap) + 1e-12
-            alpha_cg = rs_old / denom_
-            
-            x = x + alpha_cg * p
-            r = r - alpha_cg * Ap
-            rs_new = torch.dot(r, r)
+            Ap        = matvec_H(p)
+            denom_    = torch.dot(p, Ap) + 1e-12
+            alpha_cg  = rs_old / denom_
 
-            iter_cg += 1
-            # Check stopping criteria
-            if rs_new.sqrt() < tol or iter_cg >= max_cg_iter:
+            x         = x + alpha_cg * p
+            r_vec     = r_vec - alpha_cg * Ap
+            rs_new    = torch.dot(r_vec, r_vec)
+
+            iter_cg  += 1
+            if (rs_new.sqrt() < tol) or (iter_cg >= max_cg_iter):
                 break
 
-            p = r + (rs_new / rs_old) * p
-            rs_old = rs_new
+            p       = r_vec + (rs_new / rs_old) * p
+            rs_old  = rs_new
 
-        # x now holds the solution for (diag(B^2) + alpha * DTD) * x = linear_t
         w_new_flat_t = x
-        w_new_t = w_new_flat_t.view(No_mutation, M)
+        w_new_t      = w_new_flat_t.view(No_mutation, M)
 
-        # Finally, clamp in [-control_large, control_large]
+        # clamp w in [-control_large, control_large]
         w_new_t = torch.clamp(w_new_t, -control_large, control_large)
 
-
-        # Finally, clamp in [-control_large, control_large]
-        w_new_t = torch.clamp(w_new_t, -control_large, control_large)
-
-        # =========== (C) SCAD threshold ===========  
+        # === (C) SCAD threshold => update η, τ
         eta_new_t, tau_new_t = scad_threshold_update_torch(
             w_new_t, tau_old_t, Delta_coo, alpha, Lambda, gamma
         )
 
-        # scale alpha
+        # update alpha for next iteration
         alpha *= rho
 
-        # =========== (D) residual check ===========
-        # residual = max_{i<j,m} | (w[i]-w[j]) - eta[k]| 
-        # We'll do it again with the Delta approach
-        # D_w = Delta_coo w_new_flat
+        # === (D) Compute residual
         w_new_flat2 = w_new_t.flatten()
         D_w_flat2   = torch.sparse.mm(Delta_coo, w_new_flat2.unsqueeze(1)).squeeze(1)
-        # reshape to (No_pairs, M)
-        D_w2 = D_w_flat2.view(No_pairs, M)
-        diff_2D_t = D_w2 - eta_new_t
+        D_w2        = D_w_flat2.view(No_pairs, M)
+
+        diff_2D_t   = D_w2 - eta_new_t
         residual_val_t = torch.max(torch.abs(diff_2D_t))
         residual = float(residual_val_t.item())
 
         if torch.isnan(residual_val_t):
             break
 
-        print(f"Iter={k_iter}, alpha={alpha:.4f}, residual={residual:.6g}")
-
     print("\nADMM finished.\n")
-    
-    w_new = w_new_t.detach().cpu().numpy()
+
+    # -------------------- (7) Post-processing: cluster assignment ----------------
+    w_new   = w_new_t.detach().cpu().numpy()
     eta_new = eta_new_t.detach().cpu().numpy()
     phi_hat = phi_hat_t.detach().cpu().numpy()
-    diff = diff_mat(w_new)
-    ids = np.triu_indices(diff.shape[1], 1)
-    eta_new[np.where(np.abs(eta_new) <= post_th)] = 0
+
+    # Build difference matrix from w
+    diff    = diff_mat(w_new)
+
+    # For upper-tri indices, fill with norm(η).
+    ids           = np.triu_indices(diff.shape[1], 1)
+    # Zero out small edges => post_th
+    eta_new[np.abs(eta_new) <= post_th] = 0
     diff[ids] = np.linalg.norm(eta_new, axis=1)
-    class_label = -np.ones(No_mutation)
+
+    # Build initial cluster labels
+    class_label = -np.ones(No_mutation, dtype=int)
     class_label[0] = 0
     group_size = [1]
     labl = 1
 
     for i in range(1, No_mutation):
+        assigned = False
         for j in range(i):
             if diff[j, i] == 0:
                 class_label[i] = class_label[j]
-                group_size[int(class_label[j])] += 1
+                group_size[class_label[j]] += 1
+                assigned = True
                 break
-        if class_label[i] == -1:
+        if not assigned:
             class_label[i] = labl
             labl += 1
             group_size.append(1)
 
-    # quality control
+    # -------------------- (8) Refine small clusters --------------------
     least_mut = np.ceil(0.05 * No_mutation)
-    tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
-    tmp_grp = np.where(group_size == tmp_size)
-    refine = False
+    tmp_size  = np.min(np.array(group_size)[np.array(group_size) > 0])
+    tmp_grp   = np.where(group_size == tmp_size)
+    refine    = False
     if tmp_size < least_mut:
         refine = True
 
     while refine:
         refine = False
         tmp_col = np.where(class_label == tmp_grp[0][0])[0]
-        for i in range(len(tmp_col)):
-            if tmp_col[i] != 0 and tmp_col[i] != No_mutation - 1:
-                tmp_diff = np.abs(np.append(np.append(diff[0:tmp_col[i], tmp_col[i]].T.ravel(), 100),
-                                            diff[tmp_col[i], (tmp_col[i] + 1):No_mutation].ravel()))
+        for mut_idx in tmp_col:
+            if (mut_idx != 0) and (mut_idx != No_mutation - 1):
+                tmp_diff = np.abs(
+                    np.concatenate([
+                        diff[:mut_idx, mut_idx].ravel(),
+                        [100],
+                        diff[mut_idx, mut_idx+1:].ravel()
+                    ])
+                )
                 tmp_diff[tmp_col] += 100
-                diff[0:tmp_col[i], tmp_col[i]] = tmp_diff[0:tmp_col[i]]
-                diff[tmp_col[i], (tmp_col[i] + 1):No_mutation] = tmp_diff[(tmp_col[i] + 1):No_mutation]
-            elif tmp_col[i] == 0:
-                tmp_diff = np.append(100, diff[0, 1:No_mutation])
+                diff[:mut_idx, mut_idx]        = tmp_diff[:mut_idx]
+                diff[mut_idx, mut_idx+1:]      = tmp_diff[mut_idx+1:]
+            elif mut_idx == 0:
+                tmp_diff = np.concatenate([
+                    [100],
+                    diff[0, 1:No_mutation]
+                ])
                 tmp_diff[tmp_col] += 100
-                diff[0, 1:No_mutation] = tmp_diff[1:No_mutation]
+                diff[0, 1:No_mutation] = tmp_diff[1:]
             else:
-                tmp_diff = np.append(diff[0:(No_mutation - 1), No_mutation - 1], 100)
+                tmp_diff = np.concatenate([
+                    diff[:No_mutation-1, No_mutation-1],
+                    [100]
+                ])
                 tmp_diff[tmp_col] += 100
-                diff[0:(No_mutation - 1), No_mutation - 1] = tmp_diff[0:(No_mutation - 1)]
+                diff[:No_mutation-1, No_mutation-1] = tmp_diff[:-1]
+
+            old_lbl = class_label[mut_idx]
+            group_size[old_lbl] -= 1
+            # pick new label => the closest by diff
             ind = tmp_diff.argmin()
-            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] -= 1
-            class_label[tmp_col[i]] = class_label[ind]
-            group_size[class_label.astype(np.int64, copy=False)[tmp_col[i]]] += 1
+            class_label[mut_idx] = class_label[ind]
+            group_size[class_label[ind]] += 1
+
         tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
-        tmp_grp = np.where(group_size == tmp_size)
-        refine = False
+        tmp_grp  = np.where(group_size == tmp_size)
         if tmp_size < least_mut:
             refine = True
 
-    labels = np.unique(class_label)
-    phi_out = np.zeros((len(labels), M))
-    for i in range(len(labels)):
-        ind = np.where(class_label == labels[i])[0]
-        class_label[ind] = i
-        phi_out[i, :] = np.sum(phi_hat[ind, : ] * n[ind, : ], axis=0) / np.sum(n[ind, : ], axis=0)
+    # -------------------- (9) Compute final cluster means (phi_out) --------------------
+    labels     = np.unique(class_label)
+    phi_out    = np.zeros((len(labels), M))
+    # Weighted average of phi_hat by coverage n
+    for i, lbl in enumerate(labels):
+        cluster_idx = np.where(class_label == lbl)[0]
+        class_label[cluster_idx] = i
+        nh = n[cluster_idx, :]
+        ph = phi_hat[cluster_idx, :]
+        phi_out[i, :] = np.sum(ph * nh, axis=0) / np.sum(nh, axis=0)
 
+    # Optionally combine clusters if 2-norm < least_diff
     if len(labels) > 1:
         sort_phi = sort_by_2norm(phi_out)
         phi_diff = sort_phi[1:, :] - sort_phi[:-1, :]
         min_ind, min_val = find_min_row_by_2norm(phi_diff)
+
         while np.linalg.norm(min_val) < least_diff:
-            combine_ind = np.where(phi_out == sort_phi[min_ind, ])[0]
-            combine_to_ind = np.where(phi_out == sort_phi[min_ind + 1, ])[0]
-            class_label[class_label == combine_ind] = combine_to_ind
+            # combine these two clusters
+            clusterA = np.where(phi_out == sort_phi[min_ind])[0]
+            clusterB = np.where(phi_out == sort_phi[min_ind + 1])[0]
+
+            class_label[class_label == clusterA] = clusterB
             labels = np.unique(class_label)
+
+            # re-build phi_out for fewer labels
             phi_out = np.zeros((len(labels), M))
-            for i in range(len(labels)):
-                ind = np.where(class_label == labels[i])[0]
-                class_label[ind] = i
-                phi_out[i] = np.sum(phi_hat[ind, : ] * n[ind, : ], axis=0) / np.sum(n[ind, : ], axis=0)
+            for i, lbl in enumerate(labels):
+                idx = np.where(class_label == lbl)[0]
+                class_label[idx] = i
+                nh = n[idx, :]
+                ph = phi_hat[idx, :]
+                phi_out[i, :] = np.sum(ph * nh, axis=0) / np.sum(nh, axis=0)
+
             if len(labels) == 1:
                 break
-            else:
-                sort_phi = sort_by_2norm(phi_out)
-                phi_diff = sort_phi[1:, :] - sort_phi[:-1, :]
-                min_ind, min_val = find_min_row_by_2norm(phi_diff)
-    phi_res = np.zeros((No_mutation, M))
-    for lab in range(np.shape(phi_out)[0]):
-        phi_res[class_label == lab, ] = phi_out[lab, ]
 
+            # recalc differences
+            sort_phi = sort_by_2norm(phi_out)
+            phi_diff = sort_phi[1:, :] - sort_phi[:-1, :]
+            min_ind, min_val = find_min_row_by_2norm(phi_diff)
+
+    # -------------------- (10) Assign final phi_res by cluster --------------------
+    phi_res = np.zeros((No_mutation, M))
+    for lab_idx in range(phi_out.shape[0]):
+        phi_res[class_label == lab_idx, :] = phi_out[lab_idx, :]
+
+    # Re-check and reassign labels (distance-based)
     class_label = reassign_labels_by_distance(phi_res, class_label, purity)
-    
-    return {'phi': phi_res, 'label': class_label}
+
+    return {
+        'phi'  : phi_res,
+        'label': class_label
+    }

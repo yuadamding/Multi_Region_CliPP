@@ -10,7 +10,8 @@ def run(args):
     root           = args.input_dir
     subsample_rate = args.subsample_rate
     Lambda         = args.Lambda
-
+    outdir         = args.output_dir
+    dtype          = args.dtype
     # ► EARLY SANITY CHECK ◀
     if not os.path.isdir(root):
         print(f"Error: input directory not found: {root!r}")
@@ -45,10 +46,10 @@ def run(args):
         print("[5/7] No subsampling applied")
         idxs = range(r.shape[0])
 
-    print(f"[6/7] Running CLiPP2 with Lambda={Lambda}, device='cuda', dtype='float64'")
+    print(f"[6/7] Running CLiPP2 with Lambda={Lambda}, device='cuda', dtype={dtype}")
     res = clipp2(
         r, n, minor, total, pur_arr, coef_list,
-        Lambda=Lambda, device='cuda', dtype='float64'
+        Lambda=Lambda, device='cuda', dtype=dtype
     )
     labels, phi_cent = res['label'], res['phi']
 
@@ -84,8 +85,11 @@ def run(args):
             })
 
     result_df = pd.DataFrame(rows)
-    result_df.to_csv('res.tsv', sep='\t', index=False)
-    print("Done. Output written to res.tsv")
+    os.makedirs(outdir, exist_ok=True)
+    suboutput = os.path.join(outdir, root)
+    os.makedirs(suboutput, exist_ok=True)
+    result_df.to_csv(f'{suboutput}/clipp2_result.tsv', sep='\t', index=False)
+    print(f"Done. Output written to {suboutput}/clipp2_result.tsv")
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(
@@ -93,9 +97,12 @@ if __name__=='__main__':
     )
     parser.add_argument('--input_dir',       required=True,
                         help="Root directory of processed samples")
+    parser.add_argument('--output_dir',       default='output',
+                        help="Root directory of processed samples")
     parser.add_argument('--Lambda', type=float, default=0.1,
                         help="Regularization strength for CLiPP2")
     parser.add_argument('--subsample_rate', type=float, default=1.0,
                         help="Fraction of mutations to keep (for speed/debug)")
+    parser.add_argument('--dtype', default='float64')
     args = parser.parse_args()
     run(args)

@@ -495,7 +495,6 @@ def matvec_H(x, B_sq, DTD, alpha):
     out += alpha * torch.sparse.mm(DTD, x.unsqueeze(-1)).squeeze(-1)
     return out
 
-
 def clipp2(
     r,
     n,
@@ -815,7 +814,7 @@ def clipp2(
         if torch.isnan(residual_val_t):
             break
 
-    print("\nADMM finished.\n")
+    # print("\nADMM finished.\n")
 
     # -------------------- (7) Post-processing: cluster assignment ----------------
     w_new   = w_new_t.detach().cpu().numpy()
@@ -950,7 +949,27 @@ def clipp2(
     # Re-check and reassign labels (distance-based)
     class_label = reassign_labels_by_distance(phi_res, class_label, purity)
 
+    # -------------------- (11) AIC/BIC Calculation --------------------
+    phi_clip = np.clip(phi_res, 1e-15, 1 - 1e-15)
+
+    # Vectorized approach
+    # shape checks: r, n, minor, total => (No_mutation, M)
+    # purity => shape (M,) => we can broadcast with purity[None, :]
+    denominator = 2.0*(1.0 - purity[None,:]) + purity[None,:]*total
+    pp_matrix   = phi_clip * minor / denominator
+    logL_matrix = r * np.log(pp_matrix) + (n - r) * np.log(1 - pp_matrix)
+    logL        = np.sum(logL_matrix)
+
+    N = No_mutation * M
+    K_clusters = len(np.unique(class_label))
+    k_params   = K_clusters * M
+
+    AIC = -2.0 * logL + 2.0 * k_params
+    BIC = -2.0 * logL + k_params * np.log(N)
+
     return {
         'phi'  : phi_res,
-        'label': class_label
+        'label': class_label,
+        'aic'  : AIC,
+        'bic'  : BIC
     }

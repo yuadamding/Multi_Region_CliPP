@@ -44,7 +44,7 @@ def run(args):
     for Lambda in Lambda_lst:
         res = clipp2(
             r, n, minor, total, pur_arr, coef_list,
-            Lambda=Lambda, device='cuda', dtype=dtype
+            Lambda=Lambda, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=dtype
         )
         labels, phi_cent, aic, bic = res['label'], res['phi'], res['aic'], res['bic']
 

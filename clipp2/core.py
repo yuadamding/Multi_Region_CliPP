@@ -1,15 +1,38 @@
-#!/usr/bin/env python3
-
 """
-This script provides a research-oriented pipeline for a SCAD-penalized ADMM approach 
-to multi-region subclone reconstruction in single-sample or multi-sample (M>1) scenarios. 
+This script provides a research-oriented pipeline for a SCAD-penalized ADMM approach
+to multi-region subclone reconstruction in single-sample or multi-sample (M>1) scenarios.
 
-Main steps:
-1) Load data files from multiple "regions" (directories), each representing 
-   a sample/region for ADMM.  (See `group_all_regions_for_ADMM`.)
-2) Initialize logistic-scale parameters `w_new`.
-3) Build difference operators and run an ADMM loop with SCAD-based thresholding.
-4) Merge clusters in a final post-processing step if they are too close.
+The model, CliPP2, is a statistical framework for identifying subclonal structures by
+grouping Single Nucleotide Variants (SNVs) that share common evolutionary patterns across
+multiple tumor samples. It achieves this by minimizing a penalized negative log-likelihood
+objective function, where a Group SCAD penalty is applied to the pairwise differences
+of logistic-scale cellular prevalence vectors ($\vec{p}_i$) for each SNV.
+
+The objective function is:
+    min_{P} { -l(P) + sum_{i < i'} SCAD_lambda(||p_i - p_{i'}||_2) }
+
+This non-convex problem is solved using the Alternating Direction Method of Multipliers (ADMM),
+which involves iteratively solving for the prevalence matrix P and auxiliary variables.
+
+Main Pipeline Steps:
+1) Preprocess Data: Load input files (read counts, copy number, etc.), validate
+   data shapes, compute initial unpenalized estimates, and move data to the
+   specified compute device (CPU/GPU).
+2) Run ADMM Optimization: Execute the core ADMM optimization loop. This involves
+   iteratively updating a quadratic approximation of the likelihood (IRLS step),
+   solving a linear system for the primary variables `P` using the Conjugate
+   Gradient method, and applying a group SCAD thresholding operator for the
+   auxiliary variables. This process is run over a sequence of regularization
+   parameters (Lambda), using warm starts to enhance convergence.
+3) Postprocess Results: For each Lambda, the raw output is processed to form
+   distinct clusters. This involves merging small or proximal clusters based on
+   pre-defined heuristics. Model selection criteria (AIC, BIC) are computed.
+4) Calculate Quality Metrics: The Wasserstein distance between the penalized
+   result and the initial unpenalized estimate is calculated for each Lambda to
+   quantify the effect of regularization.
+5) Return Results: The final output is a list of dictionaries, with each dictionary
+   containing the comprehensive results (phi, labels, AIC, BIC, distance) for
+   one Lambda value.
 
 Author: [Yu Ding, Ph.D. / Wenyi Wang's Lab / MD Anderson Cancer Center]
 Date: [Oct 2024]
@@ -22,702 +45,486 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import spsolve
 from scipy.special import expit, logit
 import torch
+from scipy.stats import wasserstein_distance
+from typing import List, Dict, Any, Tuple, Union, Optional
+
+# =============================================================================
+# I. CORE ALGORITHMIC COMPONENTS (ADMM UPDATES & LINEAR ALGEBRA)
+# =============================================================================
 
 def scad_threshold_update_torch(
-    w_new_t, tau_old_t, i_idx, j_idx, alpha, Lambda, gamma
-):
+    w_new_t: torch.Tensor,
+    tau_old_t: torch.Tensor,
+    i_idx: torch.Tensor,
+    j_idx: torch.Tensor,
+    alpha: float,
+    Lambda: float,
+    gamma: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    GPU-based SCAD update using direct indexing (`w[i] - w[j]`).
-    This is faster than sparse.mm by avoiding its overhead and uses less memory
-    by not requiring the Delta_coo structure.
-    """
-    # 1. Compute pairwise differences directly. Highly efficient on GPU.
-    D_w = w_new_t[i_idx, :] - w_new_t[j_idx, :]
+    Performs the eta-update and tau-update steps of the ADMM algorithm.
 
-    # 2. The rest of the logic is unchanged but operates on the efficiently-computed D_w.
-    delt_t = D_w - (1.0/alpha) * tau_old_t
+    This function implements the group SCAD thresholding operator, which is the
+    proximal operator for the SCAD penalty. It solves the subproblem for the
+    auxiliary variable `eta` and then updates the dual variable `tau`.
+
+    Ref: Supplementary Information, Section 2.2 (eta-update).
+
+    The update for `eta` is:
+    eta_new = argmin_{eta} { SCAD_lambda(||eta||_2) + (alpha/2) * ||eta - delta||_2^2 }
+    where delta = (p_i - p_j) + (1/alpha) * tau_old.
+
+    The variable `tau` in this code corresponds to the negative scaled dual variable,
+    i.e., tau = -alpha * u. The update rule used here,
+    tau_new = tau_old - alpha * (residual), is equivalent to the standard scaled
+    dual update u_new = u_old + residual.
+
+    Parameters
+    ----------
+    w_new_t : torch.Tensor
+        The updated logistic-scale parameter matrix P (S x M). Corresponds to `p^(k+1)`.
+    tau_old_t : torch.Tensor
+        The dual variable from the previous iteration. Corresponds to `tau^(k)`.
+    i_idx, j_idx : torch.Tensor
+        Indices for the upper triangle of the pairwise difference matrix.
+    alpha : float
+        The augmented Lagrangian penalty parameter.
+    Lambda : float
+        The SCAD regularization parameter (lambda).
+    gamma : float
+        The SCAD shape parameter (a > 2, typically 3.7).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        - eta_new_t: The updated auxiliary variable. Corresponds to `eta^(k+1)`.
+        - tau_new_t: The updated dual variable. Corresponds to `tau^(k+1)`.
+    """
+    # Calculate the argument for the proximal operator
+    D_w = w_new_t[i_idx, :] - w_new_t[j_idx, :]
+    delt_t = D_w - (1.0 / alpha) * tau_old_t  # This is `delta` in the math derivation
     delt_norm_t = torch.norm(delt_t, dim=1)
-    
-    # ... (Rest of the SCAD logic is identical to your original function)
+
+    # Pre-calculate constants for efficiency
     lam_over_alpha = Lambda / alpha
     gamma_lam = gamma * Lambda
-    mask1 = (delt_norm_t <= lam_over_alpha)
+
+    # Apply the three-part SCAD thresholding rule based on the norm of `delta`
     mask2 = (delt_norm_t > lam_over_alpha) & (delt_norm_t <= (Lambda + lam_over_alpha))
     mask3 = (delt_norm_t > (Lambda + lam_over_alpha)) & (delt_norm_t <= gamma_lam)
     mask4 = (delt_norm_t > gamma_lam)
+
     eta_new_t = torch.zeros_like(delt_t)
+
+    # Part 1: Soft-thresholding region
     if mask2.any():
         i2 = mask2.nonzero(as_tuple=True)[0]
         scale2 = torch.clamp(1.0 - (lam_over_alpha / delt_norm_t[i2]), min=0.0)
         eta_new_t[i2] = scale2.unsqueeze(1) * delt_t[i2]
+
+    # Part 2: Intermediate region (moves solution towards `delta`)
     if mask3.any():
         i3 = mask3.nonzero(as_tuple=True)[0]
         denom2 = 1.0 - 1.0/((gamma - 1)*alpha)
         if denom2 > 0:
-            eta_new_t[i3] = (1.0 / denom2) * torch.clamp(1.0 - ((gamma_lam / ((gamma - 1)*alpha)) / delt_norm_t[i3]), min=0.0).unsqueeze(1) * delt_t[i3]
+            scale3 = (1.0 / denom2) * torch.clamp(1.0 - ((gamma_lam / ((gamma - 1)*alpha)) / delt_norm_t[i3]), min=0.0)
+            eta_new_t[i3] = scale3.unsqueeze(1) * delt_t[i3]
         else:
-            eta_new_t[i3] = delt_t[i3]
+            eta_new_t[i3] = delt_t[i3] # Fallback if denominator is non-positive
+
+    # Part 3: Unpenalized region (solution is `delta`)
     if mask4.any():
         i4 = mask4.nonzero(as_tuple=True)[0]
         eta_new_t[i4] = delt_t[i4]
-    
+
+    # Dual variable update (tau-update)
+    # This corresponds to tau^(k+1) <- tau^(k) + alpha * (Delta*p^(k+1) - eta^(k+1))
+    # with a sign convention difference.
     tau_new_t = tau_old_t - alpha * (D_w - eta_new_t)
+
     return eta_new_t, tau_new_t
 
-def matvec_H_laplacian(x, B_sq_t, No_mutation, M, alpha):
+def matvec_H_laplacian(x: torch.Tensor, B_sq_t: torch.Tensor, No_mutation: int, M: int, alpha: float) -> torch.Tensor:
     """
-    Computes (diag(B^2) + alpha*DTD) @ x using the Graph Laplacian formula DTD=N*I-J.
-    This replaces a slow sparse matrix multiply with fast, GPU-native dense algebra.
+    Computes the matrix-vector product for the Conjugate Gradient solver.
+
+    This function calculates `y = Hx` where `H = B^T*B + alpha * Delta^T*Delta`.
+    `B` is the diagonal matrix from the quadratic approximation of the likelihood,
+    and `Delta^T*Delta` is the graph Laplacian matrix. This operation is a key
+    part of the p-update step.
+
+    Ref: Supplementary Information, Section 3 (Conjugate gradient method).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        The vector to be multiplied by the matrix H (flattened, size SM).
+    B_sq_t : torch.Tensor
+        The squared diagonal elements of the matrix B (flattened, size SM).
+    No_mutation : int
+        Number of SNVs (S).
+    M : int
+        Number of samples.
+    alpha : float
+        The augmented Lagrangian penalty parameter.
+
+    Returns
+    -------
+    torch.Tensor
+        The result of the matrix-vector product `Hx`.
     """
+    # Part 1: B^T*B * x (element-wise product since B is diagonal)
     out = B_sq_t * x
+
+    # Part 2: alpha * Delta^T*Delta * x (the graph Laplacian part)
+    # Reshape x into the matrix W (S x M) to compute the Laplacian action.
     W = x.view(No_mutation, M)
+    # The action of the graph Laplacian L = Delta^T*Delta on W is S*W - sum(W),
+    # where the sum is broadcasted across rows.
     sum_of_rows = W.sum(dim=0, keepdim=True)
-    L_times_W = No_mutation * W - sum_of_rows  # Broadcasting handles the J matrix multiply
+    L_times_W = No_mutation * W - sum_of_rows
     out.add_(L_times_W.flatten(), alpha=alpha)
+
     return out
 
-def transpose_matvec_delta(v_pairs, No_mutation, M, i_idx, j_idx):
+def transpose_matvec_delta(v_pairs: torch.Tensor, No_mutation: int, M: int, i_idx: torch.Tensor, j_idx: torch.Tensor) -> torch.Tensor:
     """
-    Computes Δ^T @ v using a memory-efficient and fast scatter-add operation.
+    Computes the transpose matrix-vector product for the operator Delta.
+
+    This function calculates `z = Delta^T * v`, where `Delta` is the pairwise
+    difference operator. This is used to construct the right-hand side of the
+    linear system in the p-update.
+
+    Ref: Supplementary Information, Section 2.1, Eq. (7).
+
+    Parameters
+    ----------
+    v_pairs : torch.Tensor
+        The vector representing values on the edges of the SNV graph.
+    No_mutation : int
+        Number of SNVs (S).
+    M : int
+        Number of samples.
+    i_idx, j_idx : torch.Tensor
+        Indices for the pairs defining the Delta operator.
+
+    Returns
+    -------
+    torch.Tensor
+        The result of the product `Delta^T * v`, a flattened vector of size SM.
     """
     z_mat = torch.zeros((No_mutation, M), dtype=v_pairs.dtype, device=v_pairs.device)
+    # The action of Delta^T is to aggregate the differences back to the nodes.
+    # For a pair (i,j), v_ij contributes positively to node i and negatively to node j.
     z_mat.index_add_(0, i_idx, v_pairs)
     z_mat.index_add_(0, j_idx, -v_pairs)
     return z_mat.flatten()
 
-def sort_by_2norm(x):
+def run_admm_optimization(
+    preprocessed_data: Dict[str, Any],
+    wcut: List[float],
+    alpha_init: float,
+    gamma: float,
+    rho: float,
+    precision: float,
+    Run_limit: int,
+    control_large: float,
+    Lambda: float,
+    device: str,
+    warm_start_vars: Optional[Dict[str, torch.Tensor]] = None
+) -> Dict[str, torch.Tensor]:
     """
-    Sort the rows of array x by their Euclidean (L2) norm.
+    Executes the core ADMM optimization loop for a single Lambda value.
+
+    This function implements the full ADMM algorithm by iteratively updating
+    the quadratic approximation of the likelihood, solving for the primary
+    variable `w` (P matrix), and updating the auxiliary (`eta`) and dual (`tau`)
+    variables until convergence.
+
+    Ref: Supplementary Information, Section 2 (Computational structure using ADMM).
 
     Parameters
     ----------
-    x : np.ndarray
-        Shape (N, M).  Each row x[i,:] is a vector in R^M.
-
-    Returns
-    -------
-    x_sorted : np.ndarray, shape (N, M)
-        The same rows as x, but ordered by ascending L2 norm.
-
-    Notes
-    -----
-    1) We compute the L2-norm of each row => row_norms[i] = ||x[i,:]||_2.
-    2) We get an argsort over these norms and reorder the rows accordingly.
-    3) We return only x_sorted.  If you also need the sorted norms, you can extend the code.
-    """
-
-    # 1) Compute the L2-norm of each row
-    row_norms = np.linalg.norm(x, axis=1)  # shape (N,)
-
-    # 2) Obtain an ordering that sorts by row_norms
-    sort_idx = np.argsort(row_norms)       # shape (N,)
-
-    # 3) Reorder x by that index
-    x_sorted = x[sort_idx, :]
-    return x_sorted
-
-import numpy as np
-
-def reassign_labels_by_distance(a: np.ndarray,
-                                b: np.ndarray,
-                                ref: np.ndarray,
-                                tol: float = 1e-8) -> np.ndarray:
-    """
-    Parameters
-    ----------
-    a   : np.ndarray, shape (n, m)
-          Data matrix.
-    b   : np.ndarray, shape (n,)
-          Original integer labels.
-    ref : np.ndarray, shape (m,)
-          Reference vector to compute distances against.
-    tol : float
-          Tolerance for checking identical rows.
-          
-    Returns
-    -------
-    new_b : np.ndarray, shape (n,)
-            Integer labels 0..(k-1) in order of increasing
-            distance from cluster‐rep to `ref`.
-    """
-    # 1) find unique labels and map each row to its cluster‐index
-    uniq, first_idx, inv = np.unique(b,
-                                     return_index=True,
-                                     return_inverse=True)
-    # representative row per cluster
-    reps = a[first_idx]           # shape (k, m)
-    
-    # 2) verify identical within each cluster
-    #    broadcast reps[inv] back to shape (n, m)
-    diff = np.abs(a - reps[inv])
-    if np.max(diff) > tol:
-        bad = np.argmax(np.max(diff, axis=1))
-        raise ValueError(f"Row {bad} differs from its rep by {np.max(diff):.3g}")
-    
-    # 3) compute distances of each rep to ref
-    #    shape (k,)
-    dists = np.linalg.norm(reps - ref, axis=1)
-    
-    # 4) sort clusters by increasing distance
-    order = np.argsort(dists)    # indices into uniq/reps
-    
-    # 5) build mapping cluster‐idx → new label
-    new_label = np.empty_like(order)
-    new_label[order] = np.arange(len(order))
-    
-    # 6) relabel all rows
-    return new_label[inv]
-
-
-def find_min_row_by_2norm(x):
-    """
-    Find the single row in 'x' that has the minimal L2 norm.
-
-    Parameters
-    ----------
-    x : np.ndarray, shape (N, M)
-        Each row x[i,:] is a vector in R^M.
-
-    Returns
-    -------
-    min_index : int
-        The index of the row with the smallest L2 norm.
-    min_row : np.ndarray of shape (M,)
-        The row itself, x[min_index,:].
-
-    Notes
-    -----
-    1) We compute row_norms[i] = || x[i,:] ||_2 
-    2) argmin => minimal row index => min_index
-    3) Return that row and its index
-    """
-
-    # 1) Compute each row's L2-norm (Euclidean norm)
-    row_norms = np.linalg.norm(x, axis=1)  # shape (N,)
-
-    # 2) Find the index of the minimal norm
-    min_index = np.argmin(row_norms)       # an integer
-
-    # 3) Extract the corresponding row
-    min_row = x[min_index, :]
-
-    return min_index, min_row
-
-def soft_threshold_group(vec, threshold):
-    """
-    Group soft-thresholding operator for a vector in R^M.
-    This shrinks vec toward 0 by threshold in L2 norm,
-    or sets it to 0 if ||vec|| < threshold.
-    """
-    norm_vec = np.linalg.norm(vec)
-    if norm_vec == 0:
-        return np.zeros_like(vec)
-    scale = max(0.0, 1 - threshold / norm_vec)
-    return scale * vec
-
-def SCAD_group_threshold(delta, lam, alpha, gamma):
-    """
-    Apply the group-SCAD threshold rule to the vector delta in R^M.
-
-    Parameters
-    ----------
-    delta : np.ndarray of shape (M,)
-        The difference vector to be thresholded in L2-norm.
-    lam   : float
-        The SCAD lambda.
-    alpha : float
-        The ADMM penalty parameter.
+    preprocessed_data : dict
+        A dictionary containing all necessary preprocessed data tensors.
+    wcut : list
+        Cutoff points for the piecewise-linear approximation of the logit function.
+    alpha_init : float
+        Initial value for the ADMM penalty parameter `alpha`.
     gamma : float
-        The SCAD gamma (> 2).
-
-    Returns
-    -------
-    eta : np.ndarray of shape (M,) after group SCAD thresholding.
-
-    Notes
-    -----
-    - D = np.linalg.norm(delta).
-    - We compare D with lam/alpha, lam + lam/alpha, gamma*lam to decide piecewise region.
-    - We apply group soft-threshold or full shrink / SCAD plateau logic.
-    """
-    D = np.linalg.norm(delta)
-    lam_over_alpha = lam / alpha
-    gamma_lam = gamma * lam
-
-    # (1) If D <= lam/alpha => full shrink to 0
-    if D <= lam_over_alpha:
-        return np.zeros_like(delta)
-    # (2) If lam/alpha < D <= lam + lam/alpha => standard group soft threshold
-    elif D <= lam + lam_over_alpha:
-        return soft_threshold_group(delta, lam_over_alpha)
-    # (3) Middle SCAD region
-    elif D <= gamma_lam:
-        T_mid = gamma_lam / ((gamma - 1)*alpha)
-        scale_factor = 1.0 / (1.0 - 1.0/((gamma - 1)*alpha))
-        st_vec = soft_threshold_group(delta, T_mid)
-        return scale_factor * st_vec
-    else:
-        # (4) If D > gamma_lam => no shrink
-        return delta
-
-def build_DELTA_multiM(No_mutation, M):
-    """
-    Construct the block-structured difference operator DELTA for M>1 case.
-    DELTA will map w in R^{No_mutation * M} -> the stacked pairwise differences in R^{(#pairs) * M}.
-
-    Returns
-    -------
-    DELTA : scipy.sparse.csr_matrix
-        shape ((No_pairs*M), (No_mutation*M))
-        #pairs = No_mutation*(No_mutation - 1)//2
-    pair_indices : list of (i,j) pairs with i<j
-    """
-    row_idx = []
-    col_idx = []
-    vals    = []
-
-    pair_indices = []
-    No_pairs = No_mutation*(No_mutation-1)//2
-
-    pair_count = 0
-    for i in range(No_mutation-1):
-        for j in range(i+1, No_mutation):
-            pair_indices.append((i,j))
-            for m in range(M):
-                row_i = pair_count*M + m
-                # +1 for w_i[m]
-                col_i = i*M + m
-                row_idx.append(row_i)
-                col_idx.append(col_i)
-                vals.append(1.0)
-                # -1 for w_j[m]
-                col_j = j*M + m
-                row_idx.append(row_i)
-                col_idx.append(col_j)
-                vals.append(-1.0)
-            pair_count += 1
-
-    data = np.array(vals, dtype=float)
-    rows = np.array(row_idx, dtype=int)
-    cols = np.array(col_idx, dtype=int)
-
-    total_rows = No_pairs * M
-    total_cols = No_mutation * M
-    DELTA = sp.coo_matrix((data, (rows, cols)), shape=(total_rows, total_cols))
-    return DELTA.tocsr(), pair_indices
-
-def initialize_w(r, n, ploidy, purity, total, minor, control_large=4.0):
-    """
-    Initialize w (logistic scale) from input read counts and copy number/purity.
-
-    r, n : shape (No_mutation, M) => variant reads, total reads
-    ploidy, purity, total, minor : can be broadcast or shape (No_mutation, M)
-    control_large : clamp boundary for logistic transform
-
-    Returns
-    -------
-    w_init : shape (No_mutation, M)
-
-    Steps
-    -----
-    1) Basic fraction => (r + eps)/(n + 2*eps).
-    2) Multiply by ( (ploidy - purity*ploidy + purity*total)/minor )
-    3) Clip logistic scale in [-control_large, control_large].
-    """
-
-    eps_small = 1e-5
-    theta_hat = (r + eps_small) / (n + 2*eps_small)  # avoid 0/1
-    phi_hat = theta_hat * ((ploidy - purity*ploidy + purity*total)/minor)
-
-    scale_parameter = max(1.0, np.max(phi_hat))
-    phi_new = phi_hat / scale_parameter
-
-    lower_bound = expit(-control_large)
-    upper_bound = expit(control_large)
-    phi_new_clamped = np.clip(phi_new, lower_bound, upper_bound)
-
-    w_init = logit(phi_new_clamped)
-    w_init_clamped = np.clip(w_init, -control_large, control_large)
-    return w_init_clamped
-
-def soft_threshold_group(vec, threshold):
-    """
-    Group soft-thresholding operator for a vector in R^M.
-    This shrinks vec toward 0 by threshold in L2 norm, 
-    or sets it to 0 if ||vec|| < threshold.
-    """
-    norm_vec = np.linalg.norm(vec)
-    if norm_vec == 0:
-        return vec * 0.0
-    scale = max(0.0, 1 - threshold / norm_vec)
-    return scale * vec
-
-def SCAD_group_threshold(delta, lam, alpha, gamma):
-    """
-    Apply the group-SCAD threshold rule to the vector delta in R^M.
-    """
-    D = np.linalg.norm(delta)
-    lam_over_alpha = lam / alpha
-    gamma_lam      = gamma * lam
-    if D <= lam_over_alpha:
-        return np.zeros_like(delta)
-    elif D <= lam + lam_over_alpha:
-        return soft_threshold_group(delta, lam_over_alpha)
-    elif D <= gamma_lam:
-        T_mid = (gamma_lam / ((gamma - 1)*alpha))
-        scale_factor = 1.0 / (1.0 - 1.0 / ((gamma - 1)*alpha))
-        st_vec = soft_threshold_group(delta, T_mid)
-        return scale_factor * st_vec
-    else:
-        return delta
-
-def build_DELTA_multiM(No_mutation, M):
-    """
-    Re-declared for consistency 
-    (Note: function was declared above, repeated here presumably by mistake in your code).
-    """
-    row_idx = []
-    col_idx = []
-    vals    = []
-    pair_indices = []
-    No_pairs = No_mutation*(No_mutation-1)//2
-    pair_count = 0
-    for i in range(No_mutation-1):
-        for j in range(i+1, No_mutation):
-            pair_indices.append((i,j))
-            for m in range(M):
-                row_i = pair_count*M + m
-                col_i = i*M + m
-                row_idx.append(row_i)
-                col_idx.append(col_i)
-                vals.append(+1.0)
-                col_j = j*M + m
-                row_idx.append(row_i)
-                col_idx.append(col_j)
-                vals.append(-1.0)
-            pair_count += 1
-
-    data = np.array(vals)
-    rows = np.array(row_idx)
-    cols = np.array(col_idx)
-    total_rows = No_pairs * M
-    total_cols = No_mutation * M
-    DELTA = sp.coo_matrix((data, (rows, cols)),
-                          shape=(total_rows, total_cols))
-    return DELTA.tocsr(), pair_indices
-
-def initialize_w(r, n, ploidy, purity, total, minor, No_mutation, M, control_large):
-    """
-    Re-declared for consistency 
-    (Note: function was also declared above, repeated here presumably by mistake).
-    """
-    theta_hat = r / n
-    phi_hat = theta_hat * ((ploidy - purity*ploidy + purity*total)/minor)
-    scale_parameter = max(1, np.max(phi_hat))
-    phi_new = phi_hat / scale_parameter
-    lower_bound = expit(-control_large)
-    upper_bound = expit(control_large)
-    phi_new = np.clip(phi_new, lower_bound, upper_bound)
-    w_init = logit(phi_new)
-    w_init = np.clip(w_init, -control_large, control_large)
-    return w_init
-
-def reshape_eta_to_2D(w_new, No_mutation, M):
-    """
-    (Reiterated from above code, repeated here presumably by mistake).
-    """
-    w_flat = w_new.ravel()
-    NM = No_mutation*M
-    if w_flat.size != NM:
-        raise ValueError("Mismatch: w_flat.size != No_mutation*M")
-    diff = np.subtract.outer(w_flat, w_flat)
-    ids  = np.triu_indices(NM, k=1)
-    eta_new_1d = diff[ids]
-    pair2idx = {}
-    for one_d_index, (p_val, q_val) in enumerate(zip(ids[0], ids[1])):
-        pair2idx[(p_val, q_val)] = one_d_index
-    No_pairs = No_mutation*(No_mutation-1)//2
-    eta_2d = np.zeros((No_pairs, M), dtype=w_new.dtype)
-    pair_idx = 0
-    for i in range(No_mutation-1):
-        for j in range(i+1, No_mutation):
-            for m in range(M):
-                p = i*M + m
-                q = j*M + m
-                if p < q:
-                    idx_in_1d = pair2idx[(p, q)]
-                    val = eta_new_1d[idx_in_1d]
-                else:
-                    idx_in_1d = pair2idx[(q, p)]
-                    val = -eta_new_1d[idx_in_1d]
-                eta_2d[pair_idx, m] = val
-            pair_idx += 1
-    return eta_2d
-
-def diff_mat(w_new):
-    """
-    Build a 'signed' distance matrix for M>1 by combining L2 norm with sign from the first coordinate,
-    ensuring antisymmetry.  Negative sign is used as in the snippet.
-    """
-    No_mutation, M = w_new.shape
-    mag = np.zeros((No_mutation, No_mutation), dtype=w_new.dtype)
-    
-    for i in range(No_mutation):
-        diffs = w_new - w_new[i, :] # Shape (No_mutation, M)
-        mag[i, :] = np.linalg.norm(diffs, axis=1)
-
-    first_coord_diff = w_new[None, :, 0] - w_new[:, None, 0]
-    sign_mat = np.sign(first_coord_diff)
-    diff_signed = -sign_mat * mag
-    
-    np.fill_diagonal(diff_signed, 0.0)
-    i_idx, j_idx = np.triu_indices(No_mutation, k=1)
-    diff_signed[j_idx, i_idx] = -diff_signed[i_idx, j_idx]
-    
-    return diff_signed
-
-def clipp2(
-    r,
-    n,
-    minor,
-    total,
-    purity,
-    coef_list,
-    wcut = [-1.8, 1.8],
-    alpha = 0.8,
-    gamma = 3.7,
-    rho   = 1.02,
-    precision    = 0.01,
-    Run_limit    = 200,
-    control_large= 5,
-    Lambda       = 0.01,
-    post_th      = 0.001,
-    least_diff   = 0.01,
-    device       = 'cuda' if torch.cuda.is_available() else 'cpu', 
-    dtype        = torch.float32,
-):
-    """
-    Perform the ADMM + SCAD approach for multi-sample subclone reconstruction,
-    then do a final cluster assignment.
-
-    Steps (high-level):
-    1) Ensure input shapes => (No_mutation, M). Replace zeros with 1 in n/minor/total arrays.
-    2) Convert NumPy arrays to Torch tensors on the specified device & dtype.
-    3) Build preliminary φ-hat estimates from r, n, minor, total, purity.
-    4) Convert φ-hat to logistic space => w in [-control_large, control_large].
-    5) Build the sparse difference operator Δ (size ≈ (No_pairs*M) × (No_mutation*M)).
-    6) Initialize η, τ from w.
-    7) ADMM loop:
-       - (A) IRLS expansions => build large linear system
-       - (B) Solve system with Conjugate Gradient
-       - (C) SCAD thresholding => update η, τ
-       - (D) Check residual => stop if below precision or max iterations
-    8) Post-processing to merge clusters with small differences
-    9) Combine clusters if needed
-    10) Return final assignment { 'phi': shape(No_mutation, M),
-                                 'label': shape(No_mutation,) }
-
-    Parameters
-    ----------
-    r : np.ndarray
-        Read counts of the mutated allele, shape (No_mutation, M) or (No_mutation,).
-    n : np.ndarray
-        Total read counts, same shape as r. Zeros replaced with 1.
-    minor : np.ndarray
-        Minor CN array, same shape as r. Zeros replaced with 1.
-    total : np.ndarray
-        Total CN array, same shape as r. Zeros replaced with 1.
-    purity : float or 1D array
-        Purity (one per sample or single float).
-    coef_list : list of np.ndarray
-        IRLS coefficient expansions, each shape (No_mutation, 6).
-    wcut : list of float, optional
-        Hard logistic boundaries [low_cut, up_cut].
-    alpha : float, optional
-        Initial weight on the Δ^TΔ penalty in ADMM.
-    gamma : float, optional
-        SCAD threshold parameter.
-    rho : float, optional
-        Factor for increasing alpha after each ADMM iteration.
-    precision : float, optional
-        Residual threshold for ADMM stopping.
-    Run_limit : int, optional
+        The SCAD shape parameter.
+    rho : float
+        The multiplicative factor to increase `alpha` in each iteration.
+    precision : float
+        The convergence tolerance for the primal residual.
+    Run_limit : int
         Maximum number of ADMM iterations.
-    control_large : float, optional
-        Clamps w in [-control_large, control_large].
-    Lambda : float, optional
-        Regularization strength used in SCAD thresholding.
-    post_th : float, optional
-        Post-processing threshold for zeroing out small edges (η).
-    least_diff : float, optional
-        Minimum 2-norm difference to keep clusters separate.
-    device : str, optional
-        'cuda' or 'cpu' for torch device.
-    dtype : torch.dtype, optional
-        Torch dtype, e.g. torch.float32, torch.float64, etc.
+    control_large : float
+        Value to clamp the logistic-scale parameters `w` to prevent divergence.
+    Lambda : float
+        The SCAD regularization parameter for this run.
+    device : str
+        The compute device ('cuda' or 'cpu').
+    warm_start_vars : dict, optional
+        A dictionary with 'w', 'eta', 'tau' from a previous run to use as a
+        warm start. Defaults to None.
 
     Returns
     -------
-    results : dict
-        {
-          'phi'   : np.ndarray of shape (No_mutation, M),
-          'label' : np.ndarray of shape (No_mutation,)
-        }
+    dict
+        A dictionary containing the converged variables: 'w', 'eta', 'tau'.
     """
+    # --- Step 0: Unpack Data and Initialize ---
+    w_init_t = preprocessed_data['w_init_t']
+    r_t, n_t, minor_t, total_t, purity_t, c_all_t = (
+        preprocessed_data['r_t'], preprocessed_data['n_t'], preprocessed_data['minor_t'],
+        preprocessed_data['total_t'], preprocessed_data['purity_t'], preprocessed_data['c_all_t']
+    )
+    No_mutation, M = preprocessed_data['No_mutation'], preprocessed_data['M']
 
-    # -------------------- Helper functions --------------------
-
-    def ensure_2D_and_no_zeros(arr):
-        """
-        If arr is 1D, reshape to (No_mutation, 1).
-        If arr is 2D, keep shape.
-        Then replace any zeros with 1.
-        """
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        elif arr.ndim != 2:
-            raise ValueError(f"Expected 1D or 2D array, got shape {arr.shape}")
-        arr = np.where(arr == 0, 1, arr)
-        return arr
-
-    def to_torch_gpu(arr, local_dtype):
-        """
-        Convert NumPy array to torch.Tensor on the specified device and dtype.
-        Also handles float8/float16 special cases if needed.
-        """
-        arr = arr.astype(np.float32)
-        if local_dtype == 'float8':
-            return torch.as_tensor(arr, dtype=torch.float8_e4m3fn, device=device)
-        elif local_dtype == 'float16':
-            return torch.as_tensor(arr, dtype=torch.float16, device=device)
-        else:
-            return torch.as_tensor(arr, dtype=torch.float32, device=device)
-
-    # -------------------- (1) Ensure shapes and handle zeros --------------------
-    n     = ensure_2D_and_no_zeros(n)
-    minor = ensure_2D_and_no_zeros(minor)
-    total = ensure_2D_and_no_zeros(total)
-
-    # -------------------- (2) Convert inputs to torch on GPU/CPU ----------------
-    r_t     = to_torch_gpu(r,     dtype)
-    n_t     = to_torch_gpu(n,     dtype)
-    minor_t = to_torch_gpu(minor, dtype)
-    total_t = to_torch_gpu(total, dtype)
-
-    # Stack coef_list => shape(No_mutation, M, 6)
-    c_stack = [to_torch_gpu(c, dtype) for c in coef_list]
-    c_all_t = torch.stack(c_stack, dim=1)  # shape => (No_mutation, M, 6)
-
-    No_mutation, M = r_t.shape
-
-    # Build purity_t => shape(No_mutation, M)
-    if isinstance(purity, (float, int)):
-        purity_t = torch.full((No_mutation, M), float(purity), device=device)
-    else:
-        purity_vec = to_torch_gpu(purity, dtype)   # shape (M,)
-        purity_t   = purity_vec.unsqueeze(0).expand(No_mutation, -1)
-
-    # Constant ploidy => shape(No_mutation, M)
-    ploidy_t = torch.full((No_mutation, M), 2.0, device=device)
-
-    # -------------------- (3) Compute φ-hat and build initial w ----------------
-    fraction_t = (r_t + 1e-12) / (n_t + 1e-10)
-    phi_hat_t  = fraction_t * (
-        (ploidy_t - purity_t*ploidy_t) + (purity_t * (total_t + 1e-10))
-    ) / (minor_t)
-
-    # Where r==0, force φ-hat to small positive constant => 1e-12
-    phi_hat_t = torch.where(r_t == 0, torch.tensor(1e-12, device=phi_hat_t.device), phi_hat_t)
-
-    # Scale φ-hat so it remains in (0,1) => logistic transform
-    scale_parameter = torch.clamp(torch.max(phi_hat_t), min=1.0)
-    phi_new_t       = phi_hat_t / scale_parameter
-
-    w_init_t = torch.log(phi_new_t / (1 - phi_new_t))
-    w_init_t = torch.clamp(w_init_t, -control_large, control_large)
-    w_new_t  = w_init_t.clone()
-
-    # -------------------- (4) Build sparse Δ operator (Delta_coo) ----------------
+    # Indices for all unique pairs of mutations (i, j) where i < j
     i_idx, j_idx = torch.triu_indices(No_mutation, No_mutation, offset=1, device=device)
 
-    # -------------------- (5) Initialize η, τ ----------------
-    # η(i, j) = w[i] - w[j]; shape => (No_pairs, M)
-    eta_new_t = w_new_t[i_idx, :] - w_new_t[j_idx, :]
-    tau_new_t = torch.ones_like(eta_new_t)
+    # Initialize from warm start if provided, otherwise initialize from scratch
+    if warm_start_vars:
+        w_new_t = warm_start_vars['w'].clone()
+        eta_new_t = warm_start_vars['eta'].clone()
+        tau_new_t = warm_start_vars['tau'].clone()
+    else:  # First run, no warm start available
+        w_new_t = w_init_t.clone()
+        eta_new_t = w_new_t[i_idx, :] - w_new_t[j_idx, :]
+        tau_new_t = torch.ones_like(eta_new_t)
 
-    # -------------------- (6) ADMM iteration ----------------
+    # --- Main ADMM Iteration Loop ---
     residual, k_iter = 1e6, 0
     low_cut, up_cut = wcut
+    alpha = alpha_init  # Use a fresh alpha for each Lambda run
 
     while (k_iter < Run_limit) and (residual > precision):
         k_iter += 1
         w_old_t, eta_old_t, tau_old_t = w_new_t.clone(), eta_new_t.clone(), tau_new_t.clone()
 
-        # (A) IRLS expansions (Unchanged)
+        # --- (A) IRLS: Update Quadratic Approximation of Likelihood ---
         expW_t = torch.exp(w_old_t)
-        theta_t = (expW_t * minor_t) / ((2.0 * (1 - purity_t) + purity_t*total_t) * (1 + expW_t))
-        maskLow, maskUp = (w_old_t <= low_cut), (w_old_t >= up_cut)
-        maskMid = ~(maskLow | maskUp)
+        # Calculate theta_ij based on the current `w` (p)
+        theta_t = (expW_t * minor_t) / ((2.0 * (1 - purity_t) + purity_t * total_t) * (1 + expW_t))
+        # Use piecewise-linear surrogate coefficients for the logistic function
+        maskLow, maskUp, maskMid = (w_old_t <= low_cut), (w_old_t >= up_cut), ~(w_old_t <= low_cut) & ~(w_old_t >= up_cut)
+        # partA corresponds to (v_ij - r_ij/n_ij) in the derivation
         partA = (maskLow*c_all_t[...,1] + maskUp*c_all_t[...,5] + maskMid*c_all_t[...,3]) - (r_t+1e-12)/(n_t+1e-10)
+        # partB corresponds to u_ij in the derivation
         partB = (maskLow*c_all_t[...,0] + maskUp*c_all_t[...,4] + maskMid*c_all_t[...,2])
-        sqrt_n_safe = torch.sqrt(n_t + 1e-10)
-        sqrt_theta_safe = torch.sqrt(theta_t * (1 - theta_t) + 1e-20)
-        A_flat = (sqrt_n_safe * partA / sqrt_theta_safe).flatten()
-        B_flat = (sqrt_n_safe * partB / sqrt_theta_safe).flatten()
+        # Construct the vectorized `a` and diagonal `B` for the quadratic form: -1/2 * ||B*p + a||^2
+        A_flat = (torch.sqrt(n_t + 1e-10) * partA / torch.sqrt(theta_t * (1 - theta_t) + 1e-20)).flatten()
+        B_flat = (torch.sqrt(n_t + 1e-10) * partB / torch.sqrt(theta_t * (1 - theta_t) + 1e-20)).flatten()
         B_sq_t = B_flat**2
 
-        # (B) Conjugate Gradient Solve (Faster and Lighter)
+        # --- (B) P-Update: Solve Linear System via Conjugate Gradient ---
+        # Construct the right-hand side of the linear system: alpha*Delta^T*(eta - (1/alpha)*tau) - B^T*a
         RHS_1 = transpose_matvec_delta(alpha * eta_old_t + tau_old_t, No_mutation, M, i_idx, j_idx)
-        linear_t = RHS_1 - (B_flat * A_flat)
-
+        linear_t = RHS_1 - (B_flat * A_flat) # Note: B is diagonal, so B^T*a = B*a
+        # Solve (B^T*B + alpha*Delta^T*Delta) * x = linear_t for x
         x = w_old_t.flatten()
         r_vec = linear_t - matvec_H_laplacian(x, B_sq_t, No_mutation, M, alpha)
         p, rs_old = r_vec.clone(), torch.dot(r_vec, r_vec)
-        
-        for _ in range(200): # Max CG iterations
+        for _ in range(200): # CG inner loop
             Ap = matvec_H_laplacian(p, B_sq_t, No_mutation, M, alpha)
             alpha_cg = rs_old / (torch.dot(p, Ap) + 1e-12)
-            x.add_(p, alpha=alpha_cg)
-            r_vec.sub_(Ap, alpha=alpha_cg)
+            x.add_(p, alpha=alpha_cg); r_vec.sub_(Ap, alpha=alpha_cg)
             rs_new = torch.dot(r_vec, r_vec)
             if rs_new.sqrt() < 1e-6: break
             p = r_vec + (rs_new / rs_old) * p
             rs_old = rs_new
         w_new_t = torch.clamp(x.view(No_mutation, M), -control_large, control_large)
 
-        # (C) SCAD Threshold (Faster)
+        # --- (C) Eta/Tau-Update: SCAD Thresholding and Dual Update ---
         eta_new_t, tau_new_t = scad_threshold_update_torch(w_new_t, tau_old_t, i_idx, j_idx, alpha, Lambda, gamma)
-        alpha *= rho
+        alpha *= rho # Update the ADMM penalty parameter
 
-        # (D) Residual Calculation (Faster)
+        # --- (D) Convergence Check ---
+        # Calculate the primal residual: max(||Delta*p^(k+1) - eta^(k+1)||)
         D_w2 = w_new_t[i_idx, :] - w_new_t[j_idx, :]
         residual = torch.max(torch.abs(D_w2 - eta_new_t)).item()
-        if np.isnan(residual): break
-    # print("\nADMM finished.\n")
-    
-    # Explicitly free up GPU memory now that we are done with the main loop
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    # -------------------- (7) Post-processing: cluster assignment ----------------
-    w_new   = w_new_t.detach().cpu().numpy()
-    eta_new = eta_new_t.detach().cpu().numpy()
-    phi_hat = phi_hat_t.detach().cpu().numpy()
+        if np.isnan(residual):
+            print("Warning: Residual is NaN. Terminating optimization.")
+            break
 
-    # Build difference matrix from w
-    diff    = diff_mat(w_new)
+    return {'w': w_new_t, 'eta': eta_new_t, 'tau': tau_new_t}
 
-    # For upper-tri indices, fill with norm(η).
-    ids           = np.triu_indices(diff.shape[1], 1)
-    # Zero out small edges => post_th
-    eta_new[np.abs(eta_new) <= post_th] = 0
-    diff[ids] = np.linalg.norm(eta_new, axis=1)
 
-    # Build initial cluster labels
-    class_label = -np.ones(No_mutation, dtype=int)
+# =============================================================================
+# II. PRE- AND POST-PROCESSING UTILITY FUNCTIONS
+# =============================================================================
+
+def sort_by_2norm(x: np.ndarray) -> np.ndarray:
+    """Sorts matrix rows by their L2 norm."""
+    row_norms = np.linalg.norm(x, axis=1)
+    sort_idx = np.argsort(row_norms)
+    return x[sort_idx, :]
+
+def reassign_labels_by_distance(a: np.ndarray, b: np.ndarray, ref: np.ndarray, tol: float = 1e-8) -> np.ndarray:
+    """Re-assigns cluster labels based on the L2 distance of cluster centers to a reference vector."""
+    uniq, first_idx, inv = np.unique(b, return_index=True, return_inverse=True)
+    reps = a[first_idx]
+    diff = np.abs(a - reps[inv])
+    if np.max(diff) > tol:
+        bad = np.argmax(np.max(diff, axis=1))
+        raise ValueError(f"Row {bad} differs from its representative by {np.max(diff):.3g}")
+    dists = np.linalg.norm(reps - ref, axis=1)
+    order = np.argsort(dists)
+    new_label = np.empty_like(order)
+    new_label[order] = np.arange(len(order))
+    return new_label[inv]
+
+def find_min_row_by_2norm(x: np.ndarray) -> Tuple[int, np.ndarray]:
+    """Finds the row with the minimum L2 norm in a matrix."""
+    row_norms = np.linalg.norm(x, axis=1)
+    min_index = np.argmin(row_norms)
+    return min_index, x[min_index, :]
+
+def diff_mat(w_new: np.ndarray) -> np.ndarray:
+    """Computes a signed pairwise distance matrix based on L2 norm."""
+    No_mutation, M = w_new.shape
+    mag = np.zeros((No_mutation, No_mutation), dtype=w_new.dtype)
+    for i in range(No_mutation):
+        mag[i, :] = np.linalg.norm(w_new - w_new[i, :], axis=1)
+    first_coord_diff = w_new[None, :, 0] - w_new[:, None, 0]
+    sign_mat = np.sign(first_coord_diff)
+    diff_signed = -sign_mat * mag
+    np.fill_diagonal(diff_signed, 0.0)
+    i_idx, j_idx = np.triu_indices(No_mutation, k=1)
+    diff_signed[j_idx, i_idx] = -diff_signed[i_idx, j_idx]
+    return diff_signed
+
+def preprocess_clipp_data(
+    r: np.ndarray, n: np.ndarray, minor: np.ndarray, total: np.ndarray,
+    purity: Union[float, np.ndarray], coef_list: List, control_large: float,
+    device: str, dtype: torch.dtype
+) -> Dict[str, Any]:
+    """
+    Prepares and transforms input data for the ADMM optimization.
+
+    This function handles data loading, validation, calculation of initial
+    cellular prevalence estimates (phi_hat), and conversion to torch tensors
+    on the specified device.
+
+    The cellular prevalence `phi` is estimated from the variant allele fraction (VAF)
+    using the formula:
+    phi = VAF * [(ploidy - purity*ploidy) + purity*total_cn] / minor_cn
+
+    This `phi` is then transformed to the logit scale `w` to initialize the
+    optimization.
+
+    Parameters are described in the main `clipp2` function.
+
+    Returns
+    -------
+    dict
+        A dictionary containing all necessary preprocessed data as torch tensors,
+        along with original numpy arrays for post-processing.
+    """
+    def ensure_2D_and_no_zeros(arr: np.ndarray) -> np.ndarray:
+        if arr.ndim == 1: arr = arr.reshape(-1, 1)
+        elif arr.ndim != 2: raise ValueError(f"Expected 1D or 2D array, got shape {arr.shape}")
+        return np.where(arr == 0, 1, arr)
+
+    def to_torch_gpu(arr: np.ndarray, local_dtype: torch.dtype) -> torch.Tensor:
+        arr = arr.astype(np.float32)
+        if str(local_dtype) == 'float8':
+            return torch.as_tensor(arr, dtype=torch.float8_e4m3fn, device=device)
+        elif str(local_dtype) == 'float16':
+            return torch.as_tensor(arr, dtype=torch.float16, device=device)
+        else:
+            return torch.as_tensor(arr, dtype=torch.float32, device=device)
+
+    # Ensure inputs are 2D and move to torch tensors on the correct device
+    r = r.reshape(-1, 1) if r.ndim == 1 else r
+    n, minor, total = ensure_2D_and_no_zeros(n), ensure_2D_and_no_zeros(minor), ensure_2D_and_no_zeros(total)
+    r_t, n_t = to_torch_gpu(r, dtype), to_torch_gpu(n, dtype)
+    minor_t, total_t = to_torch_gpu(minor, dtype), to_torch_gpu(total, dtype)
+    c_stack = [to_torch_gpu(c, dtype) for c in coef_list]
+    c_all_t = torch.stack(c_stack, dim=1)
+    No_mutation, M = r_t.shape
+
+    # Handle purity (can be a scalar or an array per sample)
+    if isinstance(purity, (float, int)):
+        purity_t = torch.full((No_mutation, M), float(purity), device=device, dtype=r_t.dtype)
+    else:
+        purity_t = to_torch_gpu(purity, dtype).unsqueeze(0).expand(No_mutation, -1)
+
+    # Calculate initial unpenalized cellular prevalence (phi_hat)
+    ploidy_t = torch.full((No_mutation, M), 2.0, device=device, dtype=r_t.dtype)
+    fraction_t = (r_t + 1e-12) / (n_t + 1e-10) # VAF
+    phi_hat_t = fraction_t * ((ploidy_t - purity_t*ploidy_t) + (purity_t * (total_t + 1e-10))) / minor_t
+    # Handle cases where read count is zero
+    phi_hat_t = torch.where(r_t == 0, torch.tensor(1e-12, device=phi_hat_t.device, dtype=phi_hat_t.dtype), phi_hat_t)
+
+    # Normalize and transform to logit scale for initialization
+    scale_parameter = torch.clamp(torch.max(phi_hat_t), min=1.0)
+    phi_new_t = phi_hat_t / scale_parameter
+    w_init_t = torch.clamp(torch.log(phi_new_t / (1 - phi_new_t)), -control_large, control_large)
+
+    return {
+        'w_init_t': w_init_t, 'r_t': r_t, 'n_t': n_t, 'minor_t': minor_t,
+        'total_t': total_t, 'purity_t': purity_t, 'c_all_t': c_all_t,
+        'phi_hat_t': phi_hat_t, 'No_mutation': No_mutation, 'M': M,
+        'original_n': n, 'original_r': r, 'original_total': total, 'original_minor': minor
+    }
+
+def postprocess_admm_results(
+    admm_results: Dict[str, torch.Tensor],
+    preprocessed_data: Dict[str, Any],
+    purity: Union[float, np.ndarray],
+    post_th: float,
+    least_diff: float
+) -> Dict[str, Any]:
+    """
+    Post-processes the raw ADMM output to generate final subclonal structures.
+
+    This involves a series of heuristic steps:
+    1. Initial clustering based on the penalized differences (`eta`).
+    2. Iterative merging of small clusters into their nearest neighbors.
+    3. Calculation of cluster centroid cellular prevalences (`phi`).
+    4. Iterative merging of phenotypically similar clusters based on `least_diff`.
+    5. Calculation of model fitness scores (Log-Likelihood, AIC, BIC).
+
+    Parameters
+    ----------
+    admm_results : dict
+        The dictionary returned by `run_admm_optimization`.
+    preprocessed_data : dict
+        The dictionary returned by `preprocess_clipp_data`.
+    purity : float or ndarray
+        The tumor purity value(s).
+    post_th : float
+        Threshold below which `eta` norms are considered zero for clustering.
+    least_diff : float
+        The minimum L2 distance between cluster centroids to remain separate.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the final results:
+        - 'phi': The (S x M) matrix of cellular prevalences for each SNV.
+        - 'label': The cluster assignment for each SNV.
+        - 'aic': The Akaike Information Criterion for the model.
+        - 'bic': The Bayesian Information Criterion for the model.
+    """
+    # --- Step 1: Initial Clustering ---
+    w_final_np = admm_results['w'].detach().cpu().numpy()
+    eta_final_np = admm_results['eta'].detach().cpu().numpy()
+    phi_hat = preprocessed_data['phi_hat_t'].detach().cpu().numpy()
+    No_mutation, M = preprocessed_data['No_mutation'], preprocessed_data['M']
+    n, r, total, minor = (
+        preprocessed_data['original_n'], preprocessed_data['original_r'],
+        preprocessed_data['original_total'], preprocessed_data['original_minor']
+    )
+    diff = diff_mat(w_final_np)
+    ids = np.triu_indices(diff.shape[1], 1)
+    eta_final_np[np.abs(eta_final_np) <= post_th] = 0
+    diff[ids] = np.linalg.norm(eta_final_np, axis=1)
+    class_label, labl, group_size = -np.ones(No_mutation, dtype=int), 1, [1]
     class_label[0] = 0
-    group_size = [1]
-    labl = 1
-
     for i in range(1, No_mutation):
         assigned = False
         for j in range(i):
@@ -731,127 +538,212 @@ def clipp2(
             labl += 1
             group_size.append(1)
 
-    # -------------------- (8) Refine small clusters --------------------
+    # --- Step 2: Refine Clusters by Merging Small Groups ---
     least_mut = np.ceil(0.05 * No_mutation)
-    tmp_size  = np.min(np.array(group_size)[np.array(group_size) > 0])
-    tmp_grp   = np.where(group_size == tmp_size)
-    refine    = False
-    if tmp_size < least_mut:
-        refine = True
-
-    while refine:
-        refine = False
-        tmp_col = np.where(class_label == tmp_grp[0][0])[0]
-        for mut_idx in tmp_col:
-            if (mut_idx != 0) and (mut_idx != No_mutation - 1):
-                tmp_diff = np.abs(
-                    np.concatenate([
-                        diff[:mut_idx, mut_idx].ravel(),
-                        [100],
-                        diff[mut_idx, mut_idx+1:].ravel()
-                    ])
-                )
+    gs_array = np.array(group_size)
+    if np.any(gs_array > 0):
+        tmp_size = np.min(gs_array[gs_array > 0])
+        refine = tmp_size < least_mut
+        while refine:
+            refine = False
+            tmp_grp = np.where(gs_array == tmp_size)[0]
+            tmp_col = np.where(class_label == tmp_grp[0])[0]
+            for mut_idx in tmp_col:
+                if (mut_idx != 0) and (mut_idx != No_mutation - 1): tmp_diff = np.abs(np.concatenate([diff[:mut_idx, mut_idx].ravel(), [100], diff[mut_idx, mut_idx+1:].ravel()]))
+                elif mut_idx == 0: tmp_diff = np.concatenate([[100], diff[0, 1:No_mutation]])
+                else: tmp_diff = np.concatenate([diff[:No_mutation-1, No_mutation-1], [100]])
                 tmp_diff[tmp_col] += 100
-                diff[:mut_idx, mut_idx]        = tmp_diff[:mut_idx]
-                diff[mut_idx, mut_idx+1:]      = tmp_diff[mut_idx+1:]
-            elif mut_idx == 0:
-                tmp_diff = np.concatenate([
-                    [100],
-                    diff[0, 1:No_mutation]
-                ])
-                tmp_diff[tmp_col] += 100
-                diff[0, 1:No_mutation] = tmp_diff[1:]
-            else:
-                tmp_diff = np.concatenate([
-                    diff[:No_mutation-1, No_mutation-1],
-                    [100]
-                ])
-                tmp_diff[tmp_col] += 100
-                diff[:No_mutation-1, No_mutation-1] = tmp_diff[:-1]
+                if (mut_idx != 0) and (mut_idx != No_mutation - 1):
+                    diff[:mut_idx, mut_idx] = tmp_diff[:mut_idx]
+                    diff[mut_idx, mut_idx+1:] = tmp_diff[mut_idx+1:]
+                elif mut_idx == 0: diff[0, 1:No_mutation] = tmp_diff[1:]
+                else: diff[:No_mutation-1, No_mutation-1] = tmp_diff[:-1]
+                old_lbl = class_label[mut_idx]
+                gs_array[old_lbl] -= 1
+                class_label[mut_idx] = class_label[tmp_diff.argmin()]
+                gs_array[class_label[mut_idx]] += 1
+            if np.any(gs_array > 0):
+                tmp_size = np.min(gs_array[gs_array > 0])
+                if tmp_size < least_mut: refine = True
 
-            old_lbl = class_label[mut_idx]
-            group_size[old_lbl] -= 1
-            # pick new label => the closest by diff
-            ind = tmp_diff.argmin()
-            class_label[mut_idx] = class_label[ind]
-            group_size[class_label[ind]] += 1
-
-        tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
-        tmp_grp  = np.where(group_size == tmp_size)
-        if tmp_size < least_mut:
-            refine = True
-
-    # -------------------- (9) Compute final cluster means (phi_out) --------------------
-    labels     = np.unique(class_label)
-    phi_out    = np.zeros((len(labels), M))
-    # Weighted average of phi_hat by coverage n
+    # --- Step 3: Compute Cluster Centroids (Phi) ---
+    labels = np.unique(class_label)
+    phi_out = np.zeros((len(labels), M))
     for i, lbl in enumerate(labels):
-        cluster_idx = np.where(class_label == lbl)[0]
-        class_label[cluster_idx] = i
-        nh = n[cluster_idx, :]
-        ph = phi_hat[cluster_idx, :]
+        cluster_idx = (class_label == lbl)
+        class_label[cluster_idx] = i # Re-index labels to be contiguous 0, 1, 2...
+        nh, ph = n[cluster_idx, :], phi_hat[cluster_idx, :]
         phi_out[i, :] = np.sum(ph * nh, axis=0) / np.sum(nh, axis=0)
 
-    # Optionally combine clusters if 2-norm < least_diff
+    # --- Step 4: Refine Clusters by Merging Proximal Centroids ---
     if len(labels) > 1:
         sort_phi = sort_by_2norm(phi_out)
         phi_diff = sort_phi[1:, :] - sort_phi[:-1, :]
         min_ind, min_val = find_min_row_by_2norm(phi_diff)
-
         while np.linalg.norm(min_val) < least_diff:
-            # combine these two clusters
-            clusterA = np.where(phi_out == sort_phi[min_ind])[0]
-            clusterB = np.where(phi_out == sort_phi[min_ind + 1])[0]
-
-            class_label[class_label == clusterA] = clusterB
+            # Find original labels corresponding to the two closest clusters
+            orig_label_A = np.where(np.all(phi_out == sort_phi[min_ind], axis=1))[0][0]
+            orig_label_B = np.where(np.all(phi_out == sort_phi[min_ind + 1], axis=1))[0][0]
+            # Merge cluster A into B
+            class_label[class_label == orig_label_A] = orig_label_B
+            # Recalculate centroids
             labels = np.unique(class_label)
-
-            # re-build phi_out for fewer labels
             phi_out = np.zeros((len(labels), M))
             for i, lbl in enumerate(labels):
-                idx = np.where(class_label == lbl)[0]
+                idx = (class_label == lbl)
                 class_label[idx] = i
-                nh = n[idx, :]
-                ph = phi_hat[idx, :]
+                nh, ph = n[idx, :], phi_hat[idx, :]
                 phi_out[i, :] = np.sum(ph * nh, axis=0) / np.sum(nh, axis=0)
-
-            if len(labels) == 1:
-                break
-
-            # recalc differences
+            if len(labels) == 1: break
+            # Find next closest pair
             sort_phi = sort_by_2norm(phi_out)
             phi_diff = sort_phi[1:, :] - sort_phi[:-1, :]
             min_ind, min_val = find_min_row_by_2norm(phi_diff)
 
-    # -------------------- (10) Assign final phi_res by cluster --------------------
+    # --- Step 5: Finalize Outputs and Compute Model Fitness ---
     phi_res = np.zeros((No_mutation, M))
     for lab_idx in range(phi_out.shape[0]):
         phi_res[class_label == lab_idx, :] = phi_out[lab_idx, :]
+    purity_arr = np.array([purity]) if isinstance(purity, (int, float)) else purity
+    # Reassign final labels for consistent ordering (e.g., 0 for smallest norm cluster)
+    final_labels = reassign_labels_by_distance(phi_res, class_label, purity_arr)
 
-    # Re-check and reassign labels (distance-based)
-    class_label = reassign_labels_by_distance(phi_res, class_label, purity)
-
-    # -------------------- (11) AIC/BIC Calculation --------------------
+    # Calculate Log-Likelihood, AIC, and BIC
     phi_clip = np.clip(phi_res, 1e-15, 1 - 1e-15)
-
-    # Vectorized approach
-    # shape checks: r, n, minor, total => (No_mutation, M)
-    # purity => shape (M,) => we can broadcast with purity[None, :]
-    denominator = 2.0*(1.0 - purity[None,:]) + purity[None,:]*total
-    pp_matrix   = phi_clip * minor / denominator
+    denominator = 2.0 * (1.0 - purity_arr[None, :]) + purity_arr[None, :] * total
+    # Calculate expected VAF (theta) from the final phi
+    pp_matrix = phi_clip * minor / denominator
+    pp_matrix = pp_matrix.clip(1e-15, 1 - 1e-15)
     logL_matrix = r * np.log(pp_matrix) + (n - r) * np.log(1 - pp_matrix)
-    logL        = np.sum(logL_matrix)
+    logL = np.sum(logL_matrix)
 
-    N = No_mutation * M
-    K_clusters = len(np.unique(class_label))
-    k_params   = K_clusters * M
-
+    N, K_clusters = No_mutation * M, len(np.unique(final_labels))
+    k_params = K_clusters * M # Number of estimated parameters
     AIC = -2.0 * logL + 2.0 * k_params
     BIC = -2.0 * logL + k_params * np.log(N)
 
-    return {
-        'phi'  : phi_res,
-        'label': class_label,
-        'aic'  : AIC,
-        'bic'  : BIC
-    }
+    return {'phi': phi_res, 'label': final_labels, 'aic': AIC, 'bic': BIC}
+
+
+# =============================================================================
+# III. MAIN PIPELINE ORCHESTRATOR
+# =============================================================================
+
+def clipp2(
+    r: np.ndarray,
+    n: np.ndarray,
+    minor: np.ndarray,
+    total: np.ndarray,
+    purity: Union[float, np.ndarray],
+    coef_list: List,
+    wcut: List[float] = [-1.8, 1.8],
+    alpha: float = 0.8,
+    gamma: float = 3.7,
+    rho: float = 1.02,
+    precision: float = 0.01,
+    Run_limit: int = 200,
+    control_large: float = 5,
+    lambda_seq: Union[List[float], float] = [0.1, 0.05, 0.01],
+    post_th: float = 0.001,
+    least_diff: float = 0.01,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    dtype: torch.dtype = torch.float32,
+) -> List[Dict[str, Any]]:
+    """
+    Main entry point for the CliPP2 subclone reconstruction pipeline.
+
+    This function orchestrates the entire process, from data preprocessing to
+    running the ADMM optimization over a sequence of regularization parameters
+    (lambda) and post-processing the results for each.
+
+    Parameters
+    ----------
+    r : np.ndarray
+        Matrix (S x M) of variant read counts for S SNVs in M samples.
+    n : np.ndarray
+        Matrix (S x M) of total read counts.
+    minor : np.ndarray
+        Matrix (S x M) of minor allele copy numbers.
+    total : np.ndarray
+        Matrix (S x M) of total copy numbers.
+    purity : float or np.ndarray
+        Tumor purity for each sample. Can be a single float or an array of size M.
+    coef_list : list
+        List of pre-computed coefficients for the piecewise-linear approximation
+        of the logistic function.
+    wcut : list, optional
+        Cutoff points for the piecewise-linear approximation. Defaults to [-1.8, 1.8].
+    alpha : float, optional
+        Initial ADMM penalty parameter. Defaults to 0.8.
+    gamma : float, optional
+        SCAD shape parameter. Defaults to 3.7.
+    rho : float, optional
+        Multiplicative factor for increasing `alpha` during ADMM. Defaults to 1.02.
+    precision : float, optional
+        Convergence tolerance for ADMM. Defaults to 0.01.
+    Run_limit : int, optional
+        Maximum number of ADMM iterations. Defaults to 200.
+    control_large : float, optional
+        Clamping value for logit-scale parameters. Defaults to 5.
+    lambda_seq : list of floats or float, optional
+        A sequence of lambda values to solve for. The solver iterates through
+        the values, using the result of one run as a warm start for the next.
+        Defaults to [0.1, 0.05, 0.01].
+    post_th : float, optional
+        Threshold for post-processing clustering. Defaults to 0.001.
+    least_diff : float, optional
+        Threshold for merging clusters based on centroid distance. Defaults to 0.01.
+    device : str, optional
+        Compute device ('cuda' or 'cpu'). Defaults to 'cuda' if available.
+    dtype : torch.dtype, optional
+        The torch data type to use for computation. Defaults to torch.float32.
+
+    Returns
+    -------
+    list[dict]
+        A list where each element is a dictionary containing the complete
+        results for a single lambda value from the input sequence. Each dict
+        includes 'phi', 'label', 'aic', 'bic', 'lambda', and 'wasserstein_distance'.
+    """
+    # --- Step 1: Preprocess data (done only once) ---
+    preprocessed_data = preprocess_clipp_data(
+        r, n, minor, total, purity, coef_list, control_large, device, dtype
+    )
+    # The unpenalized estimate is used as a baseline for distance calculation
+    phi_hat_unpenalized = preprocessed_data['phi_hat_t'].detach().cpu().numpy().flatten()
+
+    # Ensure lambda_seq is a list for iteration
+    if not isinstance(lambda_seq, (list, np.ndarray)):
+         lambda_seq = [lambda_seq]
+
+    all_results = []
+    warm_start_vars = None # Initialize warm start to None for the first run
+
+    # --- Main Loop: Iterate over the sequence of Lambda values ---
+    for i, current_lambda in enumerate(lambda_seq):
+        # --- Step 2: Run ADMM optimization for the current Lambda ---
+        # The output of the previous run is used as a warm start for the current run.
+        admm_results_for_lambda = run_admm_optimization(
+            preprocessed_data, wcut, alpha, gamma, rho, precision,
+            Run_limit, control_large, current_lambda, device,
+            warm_start_vars=warm_start_vars
+        )
+
+        # Use the results of this run as the warm start for the next lambda
+        warm_start_vars = admm_results_for_lambda
+
+        # --- Step 3: Post-process results for this Lambda ---
+        results_for_current_lambda = postprocess_admm_results(
+            admm_results_for_lambda, preprocessed_data, purity, post_th, least_diff
+        )
+
+        # --- Step 4: Calculate distance and finalize result dictionary ---
+        phi_res_current = results_for_current_lambda['phi'].flatten()
+        dist = wasserstein_distance(phi_hat_unpenalized, phi_res_current)
+
+        results_for_current_lambda['lambda'] = current_lambda
+        results_for_current_lambda['wasserstein_distance'] = dist
+
+        all_results.append(results_for_current_lambda)
+
+    return all_results

@@ -1,103 +1,116 @@
-from clipp2.preprocess import *
-from clipp2.core import *
+from clipp2.preprocess import combine_patient_samples, add_to_df, build_tensor_arrays
+from clipp2.core import clipp2 
+
 import argparse
 import numpy as np
 import pandas as pd
 import os
 import sys
-import ray
+import torch
 
 def run(args):
-    root           = args.input_dir
-    subsample_rate = args.subsample_rate
-    outdir         = args.output_dir
-    dtype          = args.dtype
-    # ► EARLY SANITY CHECK ◀
+    """
+    Main execution function for the CLiPP2 pipeline.
+    
+    This version correctly uses the warm-start pipeline to get results for
+    a full lambda path and saves a separate, vectorized output file for each lambda.
+    """
+    root, subsample_rate, outdir, dtype = args.input_dir, args.subsample_rate, args.output_dir, args.dtype
+
     if not os.path.isdir(root):
-        print(f"Error: input directory not found: {root!r}")
+        # print(f"Error: input directory not found: {root!r}", file=sys.stderr)
         sys.exit(1)
 
+    # print(f"1. Loading and preprocessing data from: {root}")
     df = combine_patient_samples(root)
-
     df = add_to_df(df)
-
     dic = build_tensor_arrays(df)
+
     r, n, minor, total = dic['r'], dic['n'], dic['minor'], dic['total']
-    pur_arr, coef_list  = dic['pur_arr'], dic['coef_list']
+    pur_arr, coef_list = dic['pur_arr'], dic['coef_list']
 
     with np.errstate(divide='ignore', invalid='ignore'):
-        frac    = r / (n + 1e-12)
-        phi_hat = frac * ((2 - 2*pur_arr) + (pur_arr * total) / (minor + 1e-12))
+        phi_hat = (r / (n + 1e-12)) * ((2 - 2 * pur_arr) + (pur_arr * total)) / (minor + 1e-12)
+        phi_hat = np.nan_to_num(phi_hat, nan=0.0)
 
+    No_orig, M_regions = phi_hat.shape
+    
     if subsample_rate < 1.0:
-        M    = r.shape[0]
-        keep = int(M * subsample_rate)
-        idxs = np.random.choice(M, keep, replace=False)
-        r, n, minor, total = [arr[idxs] for arr in (r, n, minor, total)]
-        coef_list          = [mat[idxs] for mat in coef_list]
-        for arr in (r, n, minor, total):
-            arr[np.isnan(arr)] = 1
+        # print(f"2. Subsampling mutations to {subsample_rate * 100:.1f}%")
+        keep = int(No_orig * subsample_rate)
+        idxs = np.random.choice(No_orig, keep, replace=False)
+        r_sub, n_sub, minor_sub, total_sub = [arr[idxs] for arr in (r, n, minor, total)]
+        coef_list_sub = [mat[idxs] for mat in coef_list]
     else:
-        idxs = range(r.shape[0])
+        # print("2. Using all mutations (no subsampling).")
+        idxs = np.arange(No_orig)
+        r_sub, n_sub, minor_sub, total_sub = r, n, minor, total
+        coef_list_sub = coef_list
+        
+    lambda_seq = np.linspace(0.01, 0.5, 20)
+    # print(f"3. Running CLiPP2 warm-start pipeline for {len(lambda_seq)} lambda values...")
 
-    Lambda_lst = np.linspace(0.01, 0.5, 20)
-    for Lambda in Lambda_lst:
-        res = clipp2(
-            r, n, minor, total, pur_arr, coef_list,
-            Lambda=Lambda, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=dtype
-        )
-        labels, phi_cent, aic, bic = res['label'], res['phi'], res['aic'], res['bic']
-
-        pairs   = dic['pairs']
-        samples = dic['samples']
-        orig2sub = {orig: sub for sub, orig in enumerate(idxs)}
-
-        rows = []
-        No, M = phi_hat.shape
-        for mut_idx in range(No):
-            chrom, pos = pairs.iloc[mut_idx]
-            for j, region in enumerate(samples):
-                phi_hat_val = phi_hat[mut_idx, j]
-                if mut_idx in orig2sub:
-                    sub_i  = orig2sub[mut_idx]
-                    lab    = labels[sub_i]
-                    phi    = phi_cent[sub_i, j]
-                    aic    = aic
-                    bic    = bic
-                    dropped= 0
-                else:
-                    lab    = np.nan
-                    phi    = np.nan
-                    dropped= 1
-
-                rows.append({
-                    'chromosome_index': chrom,
-                    'position':         pos,
-                    'region':           region,
-                    'label':            lab,
-                    'phi':              phi,
-                    'phi_hat':          phi_hat_val,
-                    'aic':              aic,
-                    'bic':              bic,
-                    'dropped':          dropped
-                })
-
-        result_df = pd.DataFrame(rows)
-        os.makedirs(outdir, exist_ok=True)
-        suboutput = os.path.join(outdir, root)
-        os.makedirs(suboutput, exist_ok=True)
-        result_df.to_csv(f'{suboutput}/lambda_{Lambda}.tsv', sep='\t', index=False)
-
-if __name__=='__main__':
-    parser = argparse.ArgumentParser(
-        description='Multi-sample CLiPP2 pipeline'
+    # --- SINGLE, EFFICIENT PIPELINE CALL ---
+    # This call now correctly maps to the updated clipp2 function.
+    list_of_results = clipp2(
+        r_sub, n_sub, minor_sub, total_sub, pur_arr, coef_list_sub,
+        lambda_seq=lambda_seq, # The argument name 'lambda_seq' matches.
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        dtype=dtype
     )
-    parser.add_argument('--input_dir',       required=True,
-                        help="Root directory of processed samples")
-    parser.add_argument('--output_dir',       default='output',
-                        help="Root directory of processed samples")
-    parser.add_argument('--subsample_rate', type=float, default=1.0,
-                        help="Fraction of mutations to keep (for speed/debug)")
-    parser.add_argument('--dtype', default='float16')
+    # print("   Pipeline finished. Formatting and saving results...")
+
+    output_base_dir = os.path.join(outdir, os.path.basename(os.path.normpath(root)))
+    os.makedirs(output_base_dir, exist_ok=True)
+    
+    pairs = dic['pairs']
+    samples = dic['samples']
+
+    # --- LOOP OVER RESULTS (NOT THE PIPELINE) ---
+    # This loop correctly consumes the list of dictionaries returned by clipp2.
+    for res in list_of_results:
+        lambda_val = res['lambda']
+
+        # VECTORIZED DATAFRAME CREATION
+        labels_full = np.full(No_orig, np.nan)
+        phi_res_full = np.full((No_orig, M_regions), np.nan)
+        dropped_full = np.ones(No_orig, dtype=int)
+
+        labels_full[idxs] = res['label']
+        phi_res_full[idxs, :] = res['phi']
+        dropped_full[idxs] = 0
+
+        data_for_df = {
+            'chromosome_index': np.repeat(pairs['chromosome_index'].values, M_regions),
+            'position': np.repeat(pairs['position'].values, M_regions),
+            'region': np.tile(samples, No_orig),
+            'lambda': lambda_val,
+            'label': np.repeat(labels_full, M_regions),
+            'phi': phi_res_full.flatten(),
+            'phi_hat': phi_hat.flatten(),
+            'aic': res['aic'],
+            'bic': res['bic'],
+            'wasserstein_distance': res['wasserstein_distance'], # The key exists.
+            'dropped': np.repeat(dropped_full, M_regions)
+        }
+        
+        result_df = pd.DataFrame(data_for_df)
+        
+        # Correction to handle the 'wasserstein_distance' being a single value
+        result_df['wasserstein_distance'] = res['wasserstein_distance']
+        
+        output_file = os.path.join(output_base_dir, f'lambda_{lambda_val:.4f}.tsv')
+        result_df.to_csv(output_file, sep='\t', index=False, na_rep='NA')
+
+    # print(f"\n4. Success! All {len(list_of_results)} result files saved in: {output_base_dir}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Run the CLiPP2 multi-sample subclone reconstruction pipeline for a range of lambdas.'
+    )
+    parser.add_argument('--input_dir', required=True, help="Root directory of a patient's processed samples.")
+    parser.add_argument('--output_dir', default='output', help="Directory to save the series of result TSV files.")
+    parser.add_argument('--subsample_rate', type=float, default=1.0, help="Fraction of mutations to keep for the run (e.g., 0.5 for 50%%). For speed/debugging.")
+    parser.add_argument('--dtype', default='float32', help="PyTorch dtype to use ('float32' is recommended for stability).")
     args = parser.parse_args()
     run(args)

@@ -674,7 +674,7 @@ def clipp2(
         r_vec = linear_t - matvec_H_laplacian(x, B_sq_t, No_mutation, M, alpha)
         p, rs_old = r_vec.clone(), torch.dot(r_vec, r_vec)
         
-        for _ in range(500): # Max CG iterations
+        for _ in range(200): # Max CG iterations
             Ap = matvec_H_laplacian(p, B_sq_t, No_mutation, M, alpha)
             alpha_cg = rs_old / (torch.dot(p, Ap) + 1e-12)
             x.add_(p, alpha=alpha_cg)

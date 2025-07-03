@@ -15,7 +15,15 @@ def run(args):
     This version correctly uses the warm-start pipeline to get results for
     a full lambda path and saves a separate, vectorized output file for each lambda.
     """
-    root, subsample_rate, outdir, dtype = args.input_dir, args.subsample_rate, args.output_dir, args.dtype
+    root, subsample_rate, outdir = args.i, args.subsample_rate, args.o
+    if not root:
+        # print(f"Error: input directory not found: {root!r}", file=sys.stderr)
+        sys.exit(1)
+        
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
 
     if not os.path.isdir(root):
         # print(f"Error: input directory not found: {root!r}", file=sys.stderr)
@@ -47,7 +55,7 @@ def run(args):
         r_sub, n_sub, minor_sub, total_sub = r, n, minor, total
         coef_list_sub = coef_list
         
-    lambda_seq = np.linspace(0.01, 0.5, 20)
+    lambda_seq = np.linspace(0.01, 1, 20)
     # print(f"3. Running CLiPP2 warm-start pipeline for {len(lambda_seq)} lambda values...")
 
     # --- SINGLE, EFFICIENT PIPELINE CALL ---
@@ -55,8 +63,7 @@ def run(args):
     list_of_results = clipp2(
         r_sub, n_sub, minor_sub, total_sub, pur_arr, coef_list_sub,
         lambda_seq=lambda_seq, # The argument name 'lambda_seq' matches.
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        dtype=dtype
+        device=device
     )
     # print("   Pipeline finished. Formatting and saving results...")
 
@@ -88,16 +95,12 @@ def run(args):
             'label': np.repeat(labels_full, M_regions),
             'phi': phi_res_full.flatten(),
             'phi_hat': phi_hat.flatten(),
-            'aic': res['aic'],
-            'bic': res['bic'],
-            'wasserstein_distance': res['wasserstein_distance'], # The key exists.
             'dropped': np.repeat(dropped_full, M_regions)
         }
         
         result_df = pd.DataFrame(data_for_df)
         
         # Correction to handle the 'wasserstein_distance' being a single value
-        result_df['wasserstein_distance'] = res['wasserstein_distance']
         
         output_file = os.path.join(output_base_dir, f'lambda_{lambda_val:.4f}.tsv')
         result_df.to_csv(output_file, sep='\t', index=False, na_rep='NA')
@@ -108,9 +111,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Run the CLiPP2 multi-sample subclone reconstruction pipeline for a range of lambdas.'
     )
-    parser.add_argument('--input_dir', required=True, help="Root directory of a patient's processed samples.")
-    parser.add_argument('--output_dir', default='output', help="Directory to save the series of result TSV files.")
+    parser.add_argument('-i', required=True, help="Root directory of a patient's processed samples.")
+    parser.add_argument('-o', default='output', help="Directory to save the series of result TSV files.")
     parser.add_argument('--subsample_rate', type=float, default=1.0, help="Fraction of mutations to keep for the run (e.g., 0.5 for 50%%). For speed/debugging.")
-    parser.add_argument('--dtype', default='float32', help="PyTorch dtype to use ('float32' is recommended for stability).")
     args = parser.parse_args()
     run(args)

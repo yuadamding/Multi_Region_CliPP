@@ -16,7 +16,6 @@ PERFORMANCE REVISION:
 *   Robustness: Final size-based cleanup merges spurious small clusters.
 
 Author: [Yu Ding, Ph.D. / Wenyi Wang's Lab / MD Anderson Cancer Center]
-Revised by: Assistant (based on user-provided paper and multiple expert code reviews)
 Date: [Oct 2024]
 Contact: [yding4@mdanderson.org, yding1995@gmail.com]
 """
@@ -35,51 +34,73 @@ AMP_OK = torch.cuda.is_available() and hasattr(torch.cuda, "amp")
 
 # --- JIT-Compiled Helper Functions ---
 @torch.jit.script
-def scad_threshold_update_torch(w_new_t, tau_old_t, i_idx, j_idx, alpha: float, Lambda: float, gamma: float, adaptive_weights_t):
+def scad_threshold_update_torch(
+    w_new_t:     torch.Tensor,
+    tau_old_t:   torch.Tensor,
+    i_idx:       torch.Tensor,
+    j_idx:       torch.Tensor,
+    alpha:  float,
+    Lambda: float,
+    gamma:  float,
+    adaptive_weights_t: torch.Tensor
+):
     """
-    (JIT-Compiled) Applies the proximal operator for the adaptively weighted SCAD penalty.
-    """
-    D_w = w_new_t[i_idx, :] - w_new_t[j_idx, :]
-    z_t = D_w - tau_old_t / alpha
-    z_norm_t = torch.linalg.norm(z_t, dim=1)
-    
-    lam_w = Lambda * adaptive_weights_t
-    gamma_lam_scalar = gamma * Lambda
+    Weighted Group‑SCAD proximal operator (TorchScript‑compatible).
 
-    thr1 = lam_w / alpha
-    thr2 = gamma_lam_scalar / alpha
-    
-    mask_soft_thresh = z_norm_t <= thr1
-    mask_linear_decay = (z_norm_t > thr1) & (z_norm_t <= thr2)
-    
+    Returns
+    -------
+    eta_new_t : (P,M) tensor
+    tau_new_t : (P,M) tensor
+    """
+    # ------------------------------------------------------------------ Δw  & z
+    D_w      = w_new_t[i_idx, :] - w_new_t[j_idx, :]
+    z_t      = D_w - tau_old_t / alpha
+    z_norm_t = torch.linalg.norm(z_t, dim=1)
+
+    # ------------------------------------------------------------------ pair‑specific λ
+    lam_w = Lambda * adaptive_weights_t
+
+    # ------------------------------------------------------------------ thresholds
+    thr1 = 2.0   * lam_w / alpha          # Region‑I upper bound
+    thr2 = gamma * lam_w / alpha          # Region‑II upper bound
+
+    mask_soft   = z_norm_t <= thr1
+    mask_linear = (z_norm_t > thr1) & (z_norm_t <= thr2)
+
     eta_new_t = torch.zeros_like(z_t)
 
-    if mask_soft_thresh.any():
-        i1 = mask_soft_thresh.nonzero().squeeze(1)
-        scale1 = (1.0 - lam_w[i1] / (alpha * z_norm_t[i1].clamp(min=1e-12))).clamp(min=0.0)
+    # --------------------------- Region I
+    if mask_soft.any():
+        i1 = mask_soft.nonzero().squeeze(1)            # TorchScript‑safe
+        scale1 = (1.0 - lam_w[i1] /
+                  (alpha * z_norm_t[i1].clamp_min(1e-12))).clamp_min(0.0)
         eta_new_t[i1] = scale1.unsqueeze(1) * z_t[i1]
 
-    if mask_linear_decay.any():
-        i2 = mask_linear_decay.nonzero().squeeze(1)
-        w_i2 = adaptive_weights_t[i2]
-        denom2 = 1.0 - w_i2 / (alpha * (gamma - 1.0))
-        safe_denom_mask = denom2 > 1e-8
-        
-        if safe_denom_mask.any():
-            safe_i2 = i2[safe_denom_mask]
-            numerator = (w_i2[safe_denom_mask] * gamma_lam_scalar) / (alpha * (gamma - 1.0))
-            scale2 = (1.0 - numerator / z_norm_t[safe_i2].clamp(min=1e-12)).clamp(min=0.0)
-            eta_new_t[safe_i2] = (scale2 / denom2[safe_denom_mask]).unsqueeze(1) * z_t[safe_i2]
-        
-        if (~safe_denom_mask).any():
-            unsafe_i2 = i2[~safe_denom_mask]
-            eta_new_t[unsafe_i2] = z_t[unsafe_i2]
+    # --------------------------- Region II
+    if mask_linear.any():
+        i2     = mask_linear.nonzero().squeeze(1)      # TorchScript‑safe
+        lam_i2 = lam_w[i2]
+        denom2 = 1.0 - lam_i2 / (alpha * (gamma - 1.0))
+        safe   = denom2 > 1e-8
 
-    mask_all = mask_soft_thresh | mask_linear_decay
+        if safe.any():
+            sidx   = i2[safe]
+            numer  = (gamma * lam_i2[safe]) / (alpha * (gamma - 1.0))
+            scale2 = (1.0 - numer /
+                      z_norm_t[sidx].clamp_min(1e-12)).clamp_min(0.0)
+            eta_new_t[sidx] = (scale2 / denom2[safe]).unsqueeze(1) * z_t[sidx]
+
+        if (~safe).any():                               # rare numerical corner
+            eta_new_t[i2[~safe]] = z_t[i2[~safe]]
+
+    # --------------------------- Region III (identity)
+    mask_all = mask_soft | mask_linear
     eta_new_t[~mask_all] = z_t[~mask_all]
-        
+
+    # ------------------------------------------------------------------ dual update
     tau_new_t = tau_old_t - alpha * (D_w - eta_new_t)
     return eta_new_t, tau_new_t
+
 
 @torch.jit.script
 def matvec_H_laplacian(x, B_sq_t, No_mutation: int, M: int, alpha: float):
@@ -255,14 +276,13 @@ def _log_ic(lbl_np, w, prep_data):
 def postprocess_admm_results(admm_results, preprocessed_data, i_idx, j_idx, post_th, least_mut):
     w, eta = admm_results['w'], admm_results['eta']
     No_mutation, dev = preprocessed_data['No_mutation'], w.device
-
+    n_samples = preprocessed_data['M']
+    post_th = post_th * n_samples
     norm = torch.linalg.norm(eta, dim=1)
     keep = (norm <= post_th).nonzero().squeeze(1)
     parents = torch.arange(No_mutation, dtype=torch.int64,  device=dev)
-   
+    
     if keep.numel():
-        parents = torch.arange(No_mutation, device=dev)
-
         # iterate log₂(N) times to converge
         for _ in range(15):
             pa = parents[i_idx[keep]]
@@ -390,7 +410,8 @@ def clipp2(
             warm_start_vars=warm_start_vars
         )
         warm_start_vars = admm_results_for_lambda
-
+        
+        
         results_for_current_lambda = postprocess_admm_results(
             admm_results_for_lambda, preprocessed_data, 
             i_idx, j_idx, post_th, least_mut
@@ -402,5 +423,6 @@ def clipp2(
         results_for_current_lambda['wasserstein_distance'] = dist
         
         all_results.append(results_for_current_lambda)
+        torch.cuda.empty_cache()
 
     return all_results

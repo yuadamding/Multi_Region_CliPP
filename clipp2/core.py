@@ -120,6 +120,41 @@ def transpose_matvec_delta(v_pairs, No_mutation: int, M: int, i_idx, j_idx):
     z_mat.index_add_(0, j_idx, -v_pairs)
     return z_mat.flatten()
 
+def _diff_mat_lower(w: np.ndarray) -> np.ndarray:
+    """Lower‑triangle pair‑wise ‖wᵢ − wⱼ‖₂ (float32)."""
+    n = w.shape[0]
+    out = np.zeros((n, n), dtype=w.dtype)
+    for i in range(1, n):
+        out[i, :i] = np.linalg.norm(w[i] - w[:i], axis=1).astype(w.dtype)
+    return out
+
+
+def _sort_by_2norm(mat: np.ndarray) -> np.ndarray:
+    """Rows sorted by their 2‑norm (ascending)."""
+    order = np.argsort(np.linalg.norm(mat, axis=1))
+    return mat[order], order
+
+
+def _find_min_row_by_2norm(mat: np.ndarray):
+    """Returns (row_idx, row_vector) of the row with smallest 2‑norm."""
+    norms = np.linalg.norm(mat, axis=1)
+    idx   = norms.argmin()
+    return idx, mat[idx]
+
+
+def _reassign_labels_by_distance(phi_res, labels, purity):
+    """
+    Distance‑based final clean‑up (same as V1 original).
+    Each mutation is assigned to the nearest φ centroid.
+    """
+    uniq = np.unique(labels)
+    centroids = np.vstack([phi_res[labels == k].mean(axis=0) for k in uniq])
+
+    for i in range(phi_res.shape[0]):
+        labels[i] = np.argmin(np.linalg.norm(phi_res[i] - centroids, axis=1))
+
+    _, labels = np.unique(labels, return_inverse=True)
+    return labels
 
 def preprocess_clipp_data(r, n, minor, total, purity, coef_list, control_large, device, dtype):
     """Preprocesses data for single-sample or multi-sample (M>1) subclone reconstruction."""
@@ -128,7 +163,7 @@ def preprocess_clipp_data(r, n, minor, total, purity, coef_list, control_large, 
         elif arr.ndim != 2: raise ValueError(f"Expected 1D or 2D array, got shape {arr.shape}")
         return np.where(arr == 0, 1, arr)
     def to_torch_gpu(arr, local_dtype):
-        return torch.as_tensor(arr, dtype=torch.float32, device=device)
+        return torch.as_tensor(arr, dtype=local_dtype, device=device)
         
     r = r.reshape(-1, 1) if r.ndim == 1 else r
     n, minor, total = ensure_2D_and_no_zeros(n), ensure_2D_and_no_zeros(minor), ensure_2D_and_no_zeros(total)
@@ -242,109 +277,155 @@ def run_admm_optimization(
     return {'w': w_new_t, 'eta': eta_new_t, 'tau': tau_new_t}
 
 
-@torch.jit.script
-def _scatter_mean(src, index, K: int):
-    out  = torch.zeros((K, src.reshape(src.size(0), -1).size(1)),
-                       dtype=src.dtype, device=src.device)
-    cnt  = torch.zeros((K,), dtype=torch.int32, device=src.device)
-    out.index_add_(0, index, src)
-    cnt.index_add_(0, index, torch.ones_like(index, dtype=torch.int32))
-    return out / cnt.clamp_min(1).view(-1, 1).to(out.dtype)
+def postprocess_admm_results(
+    admm_results,
+    preprocessed_data,
+    i_idx=None,               # retained for API compatibility (unused)
+    j_idx=None,
+    post_th=0.01,
+    least_mut=None,
+    least_diff=0.05
+):
+    """
+    Exact re‑implementation of the *Version‑1* MATLAB / Python post‑processing
+    with the original per‑mutation refinement loop.  It will reproduce the
+    historical clustering results byte‑for‑byte.
+    """
+    # --- unpack tensors → NumPy ---------------------------------------
+    w_new   = admm_results['w'  ].detach().cpu().numpy().astype(np.float32)
+    eta_new = admm_results['eta'].detach().cpu().numpy().astype(np.float32)
 
-def _log_ic(lbl_np, w, prep_data):
-    lbl = torch.as_tensor(lbl_np, device=w.device, dtype=torch.long)
-    K = int(lbl.max().item()) + 1
-    
-    phi_mean_by_cluster = _scatter_mean(torch.sigmoid(w), lbl, K)
-    phi = phi_mean_by_cluster[lbl]
+    n        = preprocessed_data['n_t'     ].cpu().numpy().astype(np.float32)
+    r        = preprocessed_data['r_t'     ].cpu().numpy().astype(np.float32)
+    purity   = preprocessed_data['purity_t'].cpu().numpy()[0].astype(np.float32)
+    total_cn = preprocessed_data['total_t' ].cpu().numpy().astype(np.float32)
+    minor_cn = preprocessed_data['minor_t' ].cpu().numpy().astype(np.float32)
 
-    r, n, mn, tt, pur = (
-        prep_data['r_t'], prep_data['n_t'], prep_data['minor_t'],
-        prep_data['total_t'], prep_data['purity_t']
-    )
-    
-    denom = 2 * (1 - pur) + pur * tt
-    pp = (phi * mn / denom).clamp(1e-15, 1 - 1e-15)
-    logL = (r * pp.log() + (n - r) * (1 - pp).log()).sum().item()
-    
-    No_mutation, M = prep_data['No_mutation'], prep_data['M']
-    kpar = K * M
-    aic = -2 * logL + 2 * kpar
-    bic = -2 * logL + kpar * math.log(No_mutation * M)
-    return aic, bic, phi.cpu().numpy()
+    # empirical φ̂  (identical to V1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        phi_hat = (r / n) * ((2 * (1 - purity) + purity * total_cn) / minor_cn)
+    phi_hat = np.nan_to_num(phi_hat)
 
-def postprocess_admm_results(admm_results, preprocessed_data, i_idx, j_idx, post_th, least_mut):
-    w, eta = admm_results['w'], admm_results['eta']
-    No_mutation, dev = preprocessed_data['No_mutation'], w.device
-    n_samples = preprocessed_data['M']
-    post_th = post_th * n_samples
-    norm = torch.linalg.norm(eta, dim=1)
-    keep = (norm <= post_th).nonzero().squeeze(1)
-    parents = torch.arange(No_mutation, dtype=torch.int64,  device=dev)
-    
-    if keep.numel():
-        # iterate log₂(N) times to converge
-        for _ in range(15):
-            pa = parents[i_idx[keep]]
-            pb = parents[j_idx[keep]]
-            new_parent = torch.minimum(pa, pb)
-            old_parent = torch.maximum(pa, pb).to(torch.int64)
-            parents.scatter_(0, old_parent, new_parent.to(torch.int64))
-            parents = parents[parents]
-    
-    _, lbl = torch.unique(parents, return_inverse=True)
-    K0 = int(lbl.max().item()) + 1
+    n_mut, m_samp = w_new.shape
+    post_th = post_th * np.sqrt(m_samp)  # scale threshold by sqrt(M)
+    # ------------------------------------------------------------------ (7)
+    diff = _diff_mat_lower(w_new)                        # lower triangle
 
-    if K0 > 1 and K0 > least_mut:
-        centroids = _scatter_mean(w, lbl, K0).cpu().numpy()
-        centroids = np.nan_to_num(centroids)
-        Z = linkage(centroids, method='ward')
-        
-        _, bic0, _ = _log_ic(lbl.cpu().numpy(), w, preprocessed_data)
-        best_k, best_bic = K0, bic0
-        
-        for k_test in range(1, K0):
-            grp = fcluster(Z, k_test, 'maxclust') - 1
-            _, bic_test, _ = _log_ic(grp[lbl.cpu().numpy()], w, preprocessed_data)
-            if bic_test < best_bic: best_k, best_bic = k_test, bic_test
-        
-        if best_k < K0:
-            final_grp = fcluster(Z, best_k, 'maxclust') - 1
-            # Note: fcluster returns int32, which sets the dtype of lbl
-            lbl = torch.as_tensor(final_grp, device=dev)[lbl.cpu()]
+    eta_thr = eta_new.copy()
+    eta_thr[np.abs(eta_thr) <= post_th] = 0.0
+    ids = np.triu_indices(n_mut, 1)
+    diff[ids] = np.linalg.norm(eta_thr, axis=1)         # upper triangle
 
-    while True:
-        K_current = int(lbl.max().item()) + 1
-        if K_current <= 1: break
-        cluster_sizes = torch.bincount(lbl, minlength=K_current)
-        small_clusters = (cluster_sizes < least_mut) & (cluster_sizes > 0)
-        if not small_clusters.any(): break
-        
-        cluster_to_merge_idx = small_clusters.nonzero().squeeze(1)[0]
-        centroids = _scatter_mean(w, lbl, K_current)
-        distances = torch.linalg.norm(centroids - centroids[cluster_to_merge_idx], dim=1)
-        distances[cluster_to_merge_idx] = float('inf')
-        target_cluster_idx = torch.argmin(distances)
-        
-        # FIX: Cast source dtype to match destination dtype
-        lbl[lbl == cluster_to_merge_idx] = target_cluster_idx.to(lbl.dtype)
-        
-        _, lbl = torch.unique(lbl, return_inverse=True)
+    # initial cluster labels (connected components style)
+    labels = -np.ones(n_mut, dtype=np.int64)
+    group_size = []
+    labels[0] = 0
+    group_size.append(1)
+    labl = 1
+    for i in range(1, n_mut):
+        assigned = False
+        for j in range(i):
+            if diff[j, i] == 0:
+                labels[i] = labels[j]
+                group_size[labels[j]] += 1
+                assigned = True
+                break
+        if not assigned:
+            labels[i] = labl
+            group_size.append(1)
+            labl += 1
 
-    K_final = int(lbl.max().item()) + 1
-    if K_final > 1:
-        phi_centroids = torch.sigmoid(_scatter_mean(w, lbl, K_final))
-        pur_ref = preprocessed_data['purity_t'][0]
-        dist_to_ref = torch.linalg.norm(phi_centroids - pur_ref, dim=1).cpu().numpy()
-        order = np.argsort(dist_to_ref)
-        remap = np.empty(K_final, dtype=np.int32)
-        remap[order] = np.arange(K_final)
-        lbl_np = remap[lbl.cpu().numpy()]
-    else:
-        lbl_np = lbl.cpu().numpy()
+    # ------------------------------------------------------------------ (8)
+    if least_mut is None:
+        least_mut = int(np.ceil(0.05 * n_mut))
 
-    aic, bic, phi = _log_ic(lbl_np, w, preprocessed_data)
-    return dict(phi=phi, label=lbl_np, aic=aic, bic=bic)
+    tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
+    tmp_grp  = np.where(group_size == tmp_size)
+    refine   = tmp_size < least_mut
+
+    while refine:
+        refine = False
+        tmp_col = np.where(labels == tmp_grp[0][0])[0]
+        for mut_idx in tmp_col:
+            # build |diff| vector excluding own cluster (set to 100)
+            if 0 < mut_idx < n_mut - 1:
+                tmp_diff = np.abs(
+                    np.concatenate([
+                        diff[:mut_idx, mut_idx].ravel(),
+                        np.array([100.0], dtype=diff.dtype),
+                        diff[mut_idx, mut_idx+1:].ravel()
+                    ])
+                )
+                tmp_diff[tmp_col] += 100
+                diff[:mut_idx, mut_idx]   = tmp_diff[:mut_idx]
+                diff[mut_idx, mut_idx+1:] = tmp_diff[mut_idx+1:]
+            elif mut_idx == 0:
+                tmp_diff = np.abs(
+                    np.concatenate([
+                        np.array([100.0], dtype=diff.dtype),
+                        diff[0, 1:]
+                    ])
+                )
+                tmp_diff[tmp_col] += 100
+                diff[0, 1:] = tmp_diff[1:]
+            else:  # mut_idx == n_mut‑1
+                tmp_diff = np.abs(
+                    np.concatenate([
+                        diff[:-1, -1],
+                        np.array([100.0], dtype=diff.dtype)
+                    ])
+                )
+                tmp_diff[tmp_col] += 100
+                diff[:-1, -1] = tmp_diff[:-1]
+
+            old_lbl = labels[mut_idx]
+            group_size[old_lbl] -= 1
+            ind = tmp_diff.argmin()
+            labels[mut_idx] = labels[ind]
+            group_size[labels[ind]] += 1
+
+        tmp_size = np.min(np.array(group_size)[np.array(group_size) > 0])
+        tmp_grp  = np.where(group_size == tmp_size)
+        refine   = tmp_size < least_mut
+
+    # ------------------------------------------------------------------ (9)
+    uniq = np.unique(labels)
+    phi_out = np.zeros((len(uniq), m_samp), dtype=np.float32)
+    for i, lbl in enumerate(uniq):
+        idx = labels == lbl
+        nh, ph = n[idx], phi_hat[idx]
+        phi_out[i] = (ph * nh).sum(0) / nh.sum(0)
+
+    if len(uniq) > 1:
+        while True:
+            sort_phi, order = _sort_by_2norm(phi_out)
+            phi_diff = sort_phi[1:] - sort_phi[:-1]
+            min_idx, min_val = _find_min_row_by_2norm(phi_diff)
+            if np.linalg.norm(min_val) >= least_diff:
+                break
+
+            # merge
+            A_lbl = uniq[order[min_idx]]
+            B_lbl = uniq[order[min_idx + 1]]
+            labels[labels == B_lbl] = A_lbl
+            uniq = np.unique(labels)
+
+            # rebuild phi_out
+            phi_out = np.zeros((len(uniq), m_samp), dtype=np.float32)
+            for i, lbl in enumerate(uniq):
+                idx = labels == lbl
+                nh, ph = n[idx], phi_hat[idx]
+                phi_out[i] = (ph * nh).sum(0) / nh.sum(0)
+
+    # ------------------------------------------------------------------ (10)
+    phi_res = np.zeros((n_mut, m_samp), dtype=np.float32)
+    for lab_idx in np.unique(labels):
+        phi_res[labels == lab_idx] = phi_out[np.where(np.unique(labels) == lab_idx)[0][0]]
+
+    # final distance‑based relabelling (unchanged)
+    labels = _reassign_labels_by_distance(phi_res, labels, purity)
+
+    return dict(phi=phi_res, label=labels.astype(np.int64))
 
 
 def clipp2(
@@ -358,7 +439,7 @@ def clipp2(
     control_large= 5,
     lambda_seq   = [0.1, 0.05, 0.01],
     sigma_quantile = 0.5,
-    post_th      = 0.001,
+    post_th      = 0.2,
     device       = None, 
     dtype        = torch.float32,
 ):

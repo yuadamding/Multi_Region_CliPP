@@ -7,7 +7,7 @@ import pandas as pd
 import os
 import sys
 import torch
-
+import pickle as pkl
 def run(args):
     """
     Main execution function for the CLiPP2 pipeline.
@@ -55,7 +55,8 @@ def run(args):
         r_sub, n_sub, minor_sub, total_sub = r, n, minor, total
         coef_list_sub = coef_list
         
-    lambda_seq = np.linspace(0.01, 1, 20)
+    lambda_seq = np.logspace(-2, 0.2, 100)
+    lambda_seq = np.sort(np.unique(lambda_seq))  # Ensure unique and sorted lambda values
     # print(f"3. Running CLiPP2 warm-start pipeline for {len(lambda_seq)} lambda values...")
 
     # --- SINGLE, EFFICIENT PIPELINE CALL ---
@@ -105,7 +106,6 @@ def run(args):
         output_file = os.path.join(output_base_dir, f'lambda_{lambda_val:.4f}.tsv')
         result_df.to_csv(output_file, sep='\t', index=False, na_rep='NA')
 
-    # print(f"\n4. Success! All {len(list_of_results)} result files saved in: {output_base_dir}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(

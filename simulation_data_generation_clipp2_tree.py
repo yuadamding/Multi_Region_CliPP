@@ -31,7 +31,7 @@ DEPTH_LIST      = [30, 100]                          # sequencing depth per alle
 CLUSTER_LIST    = [2, 5, 10]                         # K
 SPARSITY_LIST   = [0.2, 0.4, 0.6]                    # per-sample dropout prob.
 
-REPS    = 1
+REPS    = 5
 PREFIX  = "CliPP2Sim"
 OUT_DIR = Path("simulations_tree")
 OUT_DIR.mkdir(exist_ok=True)
@@ -226,7 +226,7 @@ def main() -> None:
                 total[mask == 1] = total_cna[mask == 1]
 
             # ---------- depth / reads ------------------------------------
-            n_exp = (total / 2) * depth
+            n_exp = depth * ( (1 - rho) * 2 + rho * total ) / 2
             n_obs = rng_poisson(n_exp)
 
             vaf   = (mut_cp * minor) / (2 * (1 - rho) + rho * total + 1e-9)
@@ -255,7 +255,8 @@ def main() -> None:
                 "minor_true":  minor.flatten(),
                 "total_true":  total.flatten(),
                 "minor_est":   minor_est.flatten(),
-                "cluster_id":  np.repeat(labels, M)
+                "cluster_id":  np.repeat(labels, M),
+                'mut_cp':      mut_cp.flatten()
             })
             df_obs.to_csv(OUT_DIR / f"{tag}_obs.csv", index=False)
 

@@ -200,81 +200,135 @@ def run_admm_optimization(
     adaptive_weights_t, i_idx, j_idx,
     warm_start_vars=None, cg_max_iter=50
 ):
-    No_mutation, M = preprocessed_data['No_mutation'], preprocessed_data['M']
-    w_new_t = (warm_start_vars['w'] if warm_start_vars else preprocessed_data['w_init_t']).clone()
-    eta_new_t = (warm_start_vars['eta'] if warm_start_vars else w_new_t[i_idx, :] - w_new_t[j_idx, :]).clone()
-    tau_new_t = (warm_start_vars['tau'] if warm_start_vars else torch.zeros_like(eta_new_t)).clone()
-    
-    r_t, n_t, minor_t, total_t, purity_t, c_all_t = (
-        preprocessed_data['r_t'], preprocessed_data['n_t'], preprocessed_data['minor_t'],
-        preprocessed_data['total_t'], preprocessed_data['purity_t'], preprocessed_data['c_all_t']
-    )
-    
-    alpha = alpha_init
+    # ---------------------------------------------------------------- unpack (unchanged)
+    No_mutation, M  = preprocessed_data['No_mutation'], preprocessed_data['M']
+    r_t, n_t        = preprocessed_data['r_t'],     preprocessed_data['n_t']
+    minor_t         = preprocessed_data['minor_t']
+    total_t         = preprocessed_data['total_t']
+    purity_t        = preprocessed_data['purity_t']
+    c_all_t         = preprocessed_data['c_all_t']
+
+    w_new_t = (warm_start_vars['w']
+               if warm_start_vars else preprocessed_data['w_init_t']).clone()
+    eta_new_t = (warm_start_vars['eta']
+                 if warm_start_vars else (w_new_t[i_idx] - w_new_t[j_idx])).clone()
+    tau_new_t = (warm_start_vars['tau']
+                 if warm_start_vars else torch.zeros_like(eta_new_t)).clone()
+
     low_cut, up_cut = wcut
-    
-    for k_iter in range(Run_limit):
+    alpha  = float(alpha_init)
+    use_amp_global = torch.cuda.is_available() and device.type == 'cuda'
+
+    # ------------------------------ helper: clamp & replace --------------
+    def _finite_or_clamp(t, lo=None, hi=None, replace=0.0):
+        """Replace NaN/±inf with `replace`, then clamp to [lo,hi] if given."""
+        t = torch.where(torch.isfinite(t), t, torch.full_like(t, replace))
+        if lo is not None or hi is not None:
+            t = t.clamp(min=lo if lo is not None else -float('inf'),
+                        max=hi if hi is not None else  float('inf'))
+        return t
+
+    # ---------------------------------------------------------------- ADMM
+    for _ in range(Run_limit):
         w_old_t, eta_old_t, tau_old_t = w_new_t, eta_new_t, tau_new_t
-        
-        # --- Start of high-performance computation block ---
-        # FIX: Use modern torch.amp.autocast syntax
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(AMP_OK and device.type=='cuda')):
-            expW_t = torch.exp(w_old_t)
-            theta_t = (expW_t * minor_t) / ((2.0 * (1 - purity_t) + purity_t * total_t) * (1 + expW_t))
-            
-            maskLow, maskUp = w_old_t <= low_cut, w_old_t >= up_cut
-            maskMid = ~maskLow & ~maskUp
-            
-            partA = (maskLow*c_all_t[...,1] + maskUp*c_all_t[...,5] + maskMid*c_all_t[...,3]) - (r_t+1e-12)/(n_t+1e-10)
-            partB = (maskLow*c_all_t[...,0] + maskUp*c_all_t[...,4] + maskMid*c_all_t[...,2])
-            
-            A_flat = (torch.sqrt(n_t) * partA / torch.sqrt(theta_t * (1 - theta_t) + 1e-20)).flatten()
-            B_flat = (torch.sqrt(n_t) * partB / torch.sqrt(theta_t * (1 - theta_t) + 1e-20)).flatten()
-            B_sq_t = B_flat**2
 
-            RHS_1 = transpose_matvec_delta(alpha * eta_old_t + tau_old_t, No_mutation, M, i_idx, j_idx)
+        # AMP only if weights far from saturation
+        amp_enabled = use_amp_global and (w_old_t.abs().max().item() < 4.0)
+        with torch.amp.autocast(device_type=device.type,
+                                dtype=torch.float16,
+                                enabled=amp_enabled):
+
+            # ------------------------------------------------ θ(w)
+            expW_t  = torch.exp(w_old_t)
+            theta_t = (expW_t * minor_t) / (
+                (2.0 * (1 - purity_t) + purity_t * total_t) * (1 + expW_t)
+            )
+
+            maskLow = w_old_t <= low_cut
+            maskUp  = w_old_t >= up_cut
+            maskMid = ~(maskLow | maskUp)
+
+            partA = (maskLow*c_all_t[...,1] +
+                     maskUp *c_all_t[...,5] +
+                     maskMid*c_all_t[...,3]) - (r_t + 1e-12)/(n_t + 1e-10)
+            partB = (maskLow*c_all_t[...,0] +
+                     maskUp *c_all_t[...,4] +
+                     maskMid*c_all_t[...,2])
+
+            # ------------- FP32 & fully sanitised numerical path -----------
+            θ = theta_t.float()
+            denom = torch.sqrt(θ * (1 - θ))
+            denom = _finite_or_clamp(denom, lo=1e-3)            # ≥ 1e‑3
+
+            n32, pA32, pB32 = n_t.float(), partA.float(), partB.float()
+            scal = torch.sqrt(n32)
+
+            B_flat = (scal * pB32 / denom).flatten()
+            B_flat = _finite_or_clamp(B_flat, lo=-1e5, hi=1e5)   # |B| ≤ 1e5
+            B_sq_t = B_flat.square()                             # ≤ 1e10
+
+            A_flat = (scal * pA32 / denom).flatten()
+            A_flat = _finite_or_clamp(A_flat, lo=-1e5, hi=1e5)
+
+            RHS_1   = transpose_matvec_delta(alpha * eta_old_t + tau_old_t,
+                                             No_mutation, M, i_idx, j_idx)
             linear_t = RHS_1 - (B_flat * A_flat)
-            
-            x = w_old_t.flatten()
-            r_vec = linear_t - matvec_H_laplacian(x, B_sq_t, No_mutation, M, alpha)
-            
-            Minv = 1.0 / (B_sq_t + alpha * (No_mutation - 1.0))
-            z_vec = Minv * r_vec
-            p, rs_old = z_vec.clone(), torch.dot(r_vec, z_vec)
 
-            max_cg = 120              # keep safety cap
-            tol2   = 1e-12            # squared tolerance
-            for _ in range(max_cg):
-                Ap       = matvec_H_laplacian(p, B_sq_t, No_mutation, M, alpha)
-                rs_p     = torch.dot(p, Ap) + 1e-12      # fused reduction
+            x     = w_old_t.flatten()
+            r_vec = linear_t - matvec_H_laplacian(x, B_sq_t,
+                                                  No_mutation, M, alpha)
+            r_vec = _finite_or_clamp(r_vec)
+
+            Minv = 1.0 / (B_sq_t + alpha * (No_mutation - 1.0))
+            Minv = _finite_or_clamp(Minv, lo=1e-10, hi=1e2)      # sensible
+
+            z_vec  = Minv * r_vec
+            p      = z_vec.clone()
+            rs_old = torch.dot(r_vec, z_vec)
+
+            tol2 = 1e-12
+            for _ in range(cg_max_iter):
+                if not torch.isfinite(rs_old).item():
+                    raise RuntimeError("CG diverged: rs_old is NaN/inf")
+
+                Ap = matvec_H_laplacian(p, B_sq_t, No_mutation, M, alpha)
+                Ap = _finite_or_clamp(Ap)
+
+                rs_p = torch.dot(p, Ap) + 1e-12
                 alpha_cg = rs_old / rs_p
 
-                # in‑place fused updates (avoids 3 temporaries)
-                x     = x + alpha_cg * p
-                r_vec = r_vec - alpha_cg * Ap
-
+                x     += alpha_cg * p
+                r_vec -= alpha_cg * Ap
                 z_vec  = Minv * r_vec
                 rs_new = torch.dot(r_vec, z_vec)
+
                 if rs_new < tol2:
                     break
-                beta = rs_new / rs_old
-                p    = z_vec + beta * p
+                beta   = rs_new / rs_old
+                p      = z_vec + beta * p
                 rs_old = rs_new
-                
-            w_new_t = torch.clamp(x.view(No_mutation, M), -control_large, control_large)
-            
-            eta_new_t, tau_new_t = scad_threshold_update_torch(
-                w_new_t, tau_old_t, i_idx, j_idx, alpha, Lambda, gamma, adaptive_weights_t
-            )
-            
-            residual = torch.max(torch.abs(w_new_t[i_idx, :] - w_new_t[j_idx, :] - eta_new_t)).float()
-        # --- End of high-performance block ---
 
+            w_new_t = torch.clamp(x.view(No_mutation, M),
+                                  -control_large, control_large)
+
+            eta_new_t, tau_new_t = scad_threshold_update_torch(
+                w_new_t, tau_old_t, i_idx, j_idx,
+                float(alpha), float(Lambda), float(gamma),
+                adaptive_weights_t
+            )
+
+            diff   = w_new_t[i_idx] - w_new_t[j_idx] - eta_new_t
+            residual = diff.abs().max()
+
+        # ---------------- outer loop checks --------------------------------
         alpha *= rho
-        if residual.item() < precision: break
-        if torch.isnan(residual) or torch.isinf(residual): break
+        if residual.item() < precision:
+            break
+        if not torch.isfinite(residual).item():
+            raise RuntimeError("ADMM diverged: residual NaN/inf")
 
     return {'w': w_new_t, 'eta': eta_new_t, 'tau': tau_new_t}
+
 
 
 def postprocess_admm_results(
@@ -302,9 +356,12 @@ def postprocess_admm_results(
     minor_cn = preprocessed_data['minor_t' ].cpu().numpy().astype(np.float32)
 
     # empirical φ̂  (identical to V1)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        phi_hat = (r / n) * ((2 * (1 - purity) + purity * total_cn) / minor_cn)
-    phi_hat = np.nan_to_num(phi_hat)
+    # with np.errstate(divide='ignore', invalid='ignore'):
+    #     phi_hat = (r / n) * ((2 * (1 - purity) + purity * total_cn) / minor_cn)
+    # phi_hat = np.nan_to_num(phi_hat)
+
+    phi_hat = torch.sigmoid(admm_results['w']).clamp(0, 2)
+    phi_hat = phi_hat.cpu().numpy().astype(np.float32)
 
     n_mut, m_samp = w_new.shape
     post_th = post_th * np.sqrt(m_samp)  # scale threshold by sqrt(M)
@@ -439,7 +496,7 @@ def clipp2(
     control_large= 5,
     lambda_seq   = [0.1, 0.05, 0.01],
     sigma_quantile = 0.5,
-    post_th      = 0.2,
+    post_th      = 0.01,
     device       = None, 
     dtype        = torch.float32,
 ):
@@ -469,7 +526,8 @@ def clipp2(
         sigma = torch.quantile(torch.sqrt(pos), sigma_quantile).clamp_min(1e-8)
     else:                                                    # new
         sigma = torch.tensor(1.0, device=device, dtype=torch.float16)
-        
+    
+    # sigma = torch.tensor(1.0, device=device, dtype=torch.float16)
     adaptive_weights_t = torch.exp(-(d2 / (2 * sigma**2)).clamp_max(50.)).to(torch.float16)
 
     w_init_t = preprocessed_data['w_init_t']
@@ -492,18 +550,23 @@ def clipp2(
         )
         warm_start_vars = admm_results_for_lambda
         
-        
-        results_for_current_lambda = postprocess_admm_results(
-            admm_results_for_lambda, preprocessed_data, 
-            i_idx, j_idx, post_th, least_mut
-        )
+        # results_for_current_lambda = postprocess_admm_results(
+        #     admm_results_for_lambda, preprocessed_data, 
+        #     i_idx, j_idx, post_th, least_mut
+        # )
 
-        phi_res_current = results_for_current_lambda['phi'].ravel()
-        dist = wasserstein_distance(phi0, phi_res_current)
-        results_for_current_lambda['lambda'] = current_lambda
-        results_for_current_lambda['wasserstein_distance'] = dist
+        # phi_res_current = results_for_current_lambda['phi'].ravel()
+        # dist = wasserstein_distance(phi0, phi_res_current)
+        # results_for_current_lambda['lambda'] = current_lambda
+        # results_for_current_lambda['wasserstein_distance'] = dist
         
+        # all_results.append(results_for_current_lambda)
+
+        results_for_current_lambda = {}
+        results_for_current_lambda['phi'] = torch.sigmoid(admm_results_for_lambda['w']).cpu().numpy().ravel()
+        results_for_current_lambda['lambda'] = current_lambda
         all_results.append(results_for_current_lambda)
+
         torch.cuda.empty_cache()
 
     return all_results

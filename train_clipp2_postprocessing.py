@@ -133,6 +133,101 @@ def _postprocess_clusters(phi, labels, least_mut, least_diff):
     labels, cent, _, _ = _reindex(phi, labels)
     return cent[labels].astype(np.float32), labels.astype(np.int64)
 
+# ─────────────────────────────────────────────────────────────────────
+# Cluster‑prevalence helpers
+# ─────────────────────────────────────────────────────────────────────
+def _cluster_prevalence(phi_clean: np.ndarray,
+                        labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns
+      cp_mat … shape (K, M) – mean CP per (cluster, sample)
+      uniq   … length‑K     – cluster IDs corresponding to rows
+    """
+    uniq = np.unique(labels)
+    K, M = len(uniq), phi_clean.shape[1]
+    cp   = np.zeros((K, M), dtype=phi_clean.dtype)
+    for i, k in enumerate(uniq):
+        cp[i] = phi_clean[labels == k].mean(0)
+    return cp, uniq
+                       
+def _merge_two_clusters(labels: np.ndarray,
+                        cid_keep: int,
+                        cid_merge: int) -> np.ndarray:
+    """
+    Relabel cid_merge → cid_keep and make the label set contiguous.
+    """
+    labels = labels.copy()
+    labels[labels == cid_merge] = cid_keep
+    _, inv = np.unique(labels, return_inverse=True)
+    return inv
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Post‑BECS fixes for Super‑clones and Small‑clones
+# ─────────────────────────────────────────────────────────────────────
+def handle_superclusters(phi_clean: np.ndarray,
+                         labels: np.ndarray,
+                         purity: np.ndarray,
+                         max_clonal_frac: float = 0.40) -> np.ndarray:
+    """
+    Multi‑sample super‑cluster consolidation.
+    """
+    while True:
+        cp_mat, uniq = _cluster_prevalence(phi_clean, labels)
+        cp_mat = cp_mat / purity  # normalise by purity
+        K, M = cp_mat.shape
+
+        # (i) super‑clone present?
+        if not (cp_mat > 1.0).any():
+            break
+
+        # (ii) too few clusters?
+        if K <= 2:
+            break
+
+        # (iii) clonal cluster & its fraction
+        d2_one = np.linalg.norm(cp_mat - 1.0, axis=1)      # L2 to 𝟙
+        clonal_idx = d2_one.argmin()
+        clonal_frac = np.bincount(labels)[clonal_idx] / labels.size
+        if clonal_frac > max_clonal_frac:
+            break
+
+        # merge two clusters with largest overall CP
+        cp_mean = np.linalg.norm(cp_mat, axis=1)
+        top2 = np.argsort(cp_mean)[-2:]
+        cid_keep  = int(uniq[top2[1]])
+        cid_merge = int(uniq[top2[0]])
+        labels = _merge_two_clusters(labels, cid_keep, cid_merge)
+
+    return labels
+
+
+def handle_small_clones(phi_clean: np.ndarray,
+                        labels: np.ndarray,
+                        max_clonal_frac: float = 0.15) -> np.ndarray:
+    """
+    Multi‑sample small‑clone consolidation.
+    """
+    while True:
+        cp_mat, uniq = _cluster_prevalence(phi_clean, labels)
+        K = cp_mat.shape[0]
+        if K <= 2:
+            break
+
+        d2_one = np.linalg.norm(cp_mat - 1.0, axis=1)      # L2 to 𝟙
+        clonal_idx = d2_one.argmin()
+        clonal_frac = np.bincount(labels)[clonal_idx] / labels.size
+        if clonal_frac > max_clonal_frac:
+            break
+
+        cp_mean = np.linalg.norm(cp_mat, axis=1)
+        top2 = np.argsort(cp_mean)[-2:]
+        cid_keep  = int(uniq[top2[1]])
+        cid_merge = int(uniq[top2[0]])
+        labels = _merge_two_clusters(labels, cid_keep, cid_merge)
+
+    return labels
+
 # ──────────────────────────────────────────────────────────────────────
 # Penalised Ward routine + post‑processing
 # ──────────────────────────────────────────────────────────────────────
@@ -290,7 +385,9 @@ def evaluate_single_lambda(tsv_file: str, samples: List[str],
         entr   = safe_entropy(labels)
         fdst   = founder_distance(phi_c, labels, tensors["purity"])
         becs   = 15 * bic / N + 100 * entr / np.log2(20) + 300 * fdst / (M ** 0.5)
-        
+
+        labels = handle_superclusters(phi_c, labels, tensors["purity"])
+        labels = handle_small_clones(phi_c, labels)
 
         out = dict(source_lambda_file=os.path.basename(tsv_file),
                    **perf,

@@ -114,7 +114,7 @@ Results are saved in `output/result.txt` and `output/intermediate/all_loci.txt`.
 ## Contact
 
 - **Authors**: Yu Ding, Ph.D. (Wenyi Wang Lab, MD Anderson)  
-- **Email**: yding4@mdanderson.org, yding1995@gmail.com  
+- **Email**: yding4@mdanderson.org, yu.adam.ding@gmail.com
 - **Date**: April 2025  
 
 For issues, feature requests, or contributions, please open a GitHub issue or contact the authors directly.

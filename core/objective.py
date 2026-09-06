@@ -404,27 +404,39 @@ class ObservedModel:
         covered by the numerical likelihood fingerprint.
         """
 
-        if self.path_shape[-1] != 2 or not np.all(self.valid[..., 0]):
-            return None
+        return self._binary_linear_mixture_dispatch()[0]
+
+    @property
+    def binary_linear_mixture_exclusion_reason(self) -> str:
+        """Explain the existing shared-prior gate without changing dispatch."""
+
+        return self._binary_linear_mixture_dispatch()[1]
+
+    def _binary_linear_mixture_dispatch(self) -> tuple[float | None, str]:
+        if self.path_shape[-1] != 2:
+            return None, "padded_path_count_not_two"
+        if not np.all(self.valid[..., 0]):
+            return None, "first_path_missing"
         if not np.all((~self.valid) | (self.first_scale == self.second_scale)):
-            return None
+            return None, "nonlinear_paths"
         ambiguous = self.valid[..., 1]
         if not np.any(ambiguous):
-            return 0.5
+            return 0.5, "none"
         if np.any(
             self.first_scale[..., 0][ambiguous]
             > self.first_scale[..., 1][ambiguous]
         ):
-            return None
+            return None, "unordered_paths"
         prior = np.exp(self.log_prior[..., 1][ambiguous])
         if (
             np.any(~np.isfinite(prior))
             or np.any(prior <= 0.0)
             or np.any(prior >= 1.0)
-            or not np.all(prior == prior[0])
         ):
-            return None
-        return float(prior[0])
+            return None, "degenerate_binary_prior"
+        if not np.all(prior == prior[0]):
+            return None, "heterogeneous_binary_priors"
+        return float(prior[0]), "none"
 
     @property
     def requires_generic_path_solver(self) -> bool:

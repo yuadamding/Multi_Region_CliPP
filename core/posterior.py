@@ -11,6 +11,7 @@ from .objective import ObservedModel, ObservedTerms, observed_terms_numpy
 
 DEFAULT_PATH_BOUNDARY_TOL = 1e-8
 DEFAULT_AMPLIFIED_MUTANT_COPY_TOL = 1e-8
+DOSAGE_REPORTING_POLICY_ID = "conditional_positive_depth_excess_mass_v2"
 
 
 def _readonly(values: np.ndarray, *, dtype: np.dtype | None = None) -> np.ndarray:
@@ -27,6 +28,8 @@ class PosteriorSummary:
     path_mutant_copy_mass: np.ndarray
     map_path: np.ndarray
     reportable: np.ndarray
+    dosage_reportable: np.ndarray
+    dosage_status: np.ndarray
     pre_switch_probability: np.ndarray
     post_switch_probability: np.ndarray
     switch_boundary_probability: np.ndarray
@@ -35,6 +38,7 @@ class PosteriorSummary:
     map_mutant_copy_mass: np.ndarray
     map_multiplicity: np.ndarray
     single_copy_probability: np.ndarray
+    single_copy_prior_probability: np.ndarray
     amplified_mutant_copy_probability: np.ndarray
     amplified_mutant_copy_call: np.ndarray
     entropy: np.ndarray
@@ -59,11 +63,13 @@ def summarize_posterior_numpy(
     use scaled copy mass, while its reporting metadata retains the exact
     unscaled paths needed for multiplicity and occupancy summaries.
 
-    ``single_copy_probability`` sums all paths within ``amplification_tol``
-    of ``mu(phi) == phi`` in mutant-copy mass (not multiplicity) units. It
-    is omitted without included positive-depth counts, an allowed reporting
-    coordinate, or CCF above the numerical lower bound by ``boundary_tol``.
-    This is conditional dosage support, not mutation-acquisition timing.
+    All dosage summaries share ``dosage_reportable``: included positive-depth
+    counts, an allowed reporting coordinate, and CCF above the numerical lower
+    bound by ``boundary_tol``. Path posterior arrays remain broader diagnostics.
+    Single-copy and amplified classes use the same stable excess mutant-copy
+    mass and ``amplification_tol`` (not an effective-multiplicity tolerance).
+    The posterior and corresponding prior mass condition on the supplied CCF;
+    neither integrates CCF/partition uncertainty or identifies mutation timing.
     """
 
     phi_array = np.asarray(phi, dtype=np.float64)
@@ -106,14 +112,9 @@ def summarize_posterior_numpy(
     switch = np.asarray(model.switch, dtype=np.float64)
     first_copy = np.asarray(model.first_copy, dtype=np.float64)
     second_copy = np.asarray(model.second_copy, dtype=np.float64)
-    mass = first_copy * np.minimum(
-        expanded_phi,
-        switch,
-    )
-    mass += second_copy * np.maximum(
-        expanded_phi - switch,
-        0.0,
-    )
+    first_occupancy = np.minimum(expanded_phi, switch)
+    second_occupancy = np.maximum(expanded_phi - switch, 0.0)
+    mass = first_copy * first_occupancy + second_copy * second_occupancy
 
     pre_switch = expanded_phi < switch - boundary_tolerance
     post_switch = expanded_phi > switch + boundary_tolerance
@@ -152,20 +153,23 @@ def summarize_posterior_numpy(
             np.where(major_call_for_call, major_copy, low_copy),
             low_copy,
         )
-    amplified_path = mass > expanded_phi + amplification_tolerance
+    # One arithmetic authority partitions positive-dosage paths, including
+    # values where mass-phi and mass > phi+tol round in different directions.
+    excess_mass = ((first_copy - 1.0) * first_occupancy
+                   + (second_copy - 1.0) * second_occupancy)
+    amplified_path = valid & (excess_mass > amplification_tolerance)
     amplified_probability = np.sum(probability * amplified_path, axis=-1)
-    single_copy_path = np.abs(mass - expanded_phi) <= amplification_tolerance
-    single_copy_reportable = (
-        reportable_array
-        & model.observed
-        & ((model.alt + model.nonalt) > 0.0)
-        & (phi_array > model.lower + boundary_tolerance)
+    single_copy_path = valid & (np.abs(excess_mass) <= amplification_tolerance)
+    dosage_status = np.select(
+        [~model.observed, (model.alt + model.nonalt) <= 0.0,
+         ~reportable_array, phi_array <= model.lower + boundary_tolerance],
+        ["not_likelihood_included", "zero_depth", "ccf_not_reportable",
+         "numerical_ccf_floor"],
+        default="conditional_at_refit_ccf",
     )
-    single_copy_probability = np.where(
-        single_copy_reportable,
-        np.sum(probability * single_copy_path, axis=-1),
-        np.nan,
-    )
+    dosage_reportable = dosage_status == "conditional_at_refit_ccf"
+    prior = np.where(valid, np.exp(model.log_prior), 0.0)
+    prior /= np.sum(prior, axis=-1, keepdims=True)
     entropy = -np.sum(
         np.where(
             probability > 0.0,
@@ -178,13 +182,16 @@ def summarize_posterior_numpy(
     def masked(values: np.ndarray) -> np.ndarray:
         return np.where(reportable_array, values, np.nan)
 
+    def dosage_masked(values: np.ndarray) -> np.ndarray:
+        return np.where(dosage_reportable, values, np.nan)
+
     major_probability: np.ndarray | None = None
     major_call: np.ndarray | None = None
     multiplicity_estimated: np.ndarray | None = None
     if major_probability_values is not None:
-        major_probability = masked(major_probability_values)
-        major_call = np.asarray(major_probability_values >= 0.5, dtype=bool)
-        multiplicity_estimated = np.sum(valid, axis=-1) > 1
+        major_probability = dosage_masked(major_probability_values)
+        major_call = dosage_masked(major_probability_values >= 0.5)
+        multiplicity_estimated = dosage_masked(np.sum(valid, axis=-1) > 1)
 
     return PosteriorSummary(
         path_probability=_readonly(
@@ -195,6 +202,8 @@ def summarize_posterior_numpy(
         ),
         map_path=_readonly(np.where(reportable_array, map_path, -1), dtype=np.int64),
         reportable=_readonly(reportable_array, dtype=bool),
+        dosage_reportable=_readonly(dosage_reportable, dtype=bool),
+        dosage_status=_readonly(dosage_status),
         pre_switch_probability=_readonly(
             masked(np.sum(probability * pre_switch, axis=-1))
         ),
@@ -204,15 +213,20 @@ def summarize_posterior_numpy(
         switch_boundary_probability=_readonly(
             masked(np.sum(probability * at_boundary, axis=-1))
         ),
-        expected_mutant_copy_mass=_readonly(masked(expected_mass)),
-        expected_multiplicity=_readonly(masked(expected_multiplicity)),
-        map_mutant_copy_mass=_readonly(masked(map_mass)),
-        map_multiplicity=_readonly(masked(map_multiplicity)),
-        single_copy_probability=_readonly(single_copy_probability),
-        amplified_mutant_copy_probability=_readonly(masked(amplified_probability)),
+        expected_mutant_copy_mass=_readonly(dosage_masked(expected_mass)),
+        expected_multiplicity=_readonly(dosage_masked(expected_multiplicity)),
+        map_mutant_copy_mass=_readonly(dosage_masked(map_mass)),
+        map_multiplicity=_readonly(dosage_masked(map_multiplicity)),
+        single_copy_probability=_readonly(
+            dosage_masked(np.sum(probability * single_copy_path, axis=-1))
+        ),
+        single_copy_prior_probability=_readonly(
+            dosage_masked(np.sum(prior * single_copy_path, axis=-1))
+        ),
+        amplified_mutant_copy_probability=_readonly(dosage_masked(amplified_probability)),
         amplified_mutant_copy_call=_readonly(
             np.where(
-                reportable_array,
+                dosage_reportable,
                 (amplified_probability >= 0.5).astype(np.float64),
                 np.nan,
             )
@@ -221,11 +235,11 @@ def summarize_posterior_numpy(
         major_probability=(
             None if major_probability is None else _readonly(major_probability)
         ),
-        major_call=None if major_call is None else _readonly(major_call, dtype=bool),
+        major_call=None if major_call is None else _readonly(major_call),
         multiplicity_estimated=(
             None
             if multiplicity_estimated is None
-            else _readonly(multiplicity_estimated, dtype=bool)
+            else _readonly(multiplicity_estimated)
         ),
     )
 
@@ -233,6 +247,7 @@ def summarize_posterior_numpy(
 __all__ = [
     "DEFAULT_AMPLIFIED_MUTANT_COPY_TOL",
     "DEFAULT_PATH_BOUNDARY_TOL",
+    "DOSAGE_REPORTING_POLICY_ID",
     "PosteriorSummary",
     "summarize_posterior_numpy",
 ]

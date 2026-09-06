@@ -6,20 +6,105 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from pathlib import Path
 
 
 SUFFIXES = ("analysis.json", "clusters.tsv", "mutations.tsv", "attempts.tsv")
+DOSAGE_COLUMNS = (
+    "single_copy_probability", "single_copy_prior_probability",
+    "amplified_mutant_copy_probability", "amplified_mutant_copy_call",
+    "posterior_effective_multiplicity", "map_effective_multiplicity",
+    "posterior_mutant_copy_mass", "map_mutant_copy_mass",
+    "multiplicity_call", "multiplicity_estimated", "gamma_major", "major_call",
+)
 
 
-def _count_rows(path: Path, *, required_columns: tuple[str, ...] = ()) -> int:
+def _number(value: object, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be finite numeric data") from exc
+    if not math.isfinite(number):
+        raise RuntimeError(f"{name} must be finite numeric data")
+    return number
+
+
+def _validate_mutations(path: Path, analysis: dict[str, object]) -> int:
+    """Validate dosage evidence and blankness without loading inference code."""
+
+    if analysis.get("dosage_reporting_policy_id") != "conditional_positive_depth_excess_mass_v2":
+        raise RuntimeError("unsupported dosage reporting policy")
+    if analysis.get("dosage_conditioning") != "selected_partition_refit_ccf":
+        raise RuntimeError("dosage conditioning is missing")
+    lower = _number(analysis.get("dosage_ccf_lower_bound"), "dosage_ccf_lower_bound")
+    floor_tol = _number(analysis.get("dosage_ccf_floor_tolerance"), "dosage_ccf_floor_tolerance")
+    mass_tol = _number(analysis.get("dosage_mass_tolerance"), "dosage_mass_tolerance")
+    positive = analysis.get("dosage_positive_path_family")
+    if not isinstance(positive, bool) or lower <= 0 or floor_tol < 0 or mass_tol < 0:
+        raise RuntimeError("invalid dosage reporting policy values")
+    required = {*DOSAGE_COLUMNS, "dosage_reportable", "dosage_status", "phi",
+                "cluster_label", "count_available", "likelihood_supported",
+                "likelihood_included", "phi_statistically_identified", "alt_count", "ref_count"}
+    count = 0
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not required.issubset(reader.fieldnames or ()):
+            raise RuntimeError(f"missing required dosage TSV columns: {sorted(required - set(reader.fieldnames or ())) }")
+        for row in reader:
+            count += 1
+            for flag in ("count_available", "likelihood_supported", "likelihood_included",
+                         "phi_statistically_identified", "dosage_reportable"):
+                if row[flag] not in {"0", "1"}:
+                    raise RuntimeError(f"{flag} must be 0 or 1")
+            if row["likelihood_included"] == "1" and (
+                row["count_available"] != "1" or row["likelihood_supported"] != "1"
+            ):
+                raise RuntimeError("likelihood inclusion contradicts count/support flags")
+            if not row["cluster_label"]:
+                status = "no_selected_partition"
+            elif row["likelihood_included"] == "0":
+                status = "not_likelihood_included"
+            else:
+                depth = _number(row["alt_count"], "alt_count") + _number(row["ref_count"], "ref_count")
+                phi = _number(row["phi"], "phi")
+                if depth <= 0:
+                    status = "zero_depth"
+                elif row["phi_statistically_identified"] == "0":
+                    status = "ccf_not_reportable"
+                elif phi <= lower + floor_tol:
+                    status = "numerical_ccf_floor"
+                else:
+                    status = "conditional_at_refit_ccf"
+            reportable = status == "conditional_at_refit_ccf"
+            if row["dosage_status"] != status or row["dosage_reportable"] != str(int(reportable)):
+                raise RuntimeError("dosage status disagrees with observation/CCF evidence")
+            if not reportable:
+                if any(row[name] != "" for name in DOSAGE_COLUMNS):
+                    raise RuntimeError("unreportable dosage fields must be blank")
+                continue
+            for name in DOSAGE_COLUMNS:
+                if row[name] != "":
+                    value = _number(row[name], name)
+                    if ("probability" in name or name == "gamma_major") and not 0 <= value <= 1:
+                        raise RuntimeError(f"{name} must be in [0, 1]")
+            single = _number(row["single_copy_probability"], "single_copy_probability")
+            _number(row["single_copy_prior_probability"], "single_copy_prior_probability")
+            amplified = _number(row["amplified_mutant_copy_probability"], "amplified_mutant_copy_probability")
+            call = _number(row["amplified_mutant_copy_call"], "amplified_mutant_copy_call")
+            if call != int(amplified >= 0.5):
+                raise RuntimeError("amplified call disagrees with probability")
+            if positive and not math.isclose(single + amplified, 1.0, rel_tol=0, abs_tol=1e-12):
+                raise RuntimeError("positive-path dosage probabilities must sum to one")
+    return count
+
+
+def _count_rows(path: Path) -> int:
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         if not reader.fieldnames:
             raise RuntimeError(f"missing TSV header: {path}")
-        if not set(required_columns).issubset(reader.fieldnames):
-            raise RuntimeError(f"missing required TSV columns {required_columns}: {path}")
         return sum(1 for _ in reader)
 
 
@@ -64,8 +149,8 @@ def validate_outputs(
     with paths["analysis.json"].open(encoding="utf-8") as handle:
         analysis = json.load(handle)
     required_equal = {
-        "summary_schema_version": 12,
-        "output_schema_version": 3,
+        "summary_schema_version": 13,
+        "output_schema_version": 4,
         "tumor_id": tumor_id,
         "computation_profile": "balanced",
         "selection_policy_id": "hybrid-ward-cem-bic-v1",
@@ -121,9 +206,7 @@ def validate_outputs(
         scientific_status = "no_certified_raw_reference"
 
     cluster_rows = _count_rows(paths["clusters.tsv"])
-    mutation_rows = _count_rows(
-        paths["mutations.tsv"], required_columns=("single_copy_probability",)
-    )
+    mutation_rows = _validate_mutations(paths["mutations.tsv"], analysis)
     attempt_rows = _count_rows(paths["attempts.tsv"])
     if cluster_rows < 1 or mutation_rows != int(expected_mutations):
         raise RuntimeError(

@@ -108,15 +108,25 @@ Every primary, conditional, or diagnostic analysis writes exactly four files:
 `clusters.tsv` is header-only when no partition point claim exists;
 `mutations.tsv` always retains every input mutation-region coordinate.
 
-Output schema v3 includes `single_copy_probability`: posterior mass over all
+Output schema v4 includes `single_copy_probability`: posterior mass over all
 paths compatible with one mutant copy at the fitted CCF, including paths
 before an occupancy switch. It uses an absolute mutant-copy mass tolerance of
-`1e-8` and is blank for excluded/zero-depth observations, unidentified refits,
-or CCF within `1e-8` of the numerical lower bound. Single-copy and occupancy
-switch probabilities do not identify mutation timing or the CN state of origin.
+`1e-8`. Single-copy, amplified, and effective-multiplicity summaries share
+`dosage_reportable`: all are blank for excluded/zero-depth observations,
+unidentified refits, or CCF within `1e-8` of the numerical lower bound.
+`dosage_status` names the reason; CCF reporting remains separate. Single-copy
+and amplified classes use one stable excess-copy mass and sum to one for
+reportable positive-dosage paths, including near the tolerance boundary.
+`single_copy_prior_probability` reports the corresponding prior mass at the
+same CCF: a high posterior can be prior-driven. Both condition on the selected
+partition's refit CCF, without integrating CCF or partition uncertainty.
+Single-copy and occupancy-switch probabilities do not identify mutation timing
+or the CN state of origin.
 Public TXT inputs use the generic effective-multiplicity columns; the legacy
-major-prior fields are blank. Summary schema v12 records the emission model,
-generator, and prior provenance.
+major-prior fields are blank. Summary schema v13 records the emission model,
+generator, prior, dosage policy/tolerances, valid-path count distribution, and
+scalar-pilot dispatch reason. The latter describes initialization, not a
+guaranteed runtime improvement or the complete ALM execution path.
 
 `cluster_label` is the immutable selected partition. The derived
 `ccf_ordered_cluster_label` is presentation-only: cluster 0 is closest to CCF

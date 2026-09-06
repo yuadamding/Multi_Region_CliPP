@@ -8,6 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+import torch
+
 
 SCHEMA_COLUMNS = (
     "mutation_id",
@@ -25,7 +28,7 @@ SCHEMA_COLUMNS = (
 )
 
 
-def _write_smoke_input(path: Path) -> None:
+def _write_smoke_input(path: Path, *, copy_state: tuple[int, int] = (1, 1)) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SCHEMA_COLUMNS, delimiter="\t")
         writer.writeheader()
@@ -42,8 +45,8 @@ def _write_smoke_input(path: Path) -> None:
                     "segment_id": f"s{index}",
                     "cn_state_id": "state1",
                     "cn_state_fraction": 1.0,
-                    "allele_a_cn": 1,
-                    "allele_b_cn": 1,
+                    "allele_a_cn": copy_state[0],
+                    "allele_b_cn": copy_state[1],
                 }
             )
 
@@ -55,6 +58,7 @@ def _run_fit(
     *options: str,
     failure_policy: str = "error",
     profile: str = "fast",
+    device: str = "cpu",
 ) -> dict[str, object]:
     result = subprocess.run(
         [
@@ -69,7 +73,7 @@ def _run_fit(
             "--profile",
             profile,
             "--device",
-            "cpu",
+            device,
             "--failure-policy",
             failure_policy,
             "--config",
@@ -111,17 +115,55 @@ def _validate_panel_output(
     return json.loads(receipt.read_text(encoding="utf-8"))
 
 
-def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
+def _assert_precision_provenance(summary: dict[str, object], requested_dtype: str) -> None:
+    # Final raw state may be promoted; it is not the requested working dtype.
+    assert summary["selected_working_dtype"] == requested_dtype
+    assert summary["selected_certificate_audit_dtype"] == "float64"
+    polished = summary["selected_precision_polish_applied"]
+    assert isinstance(polished, bool)
+    assert summary["dtype"] == ("float64" if polished else requested_dtype)
+
+
+@pytest.mark.parametrize("requested,final,polished", [
+    ("float32", "float32", False), ("float32", "float64", True),
+    ("float64", "float64", False),
+])
+def test_precision_provenance_accepts_recorded_promotion(requested, final, polished):
+    _assert_precision_provenance(dict(
+        selected_working_dtype=requested, selected_certificate_audit_dtype="float64",
+        selected_precision_polish_applied=polished, dtype=final,
+    ), requested)
+
+
+@pytest.mark.parametrize("changes", [
+    {"dtype": "float64"}, {"selected_precision_polish_applied": True},
+    {"selected_working_dtype": "float64"}, {"selected_certificate_audit_dtype": "float32"},
+    {"selected_precision_polish_applied": "false"},
+])
+def test_precision_provenance_rejects_unexplained_dtype_changes(changes):
+    summary = dict(selected_working_dtype="float32", selected_certificate_audit_dtype="float64",
+                   selected_precision_polish_applied=False, dtype="float32")
+    with pytest.raises(AssertionError):
+        _assert_precision_provenance(summary | changes, "float32")
+
+
+@pytest.mark.parametrize("copy_state", [(1, 1), (3, 2), (4, 2)])
+@pytest.mark.parametrize("device,dtype,profile", [
+    ("cpu", "float64", "fast"), ("cuda", "float32", "balanced"),
+])
+def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path, copy_state, device, dtype, profile) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
     input_file = tmp_path / "smoke.tsv"
     config_file = tmp_path / "config.json"
     checkpoint = tmp_path / "checkpoint"
-    _write_smoke_input(input_file)
+    _write_smoke_input(input_file, copy_state=copy_state)
     config_file.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "fit": {
-                    "dtype": "float64",
+                    "dtype": dtype,
                     "max_direct_partition_candidates": 1,
                 },
             }
@@ -132,23 +174,35 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
     first_dir = tmp_path / "first"
     resumed_dir = tmp_path / "resumed"
     first = _run_fit(
-        input_file, first_dir, config_file, "--checkpoint", str(checkpoint)
+        input_file, first_dir, config_file, "--checkpoint", str(checkpoint), device=device, profile=profile,
     )
     resumed = _run_fit(
-        input_file, resumed_dir, config_file, "--resume", str(checkpoint)
+        input_file, resumed_dir, config_file, "--resume", str(checkpoint), device=device, profile=profile,
     )
 
-    assert first["summary_schema_version"] == 12
-    assert first["output_schema_version"] == 3
+    assert first["summary_schema_version"] == 13
+    assert first["output_schema_version"] == 4
     assert first["emission_model_id"] == "clipp2_single_switch_path_mixture_v2"
     assert first["emission_model_version"] == "2"
+    assert first["emission_valid_path_count_distribution"] == {str(copy_state[0]): 4}
+    assert first["emission_scalar_well_dispatch"] == "generic_paths"
+    assert first["emission_binary_exclusion_reason"] == "padded_path_count_not_two"
+    assert first["emission_has_internal_switches"] is False
+    assert first["dosage_reporting_policy_id"] == "conditional_positive_depth_excess_mass_v2"
+    assert first["dosage_mass_tolerance"] == first["dosage_ccf_floor_tolerance"] == 1e-8
+    assert first["dosage_conditioning"] == "selected_partition_refit_ccf"
     assert first["analysis_tier"] == "joint_certified"
     assert first["primary_estimator_available"] is True
+    assert first["raw_reference_objective_certified"] is True
+    assert first["selected_certificate_audit_dtype"] == "float64"
+    assert first["selected_full_kkt_residual_method"] == "componentwise_box_cone_backward_error_v1"
+    assert first["selected_full_kkt_tolerance"] == 5 * first["selected_raw_solver_primal_tol"]
     assert first["selection_score_name"] == "fixed_partition_bic"
     assert first["selection_policy_id"] == "hybrid-ward-cem-bic-v1"
-    assert first["computation_profile"] == "fast"
-    assert first["device"] == "cpu"
-    assert first["dtype"] == "float64"
+    assert first["computation_profile"] == profile
+    assert first["device"] == ("cuda:0" if device == "cuda" else "cpu")
+    _assert_precision_provenance(first, dtype)
+    _assert_precision_provenance(resumed, dtype)
     assert resumed["resumed_from_checkpoint"] is True
     for field in (
         "selected_partition_signature",
@@ -156,6 +210,15 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
         "selection_score",
         "search_work_edge_pass_equivalents",
         "selection_pool_stop_reason",
+        "observed_model_hash",
+        "observed_likelihood_hash",
+        "selected_raw_reference_objective_spec_hash",
+        "selected_raw_reference_original_graph_hash",
+        "dtype",
+        "selected_working_dtype",
+        "selected_certificate_audit_dtype",
+        "selected_precision_polish_applied",
+        "selected_precision_polish_max_abs_phi_delta",
     ):
         assert resumed[field] == first[field]
 
@@ -163,7 +226,16 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
     assert any((checkpoint / "arrays").iterdir())
     with (first_dir / "smoke_mutations.tsv").open(newline="") as handle:
         mutations = list(csv.DictReader(handle, delimiter="\t"))
-    assert all(float(row["single_copy_probability"]) == 1.0 for row in mutations)
+    for row in mutations:
+        single = float(row["single_copy_probability"])
+        amplified = float(row["amplified_mutant_copy_probability"])
+        assert single + amplified == pytest.approx(1, abs=1e-12)
+        assert row["dosage_status"] == "conditional_at_refit_ccf"
+        if copy_state == (1, 1):
+            assert single == 1.0
+    assert (first_dir / "smoke_mutations.tsv").read_bytes() == (
+        resumed_dir / "smoke_mutations.tsv"
+    ).read_bytes()
     assert {path.name for path in first_dir.iterdir()} == {
         "smoke_analysis.json",
         "smoke_attempts.tsv",

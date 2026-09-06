@@ -18,7 +18,13 @@ from ..core.objective import (
     make_base_objective_key,
     observed_terms_numpy,
 )
-from ..core.posterior import PosteriorSummary, summarize_posterior_numpy
+from ..core.posterior import (
+    DEFAULT_AMPLIFIED_MUTANT_COPY_TOL,
+    DEFAULT_PATH_BOUNDARY_TOL,
+    DOSAGE_REPORTING_POLICY_ID,
+    PosteriorSummary,
+    summarize_posterior_numpy,
+)
 from ..core.scalar import PartitionFit
 from ..io.data import ExclusionCode, TumorData
 from ..model_selection.partitions import partition_signature
@@ -35,8 +41,8 @@ from ..model_selection.types import (
     TumorSelectionOutcome,
 )
 
-SUMMARY_SCHEMA_VERSION = 12
-OUTPUT_SCHEMA_VERSION = 3
+SUMMARY_SCHEMA_VERSION = 13
+OUTPUT_SCHEMA_VERSION = 4
 CCF_CLUSTER_ORDERING_METHOD = "identified_region_rms_distance_to_one_v1"
 
 
@@ -575,6 +581,9 @@ _MUTATION_COLUMNS = (
     "map_mutant_copy_mass",
     "map_effective_multiplicity",
     "single_copy_probability",
+    "single_copy_prior_probability",
+    "dosage_reportable",
+    "dosage_status",
     "amplified_mutant_copy_probability",
     "amplified_mutant_copy_call",
     "path_entropy",
@@ -683,9 +692,26 @@ def _mutation_table(
                     "original_graph_hash": original_graph_hash,
                 }
             )
-            if posterior is not None:
+            dosage_reportable = bool(
+                posterior is not None and posterior.dosage_reportable[mutation, region]
+            )
+            row["dosage_reportable"] = int(dosage_reportable)
+            row["dosage_status"] = (
+                "no_selected_partition" if posterior is None
+                else str(posterior.dosage_status[mutation, region])
+            )
+            if dosage_reportable:
                 row["single_copy_probability"] = _finite_or_none(
                     posterior.single_copy_probability[mutation, region]
+                )
+                row["single_copy_prior_probability"] = float(
+                    posterior.single_copy_prior_probability[mutation, region]
+                )
+                row["amplified_mutant_copy_probability"] = float(
+                    posterior.amplified_mutant_copy_probability[mutation, region]
+                )
+                row["amplified_mutant_copy_call"] = int(
+                    posterior.amplified_mutant_copy_call[mutation, region]
                 )
             if (
                 posterior is not None
@@ -696,7 +722,7 @@ def _mutation_table(
                     posterior.major_probability is not None
                     and posterior.major_call is not None
                 )
-                if reportable:
+                if dosage_reportable:
                     row.update(
                         {
                             "multiplicity_estimated": int(
@@ -717,7 +743,7 @@ def _mutation_table(
                         "path_supported": int(prepared.supported[mutation, region]),
                     }
                 )
-                if posterior is not None and reportable:
+                if dosage_reportable:
                     row.update(
                         {
                             "map_path": int(posterior.map_path[mutation, region]) + 1,
@@ -741,14 +767,6 @@ def _mutation_table(
                             ),
                             "map_effective_multiplicity": _finite_or_none(
                                 posterior.map_multiplicity[mutation, region]
-                            ),
-                            "amplified_mutant_copy_probability": float(
-                                posterior.amplified_mutant_copy_probability[
-                                    mutation, region
-                                ]
-                            ),
-                            "amplified_mutant_copy_call": int(
-                                posterior.amplified_mutant_copy_call[mutation, region]
                             ),
                             "path_entropy": float(posterior.entropy[mutation, region]),
                         }
@@ -1101,6 +1119,8 @@ def analysis_summary(
 
     data = analysis.data
     fit_config = analysis.fit_config
+    model = analysis.prepared.model
+    path_counts, path_count_frequencies = np.unique(model.valid.sum(axis=-1), return_counts=True)
     outcome = analysis.outcome
     candidate = analysis.selected_candidate
     partition = analysis.partition
@@ -1136,6 +1156,25 @@ def analysis_summary(
             data.emission_paths.candidate_generator_version
         ),
         "emission_prior_mode": data.emission_paths.prior_mode,
+        "emission_valid_path_count_distribution": {
+            str(int(count)): int(frequency)
+            for count, frequency in zip(path_counts, path_count_frequencies, strict=True)
+        },
+        "emission_scalar_well_dispatch": (
+            "shared_binary_linear" if model.binary_linear_mixture_prior is not None
+            else "generic_paths"
+        ),
+        "emission_binary_exclusion_reason": model.binary_linear_mixture_exclusion_reason,
+        "emission_has_internal_switches": model.has_internal_switches,
+        "dosage_reporting_policy_id": DOSAGE_REPORTING_POLICY_ID,
+        "dosage_mass_tolerance": DEFAULT_AMPLIFIED_MUTANT_COPY_TOL,
+        "dosage_ccf_floor_tolerance": DEFAULT_PATH_BOUNDARY_TOL,
+        "dosage_ccf_lower_bound": analysis.prepared.eps,
+        "dosage_positive_path_family": bool(np.all(
+            (data.emission_paths.first_copy[data.emission_paths.valid] >= 1.0)
+            & (data.emission_paths.second_copy[data.emission_paths.valid] >= 1.0)
+        )),
+        "dosage_conditioning": "selected_partition_refit_ccf",
         "analysis_tier": analysis_tier,
         "primary_estimator_available": primary,
         "failure_reason": analysis.failure_reason,

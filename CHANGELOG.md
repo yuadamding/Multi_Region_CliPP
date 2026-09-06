@@ -12,17 +12,30 @@
 - Existing subclonal enumeration, alias mass, likelihood marginalization,
   numerical dispatch, graph rule, BIC, and KKT gates are unchanged. The legacy
   major/low helper remains available through the explicit IO adapter.
-- Output schema v3 adds `single_copy_probability` to `mutations.tsv`: posterior
-  mass over all paths with `abs(mu(phi)-phi) <= 1e-8` in mutant-copy mass units,
-  including pre-switch portions of mixed-dosage paths. It is blank without
-  included positive-depth counts, an identified refit coordinate, or CCF more
-  than `1e-8` above the numerical lower bound. This is not a late-mutation call;
-  occupancy-switch probabilities are not historical event-time probabilities.
+- Output schema v4 reports `single_copy_probability` using stable excess-copy
+  mass `(d1-1)*min(phi,t) + (d2-1)*max(phi-t,0)` and absolute tolerance `1e-8`.
+  This fixes the floating-point classification gap at the tolerance boundary;
+  single-copy and amplified probabilities partition positive-dosage paths.
+- All dosage summaries and calls share `dosage_reportable` and `dosage_status`:
+  included positive-depth counts, an identified refit coordinate, and CCF more
+  than `1e-8` above the numerical floor are required. The writer suppresses
+  masked values before integer conversion. CCF availability is independent.
+- `single_copy_prior_probability` exposes prior-driven support. Both prior
+  and posterior class masses condition on the selected partition refit CCF;
+  neither integrates CCF/partition uncertainty nor identifies mutation timing.
 - Public TXT results consistently use the generic path/effective-multiplicity
   columns; legacy major-prior columns remain blank for these results. Exactly
-  four output artifacts are retained. Summary schema v12 records emission
-  model/generator versions and prior mode. Numerical hashes and source/input
-  checkpoint identities prevent reuse across incompatible objectives.
+  four output artifacts are retained. Summary schema v13 records emission
+  model/generator versions, prior mode, dosage policy/tolerances, path-count
+  distribution, and scalar-pilot dispatch/exclusion reasons. Numerical hashes
+  and source/input checkpoint identities prevent incompatible reuse.
+- Committed CI includes categorical `(3,2)`/`(4,2)` fit/report/resume, local
+  context invariance, preserved subclonal numerical identities, dosage masking,
+  tolerance-edge aggregation, semantic output validation, and CPU/CUDA kernel
+  parity (CUDA cases skip when unavailable). Full GPU release validation remains
+  required. Shared-prior specialization is not widened by this reporting fix.
+- These changes remain unreleased development under `0.4.0`; assign a distinct
+  distributable version before publishing a wheel containing the new model.
 
 ## 0.4.0
 

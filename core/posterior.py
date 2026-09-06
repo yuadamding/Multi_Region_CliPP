@@ -34,6 +34,7 @@ class PosteriorSummary:
     expected_multiplicity: np.ndarray
     map_mutant_copy_mass: np.ndarray
     map_multiplicity: np.ndarray
+    single_copy_probability: np.ndarray
     amplified_mutant_copy_probability: np.ndarray
     amplified_mutant_copy_call: np.ndarray
     entropy: np.ndarray
@@ -57,6 +58,12 @@ def summarize_posterior_numpy(
     ``ObservedModel`` is the sole emission authority.  Its numerical kernels
     use scaled copy mass, while its reporting metadata retains the exact
     unscaled paths needed for multiplicity and occupancy summaries.
+
+    ``single_copy_probability`` sums all paths within ``amplification_tol``
+    of ``mu(phi) == phi`` in mutant-copy mass (not multiplicity) units. It
+    is omitted without included positive-depth counts, an allowed reporting
+    coordinate, or CCF above the numerical lower bound by ``boundary_tol``.
+    This is conditional dosage support, not mutation-acquisition timing.
     """
 
     phi_array = np.asarray(phi, dtype=np.float64)
@@ -147,6 +154,18 @@ def summarize_posterior_numpy(
         )
     amplified_path = mass > expanded_phi + amplification_tolerance
     amplified_probability = np.sum(probability * amplified_path, axis=-1)
+    single_copy_path = np.abs(mass - expanded_phi) <= amplification_tolerance
+    single_copy_reportable = (
+        reportable_array
+        & model.observed
+        & ((model.alt + model.nonalt) > 0.0)
+        & (phi_array > model.lower + boundary_tolerance)
+    )
+    single_copy_probability = np.where(
+        single_copy_reportable,
+        np.sum(probability * single_copy_path, axis=-1),
+        np.nan,
+    )
     entropy = -np.sum(
         np.where(
             probability > 0.0,
@@ -189,6 +208,7 @@ def summarize_posterior_numpy(
         expected_multiplicity=_readonly(masked(expected_multiplicity)),
         map_mutant_copy_mass=_readonly(masked(map_mass)),
         map_multiplicity=_readonly(masked(map_multiplicity)),
+        single_copy_probability=_readonly(single_copy_probability),
         amplified_mutant_copy_probability=_readonly(masked(amplified_probability)),
         amplified_mutant_copy_call=_readonly(
             np.where(

@@ -138,7 +138,10 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
         input_file, resumed_dir, config_file, "--resume", str(checkpoint)
     )
 
-    assert first["summary_schema_version"] == 11
+    assert first["summary_schema_version"] == 12
+    assert first["output_schema_version"] == 3
+    assert first["emission_model_id"] == "clipp2_single_switch_path_mixture_v2"
+    assert first["emission_model_version"] == "2"
     assert first["analysis_tier"] == "joint_certified"
     assert first["primary_estimator_available"] is True
     assert first["selection_score_name"] == "fixed_partition_bic"
@@ -158,6 +161,9 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
 
     assert (checkpoint / "manifest.json").is_file()
     assert any((checkpoint / "arrays").iterdir())
+    with (first_dir / "smoke_mutations.tsv").open(newline="") as handle:
+        mutations = list(csv.DictReader(handle, delimiter="\t"))
+    assert all(float(row["single_copy_probability"]) == 1.0 for row in mutations)
     assert {path.name for path in first_dir.iterdir()} == {
         "smoke_analysis.json",
         "smoke_attempts.tsv",
@@ -237,3 +243,26 @@ def test_panel_validator_separates_primary_and_conditional_status(tmp_path: Path
     assert conditional["execution_status"] == "completed"
     assert conditional["artifact_status"] == "valid"
     assert conditional["scientific_status"] == "no_certified_raw_reference"
+
+
+def test_public_clonal_loader_keeps_single_copy_categorical_likelihood(tmp_path: Path) -> None:
+    import numpy as np
+
+    from CliPP2.core.objective import compile_observed_model
+    from CliPP2.io.tumor_txt import load_tumor_txt, write_tumor_txt
+
+    input_file = tmp_path / "clonal.tsv"
+    _write_smoke_input(input_file)
+    with input_file.open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    for row in rows:
+        row.update(allele_a_cn=3, allele_b_cn=2)
+    write_tumor_txt(input_file, rows)
+    data = load_tumor_txt(input_file)
+    paths = data.emission_paths
+    np.testing.assert_array_equal(paths.first_copy[0, 0], [1, 2, 3])
+    weights = np.asarray([2, 2 * np.exp(-3), np.exp(-6)])
+    np.testing.assert_allclose(np.exp(paths.log_prior[0, 0]), weights / weights.sum())
+    assert not paths.major_prior_weighted
+    model = compile_observed_model(data, major_prior=0.5, eps=1e-6)
+    assert model.requires_generic_path_solver

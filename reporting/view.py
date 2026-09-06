@@ -35,8 +35,8 @@ from ..model_selection.types import (
     TumorSelectionOutcome,
 )
 
-SUMMARY_SCHEMA_VERSION = 11
-OUTPUT_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 12
+OUTPUT_SCHEMA_VERSION = 3
 CCF_CLUSTER_ORDERING_METHOD = "identified_region_rms_distance_to_one_v1"
 
 
@@ -574,6 +574,7 @@ _MUTATION_COLUMNS = (
     "posterior_effective_multiplicity",
     "map_mutant_copy_mass",
     "map_effective_multiplicity",
+    "single_copy_probability",
     "amplified_mutant_copy_probability",
     "amplified_mutant_copy_call",
     "path_entropy",
@@ -682,6 +683,10 @@ def _mutation_table(
                     "original_graph_hash": original_graph_hash,
                 }
             )
+            if posterior is not None:
+                row["single_copy_probability"] = _finite_or_none(
+                    posterior.single_copy_probability[mutation, region]
+                )
             if (
                 posterior is not None
                 and legacy_multiplicity_report
@@ -1125,6 +1130,12 @@ def analysis_summary(
         "tumor_id": data.tumor_id,
         "input_file": str(analysis.input_file),
         "computation_profile": str(fit_config.profile_name),
+        "emission_model_id": data.emission_paths.model_id,
+        "emission_model_version": data.emission_paths.model_version,
+        "emission_candidate_generator_version": (
+            data.emission_paths.candidate_generator_version
+        ),
+        "emission_prior_mode": data.emission_paths.prior_mode,
         "analysis_tier": analysis_tier,
         "primary_estimator_available": primary,
         "failure_reason": analysis.failure_reason,

@@ -20,7 +20,6 @@ from .path_compiler import (
     PATH_LIKELIHOOD_MODEL_ID,
     PATH_LIKELIHOOD_MODEL_VERSION,
     build_emission_paths,
-    build_major_low_emission_paths,
     compile_single_switch_paths,
     dominant_copy_number_state,
     path_prior_mode,
@@ -500,16 +499,8 @@ def _build_tumor_data(
     unsupported_policy: str,
     dosage_prior_penalty: float,
 ) -> TumorData:
-    # The categorical occupancy-path likelihood is needed only when the input
-    # actually contains subclonal copy number.  For entirely one-state input,
-    # retain CliPP2's historical major/minor likelihood: it has exactly the
-    # two biologically supported endpoint dosages and uses the substantially
-    # faster convex/legacy solver route.  Mixed one/two-state tumors continue
-    # to use the path model for every unit so that one coherent likelihood is
-    # optimized across regions.
-    requires_occupancy_paths = any(
-        len(states) > 1 for states in validated.states_by_segment.values()
-    )
+    # Local support and priors depend only on local CN, never other segments.
+    # Numerical fast paths are selected from the compiled observed model.
     mutation_ids = list(validated.mutation_ids)
     sample_ids = list(validated.sample_ids)
     mutation_index = {value: index for index, value in enumerate(mutation_ids)}
@@ -561,7 +552,7 @@ def _build_tumor_data(
             reason = NO_POSITIVE_PATH
             detail = "no positive mutant-copy dosage path exists"
             compiled = CompiledPathSet((), ())
-        elif requires_occupancy_paths:
+        else:
             segment_key = (sample_id, row["segment_id"])
             compiled = compiled_by_segment.get(segment_key)
             if compiled is None:
@@ -574,8 +565,6 @@ def _build_tumor_data(
             if not compiled.paths:
                 reason = NO_POSITIVE_PATH
                 detail = "no positive mutant-copy dosage path exists"
-        else:
-            compiled = CompiledPathSet((), ())
         if reason is not None:
             if unsupported_policy == "error":
                 raise UnsupportedTumorInputError(
@@ -598,16 +587,13 @@ def _build_tumor_data(
             "Every mutation/sample unit must have a positive normal-plus-tumor "
             "copy-number denominator."
         )
-    if requires_occupancy_paths:
-        emission_paths: EmissionPaths = build_emission_paths(
-            compiled_units,
-            model_id=PATH_LIKELIHOOD_MODEL_ID,
-            model_version=PATH_LIKELIHOOD_MODEL_VERSION,
-            candidate_generator_version=PATH_CANDIDATE_GENERATOR_VERSION,
-            prior_mode=path_prior_mode(dosage_prior_penalty),
-        )
-    else:
-        emission_paths = build_major_low_emission_paths(major_cn, minor_cn)
+    emission_paths: EmissionPaths = build_emission_paths(
+        compiled_units,
+        model_id=PATH_LIKELIHOOD_MODEL_ID,
+        model_version=PATH_LIKELIHOOD_MODEL_VERSION,
+        candidate_generator_version=PATH_CANDIDATE_GENERATOR_VERSION,
+        prior_mode=path_prior_mode(dosage_prior_penalty),
+    )
     exclusion_code[likelihood_supported & ~count_available] = int(
         ExclusionCode.COUNT_UNAVAILABLE
     )

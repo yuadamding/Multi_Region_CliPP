@@ -13,11 +13,13 @@ from pathlib import Path
 SUFFIXES = ("analysis.json", "clusters.tsv", "mutations.tsv", "attempts.tsv")
 
 
-def _count_rows(path: Path) -> int:
+def _count_rows(path: Path, *, required_columns: tuple[str, ...] = ()) -> int:
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         if not reader.fieldnames:
             raise RuntimeError(f"missing TSV header: {path}")
+        if not set(required_columns).issubset(reader.fieldnames):
+            raise RuntimeError(f"missing required TSV columns {required_columns}: {path}")
         return sum(1 for _ in reader)
 
 
@@ -62,8 +64,8 @@ def validate_outputs(
     with paths["analysis.json"].open(encoding="utf-8") as handle:
         analysis = json.load(handle)
     required_equal = {
-        "summary_schema_version": 11,
-        "output_schema_version": 2,
+        "summary_schema_version": 12,
+        "output_schema_version": 3,
         "tumor_id": tumor_id,
         "computation_profile": "balanced",
         "selection_policy_id": "hybrid-ward-cem-bic-v1",
@@ -73,6 +75,12 @@ def validate_outputs(
             raise RuntimeError(
                 f"analysis contract mismatch for {key}: {analysis.get(key)!r}"
             )
+    for key in (
+        "emission_model_id", "emission_model_version",
+        "emission_candidate_generator_version", "emission_prior_mode",
+    ):
+        if not isinstance(analysis.get(key), str) or not analysis[key]:
+            raise RuntimeError(f"emission provenance is missing for {key}")
     if set(analysis.get("output_files", [])) != expected:
         raise RuntimeError("analysis output-file authority mismatch")
     if (
@@ -113,7 +121,9 @@ def validate_outputs(
         scientific_status = "no_certified_raw_reference"
 
     cluster_rows = _count_rows(paths["clusters.tsv"])
-    mutation_rows = _count_rows(paths["mutations.tsv"])
+    mutation_rows = _count_rows(
+        paths["mutations.tsv"], required_columns=("single_copy_probability",)
+    )
     attempt_rows = _count_rows(paths["attempts.tsv"])
     if cluster_rows < 1 or mutation_rows != int(expected_mutations):
         raise RuntimeError(

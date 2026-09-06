@@ -10,8 +10,10 @@ import numpy as np
 from .data import EmissionPaths
 
 
-PATH_LIKELIHOOD_MODEL_ID = "clipp2_single_switch_path_mixture_v1"
-PATH_LIKELIHOOD_MODEL_VERSION = "1"
+# v2 applies the existing categorical compiler to every supported TXT unit.
+# Enumeration and biological-alias priors retain their v1 semantics.
+PATH_LIKELIHOOD_MODEL_ID = "clipp2_single_switch_path_mixture_v2"
+PATH_LIKELIHOOD_MODEL_VERSION = "2"
 PATH_CANDIDATE_GENERATOR_VERSION = "phased_unphased_two_state_positive_dosages_v1"
 MAJOR_LOW_MODEL_ID = "legacy_major_low_as_paths_v2"
 

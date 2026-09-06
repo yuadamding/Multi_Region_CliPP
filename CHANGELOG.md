@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — categorical CN model v2
+
+- The public TXT loader uses the same positive-dosage single-switch compiler
+  for every supported one- or two-state segment. A clonal `(3,2)` now retains
+  `{1,2,3}` and `(4,2)` retains `{1,2,3,4}`, independently of other segments.
+- This is a model migration: formerly clonal-only inputs adopt the existing
+  alias-weighted endpoint-dosage prior and CCF box `[eps, 1]`. For `(2,0)` at
+  the default dosage penalty 3, the prior is approximately `(0.9526, 0.0474)`
+  for dosages `(1,2)`. It is not a calibrated mutation-timing prior.
+- Existing subclonal enumeration, alias mass, likelihood marginalization,
+  numerical dispatch, graph rule, BIC, and KKT gates are unchanged. The legacy
+  major/low helper remains available through the explicit IO adapter.
+- Output schema v3 adds `single_copy_probability` to `mutations.tsv`: posterior
+  mass over all paths with `abs(mu(phi)-phi) <= 1e-8` in mutant-copy mass units,
+  including pre-switch portions of mixed-dosage paths. It is blank without
+  included positive-depth counts, an identified refit coordinate, or CCF more
+  than `1e-8` above the numerical lower bound. This is not a late-mutation call;
+  occupancy-switch probabilities are not historical event-time probabilities.
+- Public TXT results consistently use the generic path/effective-multiplicity
+  columns; legacy major-prior columns remain blank for these results. Exactly
+  four output artifacts are retained. Summary schema v12 records emission
+  model/generator versions and prior mode. Numerical hashes and source/input
+  checkpoint identities prevent reuse across incompatible objectives.
+
 ## 0.4.0
 
 This is a breaking internal-schema and product-surface release. Reproduce v0.3

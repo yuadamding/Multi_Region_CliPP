@@ -4,7 +4,6 @@ import numpy as np
 
 from ..config import FitConfig
 from ..core.fusion.types import RawFit
-from .config import SELECTION_SCORE_NAMES
 from .types import (
     CandidateRecord,
     CandidateSelectionDecision,
@@ -38,16 +37,6 @@ def _number_or_nan(value: object) -> float:
         return float("nan")
 
 
-def _normalize_selection_score_name(selection_score: str) -> str:
-    normalized = str(selection_score).strip().lower().replace("-", "_")
-    if normalized in SELECTION_SCORE_NAMES:
-        return normalized
-    allowed = ", ".join(SELECTION_SCORE_NAMES)
-    raise ValueError(
-        f"Unknown selection_score: {selection_score}. Expected one of: {allowed}."
-    )
-
-
 def raw_candidate_has_exact_fusion_certificate(
     candidate: RawFusionCandidate,
 ) -> bool:
@@ -68,7 +57,6 @@ def raw_candidate_has_exact_fusion_certificate(
     return bool(
         candidate.eligible_for_selection
         and candidate.raw_objective_certified
-        and float(provenance.lambda_value) > 0.0
         and candidate.partition.certified
         and schema_version == _EXACT_CERTIFICATE_SCHEMA_VERSION
         and residual_method == _EXACT_CERTIFICATE_RESIDUAL_METHOD
@@ -92,15 +80,13 @@ def raw_candidate_has_exact_fusion_certificate(
 
 def candidate_is_selection_eligible(
     record: CandidateRecord,
-    *,
-    strict_positive_exact_fusion: bool,
 ) -> bool:
     """Return typed candidate admission without consulting reporting fields."""
 
     candidate = record.candidate
     if isinstance(candidate, RawFusionCandidate):
         return raw_candidate_has_exact_fusion_certificate(candidate)
-    return bool(candidate.eligible_for_selection and not strict_positive_exact_fusion)
+    return bool(candidate.eligible_for_selection)
 
 
 def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
@@ -154,8 +140,6 @@ def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
 
 def candidate_representative_ids(
     records: list[CandidateRecord],
-    *,
-    strict_positive_exact_fusion: bool = False,
 ) -> frozenset[int]:
     """Choose one deterministic eligible representative per partition."""
 
@@ -164,7 +148,6 @@ def candidate_representative_ids(
         for record in records
         if candidate_is_selection_eligible(
             record,
-            strict_positive_exact_fusion=strict_positive_exact_fusion,
         )
     ]
     _assert_same_signature_consistency(admitted)
@@ -194,8 +177,6 @@ def _candidate_representative_key(
 
 def select_candidate_records(
     records: list[CandidateRecord],
-    *,
-    strict_positive_exact_fusion: bool = False,
 ) -> CandidateSelectionDecision:
     """Select one partition and representative entirely from typed records.
 
@@ -207,7 +188,6 @@ def select_candidate_records(
 
     representative_ids = candidate_representative_ids(
         records,
-        strict_positive_exact_fusion=strict_positive_exact_fusion,
     )
     eligible = [
         record
@@ -215,7 +195,6 @@ def select_candidate_records(
         if int(record.candidate_id) in representative_ids
         and candidate_is_selection_eligible(
             record,
-            strict_positive_exact_fusion=strict_positive_exact_fusion,
         )
     ]
     if not eligible:
@@ -284,8 +263,7 @@ def select_candidate_records(
             and isinstance(record.candidate, RawFusionCandidate)
             and candidate_is_selection_eligible(
                 record,
-                strict_positive_exact_fusion=strict_positive_exact_fusion,
-            )
+                )
             and record.lambda_value is not None
             and np.isfinite(float(record.lambda_value))
             and float(record.lambda_value) >= 0.0

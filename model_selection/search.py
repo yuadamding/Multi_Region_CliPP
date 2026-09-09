@@ -4,23 +4,23 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from ..config import FitConfig
-from ..core.model import fit_fixed_objective, validate_public_tumor_data
+from ..config import FitConfig, FINAL_PHI_LADDER_KMAX, FINAL_PHI_PARENT_COUNT
+from ..api import fit_fixed_objective, validate_public_tumor_data
+from ..core.fusion.graph import build_complete_uniform_graph
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
     observed_curvature_at_pilot_torch,
 )
 from ..core.fusion.solver import (
+    fit_prepared,
     objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
     promote_solver_context_dtype,
     transfer_scalar_pilot_certificates,
-    torch_data_from_context,
-    uses_explicit_path_likelihood,
 )
 from ..core.fusion.types import (
     RawFit,
-    SolverContext,
+    PreparedProblem,
     SolverState,
 )
 from ..io.data import TumorData
@@ -31,7 +31,7 @@ from ..model_selection.candidates import (
     evaluate_raw_fusion_candidate,
     validate_candidate_identity,
 )
-from ..model_selection.config import (
+from ..config import (
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
 )
 from ..model_selection.online_lambda import (
@@ -219,8 +219,8 @@ def _stable_counts(values) -> tuple[tuple[str, int], ...]:
 
 
 def _try_promote_recovery_context(
-    context: SolverContext,
-) -> tuple[SolverContext, str]:
+    context: PreparedProblem,
+) -> tuple[PreparedProblem, str]:
     """Promote one frozen recovery context and retain a typed outcome."""
 
     if context.runtime.dtype == torch.float64:
@@ -481,13 +481,11 @@ def _assemble_selection_result(
     result_entries,
     selection_method,
     adaptive_search_stop_reason,
-    strict_positive_exact_fusion: bool = False,
     ward_candidate_pool_complete: bool = False,
 ) -> BICSelectionResult:
     try:
         decision = select_candidate_records(
             result_entries,
-            strict_positive_exact_fusion=bool(strict_positive_exact_fusion),
         )
     except ValueError as exc:
         raise NoEligibleModelSelectionCandidatesError(
@@ -600,16 +598,13 @@ def _partition_guided_admm_selection(
 ) -> BICSelectionResult:
     """Run the certified raw path and select under one immutable contract.
 
-    Ward/CEM supplies the primal start and initial-lambda scale. The contract
-    declares whether the guide or zero-penalty pilot defines the frozen graph,
-    and whether retained pilot/final-raw-phi partitions enter the secondary
-    selection pool. Direct proposals are evaluated only after the raw lambda
-    controller terminates, so they cannot steer or replace the raw optimizer.
+    Ward/CEM supplies the primal start and initial-lambda scale. The independent
+    zero-penalty pilot defines the frozen graph. Retained pilot/final-raw-phi
+    partitions enter the secondary selection pool. Direct proposals are
+    evaluated only after the raw lambda controller terminates, so they cannot
+    steer or replace the raw optimizer.
     """
 
-    selection_contract = fit_options.selection.contract
-    selection_score = str(fit_options.selection.score)
-    normalized_score = selection_score
     selection_method = "online_partition_guided_admm"
     if int(data.num_mutations) < 2:
         raise ValueError(
@@ -619,7 +614,6 @@ def _partition_guided_admm_selection(
     pilot_context = prepare_torch_problem_with_resource_policy(
         data,
         dense_fallback_policy=str(fit_options.runtime.fallback),
-        major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.solver.tolerance),
         defer_graph=True,
@@ -630,14 +624,14 @@ def _partition_guided_admm_selection(
         device=fit_options.runtime.device,
         dtype=fit_options.runtime.dtype,
         objective_shape=str(fit_options.solver.objective_shape),
+        verbose=bool(fit_options.runtime.verbose),
     )
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
-    pilot_torch_data = torch_data_from_context(pilot_context)
+    pilot_torch_data = pilot_context.problem
     guide_curvature = observed_curvature_at_pilot_torch(
         data,
         pilot_phi,
-        major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         torch_data=pilot_torch_data,
         device=pilot_runtime.device,
@@ -647,7 +641,6 @@ def _partition_guided_admm_selection(
         data=data,
         pilot_phi=pilot_phi,
         fit_options=fit_options,
-        normalized_score=normalized_score,
         runtime=pilot_runtime,
         torch_data=pilot_torch_data,
         rescore_candidates=_rescore_partition_candidates,
@@ -665,13 +658,7 @@ def _partition_guided_admm_selection(
     # graph itself stays device-backed and is reused by context preparation.
     guide_phi: StartArray = np.asarray(guide.phi_start)
     if fit_options.graph.graph is None:
-        graph_pilot_source = str(fit_options.selection.graph_pilot_source)
-        if graph_pilot_source == "partition_guide":
-            graph_builder_phi = guide_phi
-        elif graph_pilot_source == "zero_penalty_pilot":
-            graph_builder_phi = pilot_phi
-        else:  # resolved configurations never retain ``profile_default``
-            raise AssertionError("Unresolved graph-pilot source.")
+        graph_builder_phi = pilot_phi
         complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
         likelihood_noise_degree_exponent = float(
             PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT
@@ -695,7 +682,6 @@ def _partition_guided_admm_selection(
         data,
         dense_fallback_policy=str(fit_options.runtime.fallback),
         inherited_resource_fallback=pilot_context.resource_fallback,
-        major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.solver.tolerance),
         # The guide initializes adaptive weights, but observed curvature and a
@@ -720,6 +706,7 @@ def _partition_guided_admm_selection(
         runtime=pilot_runtime,
         torch_data=pilot_torch_data,
         objective_shape=str(fit_options.solver.objective_shape),
+        verbose=bool(fit_options.runtime.verbose),
     )
     base_solver_context = transfer_scalar_pilot_certificates(
         pilot_context, base_solver_context
@@ -753,7 +740,7 @@ def _partition_guided_admm_selection(
         solver_state=_offload_solver_state_to_cpu(guided_initialization.solver_state),
     )
     runtime = base_solver_context.runtime
-    torch_data = torch_data_from_context(base_solver_context)
+    torch_data = base_solver_context.problem
     effective_graph = base_solver_context.graph_spec
     effective_tensor_graph = base_solver_context.graph
     effective_fit_options = replace(
@@ -1074,14 +1061,13 @@ def _partition_guided_admm_selection(
                         context.pooled_start,
                     )
 
-            if uses_explicit_path_likelihood(data):
-                for source, start_value, state, phi in (
-                    _explicit_path_default_start_specs(
-                        scalar_well_starts=context.scalar_well_starts,
-                        pooled_start=context.pooled_start,
-                    )
-                ):
-                    append_distinct_start(source, start_value, state, phi)
+            for source, start_value, state, phi in (
+                _explicit_path_default_start_specs(
+                    scalar_well_starts=context.scalar_well_starts,
+                    pooled_start=context.pooled_start,
+                )
+            ):
+                append_distinct_start(source, start_value, state, phi)
 
             start_attempts: list[_RawStartAttempt] = []
             for (
@@ -1125,22 +1111,13 @@ def _partition_guided_admm_selection(
                             else raw_guide_phi
                         )
                     )
-                seed_fit = fit_fixed_objective(
-                    data=data,
-                    config=replace(
-                        candidate_fit_options,
-                        lambda_value=float(proposal.lambda_value),
-                    ),
+                seed_fit = fit_prepared(
+                    context,
+                    float(proposal.lambda_value),
+                    candidate_fit_options.solver,
                     phi_start=phi_start,
-                    exact_pilot=context.exact_pilot,
-                    pooled_start=context.pooled_start,
-                    scalar_well_starts=context.scalar_well_starts,
-                    start_mode="warm_only",
-                    append_default_nonconvex_starts=False,
-                    runtime=context.runtime,
-                    torch_data=torch_data_from_context(context),
-                    solver_context=context,
-                    solver_state=solver_state_start,
+                    include_default_starts=False,
+                    warm_state=solver_state_start,
                 )
                 if str(seed_fit.provenance.objective_spec_hash) != str(
                     context.objective_spec_hash
@@ -1180,18 +1157,7 @@ def _partition_guided_admm_selection(
         fit, artifact = evaluate_raw_fusion_candidate(
             data=data,
             fit_options=effective_fit_options,
-            candidate_fit_options=candidate_fit_options,
-            phi_start=None,
-            exact_pilot=base_solver_context.exact_pilot,
-            pooled_start=base_solver_context.pooled_start,
-            scalar_well_starts=base_solver_context.scalar_well_starts,
-            start_mode="warm_only",
-            runtime=runtime,
-            torch_data=torch_data,
-            solver_context=base_solver_context,
-            solver_state=selected_raw_fit.state,
             lambda_value=float(proposal.lambda_value),
-            selection_score=selection_score,
             bic_refit_cache=bic_refit_cache,
             precomputed_fit=selected_raw_fit,
             source_model=base_solver_context.problem.source_model,
@@ -1285,108 +1251,102 @@ def _partition_guided_admm_selection(
         )
         next_step += 1
 
-    ward_candidate_pool_complete = False
-    if selection_contract.selectable_partition_pool:
-        direct_proposals: list[
-            tuple[
-                PartitionCandidate,
-                str,
-                CandidateRecord | None,
-            ]
-        ] = [
-            (proposal, "pilot", None)
-            for proposal in initializer_pool
+    # The production candidate pool always includes pilot and final-Phi ladders.
+    direct_proposals: list[
+        tuple[
+            PartitionCandidate,
+            str,
+            CandidateRecord | None,
         ]
-        config = selection_contract.partition_config
-        if config.include_final_phi_ladder and config.final_phi_ladder_kmax > 0:
-            raw_parent_records = sorted(
-                (
-                    record
-                    for record in result_entries
-                    if isinstance(record.candidate, RawFusionCandidate)
-                    and raw_candidate_has_exact_fusion_certificate(record.candidate)
-                ),
-                key=lambda record: (
-                    float(record.score.value),
-                    float(record.score.numerical_uncertainty),
-                    float(record.candidate.raw_fit.provenance.lambda_value),
-                    int(record.candidate_id),
-                ),
-            )[: int(config.final_phi_parent_count)]
-            final_k_grid = tuple(
-                range(
-                    1,
-                    min(
-                        int(config.final_phi_ladder_kmax),
-                        int(data.num_mutations),
-                    )
-                    + 1,
-                )
+    ] = [
+        (proposal, "pilot", None)
+        for proposal in initializer_pool
+    ]
+    raw_parent_records = sorted(
+        (
+            record
+            for record in result_entries
+            if isinstance(record.candidate, RawFusionCandidate)
+            and raw_candidate_has_exact_fusion_certificate(record.candidate)
+        ),
+        key=lambda record: (
+            float(record.score.value),
+            float(record.score.numerical_uncertainty),
+            float(record.candidate.raw_fit.provenance.lambda_value),
+            int(record.candidate_id),
+        ),
+    )[: FINAL_PHI_PARENT_COUNT]
+    final_k_grid = tuple(
+        range(
+            1,
+            min(
+                FINAL_PHI_LADDER_KMAX,
+                int(data.num_mutations),
             )
-            for parent_record in raw_parent_records:
-                parent = parent_record.candidate
-                if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
-                    continue
-                final_pool = generate_partition_initializer_pool(
-                    data=data,
-                    pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
-                    fit_options=effective_fit_options,
-                    normalized_score=normalized_score,
-                    runtime=runtime,
-                    torch_data=torch_data,
-                    rescore_candidates=_rescore_partition_candidates,
-                    declared_k_grid=final_k_grid,
-                    enable_refinement=False,
-                )
-                direct_proposals.extend(
-                    (proposal, "final_phi", parent_record)
-                    for proposal in final_pool
-                )
+            + 1,
+        )
+    )
+    for parent_record in raw_parent_records:
+        parent = parent_record.candidate
+        if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
+            continue
+        final_pool = generate_partition_initializer_pool(
+            data=data,
+            pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
+            fit_options=effective_fit_options,
+            runtime=runtime,
+            torch_data=torch_data,
+            rescore_candidates=_rescore_partition_candidates,
+            declared_k_grid=final_k_grid,
+        )
+        direct_proposals.extend(
+            (proposal, "final_phi", parent_record)
+            for proposal in final_pool
+        )
 
-        for proposal, stage, parent_record in direct_proposals:
-            parent_candidate = (
-                None if parent_record is None else parent_record.candidate
-            )
-            parent_raw = (
-                parent_candidate
-                if isinstance(parent_candidate, RawFusionCandidate)
-                else None
-            )
-            source = _direct_partition_source(proposal, stage=stage)
-            candidate_id = int(len(result_entries))
-            direct_candidate = evaluate_direct_partition_candidate(
-                data=data,
-                proposal=proposal,
-                selection_options=effective_fit_options,
-                source=source,
-                parent_raw_candidate_id=(
-                    None if parent_record is None else int(parent_record.candidate_id)
+    for proposal, stage, parent_record in direct_proposals:
+        parent_candidate = (
+            None if parent_record is None else parent_record.candidate
+        )
+        parent_raw = (
+            parent_candidate
+            if isinstance(parent_candidate, RawFusionCandidate)
+            else None
+        )
+        source = _direct_partition_source(proposal, stage=stage)
+        candidate_id = int(len(result_entries))
+        direct_candidate = evaluate_direct_partition_candidate(
+            data=data,
+            proposal=proposal,
+            selection_options=effective_fit_options,
+            source=source,
+            parent_raw_candidate_id=(
+                None if parent_record is None else int(parent_record.candidate_id)
+            ),
+            parent_raw_lambda=(
+                None
+                if parent_raw is None
+                else float(parent_raw.raw_fit.provenance.lambda_value)
+            ),
+            parent_raw_phi_hash=(
+                ""
+                if parent_raw is None
+                else _pilot_matrix_hash(parent_raw.raw_fit.phi)
+            ),
+            refit_cache=bic_refit_cache,
+            source_model=base_solver_context.problem.source_model,
+        )
+        result_entries.append(
+            CandidateRecord(
+                candidate_id=candidate_id,
+                candidate=direct_candidate,
+                trace=CandidateTrace(
+                    search_round=int(next_step),
+                    search_phase=f"{stage}_direct_partition_pool",
                 ),
-                parent_raw_lambda=(
-                    None
-                    if parent_raw is None
-                    else float(parent_raw.raw_fit.provenance.lambda_value)
-                ),
-                parent_raw_phi_hash=(
-                    ""
-                    if parent_raw is None
-                    else _pilot_matrix_hash(parent_raw.raw_fit.phi)
-                ),
-                refit_cache=bic_refit_cache,
-                source_model=base_solver_context.problem.source_model,
             )
-            result_entries.append(
-                CandidateRecord(
-                    candidate_id=candidate_id,
-                    candidate=direct_candidate,
-                    trace=CandidateTrace(
-                        search_round=int(next_step),
-                        search_phase=f"{stage}_direct_partition_pool",
-                    ),
-                )
-            )
-            next_step += 1
-        ward_candidate_pool_complete = True
+        )
+        next_step += 1
 
     if not result_entries:
         raise RuntimeError(
@@ -1398,10 +1358,61 @@ def _partition_guided_admm_selection(
         result_entries=result_entries,
         selection_method=selection_method,
         adaptive_search_stop_reason=stop_reason,
-        strict_positive_exact_fusion=not bool(
-            selection_contract.selectable_partition_pool
-        ),
-        ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
+        ward_candidate_pool_complete=True,
+    )
+
+
+def _select_single_mutation(data: TumorData, fit_config: FitConfig) -> BICSelectionResult:
+    """Fit the separable scalar problem without a guide or lambda ladder.
+
+    All pairwise penalties are identically zero. The existing no-edge solver
+    computes scalar mixture starts and audits their coordinatewise refinement;
+    it performs no ADMM iterations. Its bounded scalar evidence, full-KKT gate,
+    and the profile's distinct fixed-label refit contract remain unchanged.
+    """
+    graph = fit_config.graph.graph
+    if graph is None:
+        graph = build_complete_uniform_graph(1)
+    options = replace(
+        fit_config,
+        lambda_value=0.0,
+        graph=replace(fit_config.graph, graph=graph),
+    )
+    fit = fit_fixed_objective(data, options)
+    _, candidate = evaluate_raw_fusion_candidate(
+        data=data,
+        fit_options=options,
+        lambda_value=0.0,
+        precomputed_fit=fit,
+    )
+    result = _assemble_selection_result(
+        data=data,
+        result_entries=[CandidateRecord(
+            candidate_id=0,
+            candidate=candidate,
+            trace=CandidateTrace(
+                search_round=0,
+                search_phase="singleton_no_edges",
+                start_source="scalar_mixture",
+            ),
+        )],
+        selection_method="singleton_scalar_no_edges",
+        adaptive_search_stop_reason="singleton_no_edges",
+    )
+    # There is no lambda/partition boundary to explore. This topological fact
+    # does not upgrade a local KKT point or an approximate scalar refit into a
+    # global likelihood optimum.
+    globally_certified = bool(
+        fit.certificate.global_optimum and candidate.refit.global_optimum_certified
+    )
+    return replace(
+        result,
+        selection_hits_lower_boundary=False,
+        selection_hits_upper_boundary=False,
+        selection_boundary_unresolved=False,
+        raw_lambda_path_resolved=True,
+        selection_optimum_resolved=globally_certified,
+        global_hybrid_optimum_certified=globally_certified,
     )
 
 
@@ -1420,6 +1431,9 @@ def select_model(
             fit_config,
             solver=replace(fit_config.solver, objective_shape=effective_objective_shape),
         )
+
+    if data.num_mutations == 1:
+        return _select_single_mutation(data, fit_config)
 
     return _partition_guided_admm_selection(
         data=data,

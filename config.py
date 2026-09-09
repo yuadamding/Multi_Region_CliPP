@@ -2,42 +2,179 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
-from .core.fusion.defaults import (
-    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
-    DEFAULT_DENSE_FALLBACK_POLICY,
-    DEFAULT_DEVICE,
-    DEFAULT_WORKSET_ADD_BATCH,
-    DEFAULT_WORKSET_MAX_BYTES,
-    DEFAULT_WORKSET_MAX_EXPANSIONS,
-    normalize_dense_fallback_policy,
+DenseFallbackPolicy: TypeAlias = Literal["device_only", "cpu_allowed", "error"]
+
+DEFAULT_DEVICE: Final = "cuda"
+DEFAULT_DTYPE: Final = "float32"
+DEFAULT_OPTIMIZATION_TOLERANCE: Final = 8e-4
+DEFAULT_DENSE_FALLBACK_POLICY: Final[DenseFallbackPolicy] = "device_only"
+
+DENSE_FALLBACK_POLICIES: Final = ("device_only", "cpu_allowed", "error")
+
+DEFAULT_WORKSET_MAX_BYTES: Final = 256 * 1024 * 1024
+DEFAULT_COMPRESSED_CACHE_MAX_BYTES: Final = 256 * 1024 * 1024
+DEFAULT_WORKSET_ADD_BATCH: Final = 64
+DEFAULT_WORKSET_MAX_EXPANSIONS: Final = 16
+DEFAULT_CERTIFICATE_MAX_ITER: Final = 512
+DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS: Final = 2
+DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE: Final = 1.0
+
+
+def normalize_dense_fallback_policy(value: str) -> DenseFallbackPolicy:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized == "auto":
+        normalized = DEFAULT_DENSE_FALLBACK_POLICY
+    if normalized not in DENSE_FALLBACK_POLICIES:
+        raise ValueError(
+            "dense_fallback_policy must be device_only, cpu_allowed, or error."
+        )
+    return cast(DenseFallbackPolicy, normalized)
+
+
+ProfileName: TypeAlias = Literal["strict", "balanced", "fast"]
+
+
+@dataclass(frozen=True, slots=True)
+class ComputationProfile:
+    """Resource policy and statistical contract for one tumor fit.
+
+    ``strict`` is the reference implementation. ``balanced`` and ``fast``
+    deliberately trade stronger refit certification for bounded single-tumor
+    latency; their output provenance remains explicit.
+    """
+
+    name: ProfileName
+    raw_dtype: Literal["float32", "float64"]
+    scalar_mode: Literal["interval_certified", "grid_local"]
+    scalar_grid_points: int
+    scalar_local_steps: int
+    lambda_budget: int
+    lambda_refinement_budget: int
+    outer_max_iter: int
+    inner_max_iter: int
+    solver_tolerance: float
+    solver_retry_limit: int
+    partition_tolerance: float
+    refit_tolerance: float
+    refit_max_iter: int
+    certificate_max_iter: int
+    certificate_refinement_rounds: int
+
+    @property
+    def is_strict(self) -> bool:
+        return self.name == "strict"
+
+    @property
+    def objective_equivalent_to_strict(self) -> bool:
+        # Pilot precision and numerical stopping differ across profiles; do not
+        # claim cross-profile frozen-graph equality without comparing hashes.
+        return self.is_strict
+
+STRICT_PROFILE: Final = ComputationProfile(
+    name="strict",
+    raw_dtype="float64",
+    scalar_mode="interval_certified",
+    scalar_grid_points=17,
+    scalar_local_steps=0,
+    lambda_budget=12,
+    lambda_refinement_budget=12,
+    outer_max_iter=8,
+    inner_max_iter=30,
+    solver_tolerance=5e-5,
+    solver_retry_limit=4,
+    partition_tolerance=1e-4,
+    refit_tolerance=1e-7,
+    refit_max_iter=128,
+    certificate_max_iter=512,
+    certificate_refinement_rounds=2,
 )
-from .core.fusion.profiles import (
-    DEFAULT_COMPUTATION_PROFILE,
-    ComputationProfile,
-    get_computation_profile,
+
+# For a single tumor, the complete graph is retained in balanced mode to avoid
+# silently changing the estimator.  The dominant latency reductions come from
+# approximate scalar refits and a shorter lambda path.
+BALANCED_PROFILE: Final = ComputationProfile(
+    name="balanced",
+    raw_dtype="float32",
+    scalar_mode="grid_local",
+    scalar_grid_points=64,
+    scalar_local_steps=3,
+    lambda_budget=8,
+    lambda_refinement_budget=2,
+    outer_max_iter=6,
+    inner_max_iter=25,
+    solver_tolerance=8e-4,
+    solver_retry_limit=1,
+    partition_tolerance=2e-4,
+    refit_tolerance=1e-5,
+    refit_max_iter=64,
+    certificate_max_iter=128,
+    certificate_refinement_rounds=1,
 )
+
+FAST_PROFILE: Final = ComputationProfile(
+    name="fast",
+    raw_dtype="float32",
+    scalar_mode="grid_local",
+    scalar_grid_points=32,
+    scalar_local_steps=1,
+    lambda_budget=6,
+    lambda_refinement_budget=0,
+    outer_max_iter=4,
+    inner_max_iter=16,
+    solver_tolerance=1e-3,
+    solver_retry_limit=0,
+    partition_tolerance=1e-3,
+    refit_tolerance=1e-4,
+    refit_max_iter=32,
+    certificate_max_iter=64,
+    certificate_refinement_rounds=0,
+)
+
+COMPUTATION_PROFILES: Final = {
+    profile.name: profile
+    for profile in (STRICT_PROFILE, BALANCED_PROFILE, FAST_PROFILE)
+}
+COMPUTATION_PROFILE_NAMES: Final = tuple(COMPUTATION_PROFILES)
+DEFAULT_COMPUTATION_PROFILE: Final[ProfileName] = "balanced"
+
+
+def get_computation_profile(value: str) -> ComputationProfile:
+    normalized = str(value).strip().lower().replace("-", "_")
+    try:
+        return COMPUTATION_PROFILES[cast(ProfileName, normalized)]
+    except KeyError as error:
+        allowed = ", ".join(COMPUTATION_PROFILE_NAMES)
+        raise ValueError(
+            f"computation_profile must be one of: {allowed}."
+        ) from error
+
+
+
+SELECTION_CONTRACT_ID = "hybrid-ward-cem-v1"
+SELECTION_SCORE = "fixed_partition_dirichlet_score"
+DIRICHLET_ALPHA = 1.0
+DIRICHLET_CODE_WEIGHT = 0.7
+PARTITION_K_ANCHORS = (*range(1, 16), 20, 25, 30, 40, 50)
+PARTITION_MAX_CANDIDATES_PER_K = 5
+PARTITION_CEM_MAX_ITER = 8
+PARTITION_GENERATION_REFIT_MAX_ITER = 32
+FINAL_PHI_LADDER_KMAX = 30
+FINAL_PHI_PARENT_COUNT = 1
+PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT = 1.05
+LIKELIHOOD_PARTITION_K_MAX = 50
 
 if TYPE_CHECKING:
     from .core.fusion.types import PairwiseFusionGraph
-    from .model_selection.contracts import SelectionContract
 
 
 def _positive(name: str, value: float) -> float:
     value = float(value)
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be positive and finite.")
-    return value
-
-
-def _score_name(value: str) -> str:
-    value = str(value).strip().lower().replace("-", "_")
-    if value not in {"fixed_partition_bic", "fixed_partition_dirichlet_score"}:
-        raise ValueError("Unknown fixed-partition selection score.")
     return value
 
 
@@ -124,28 +261,32 @@ class LambdaSearchConfig:
 class SelectionConfig:
     """Resolved selection contract and all numerical selection settings."""
 
-    score: str
-    contract: SelectionContract
-    graph_pilot_source: str
     partition_tolerance: float
     refit: RefitConfig
     lambda_search: LambdaSearchConfig
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "score", _score_name(self.score))
         _positive("selection_partition_tol", self.partition_tolerance)
 
     @property
+    def score(self) -> str:
+        return SELECTION_SCORE
+
+    @property
+    def graph_pilot_source(self) -> str:
+        return "zero_penalty_pilot"
+
+    @property
     def contract_id(self) -> str:
-        return str(self.contract.contract_id)
+        return SELECTION_CONTRACT_ID
 
     @property
     def dirichlet_alpha(self) -> float:
-        return float(self.contract.partition_config.classification_alpha)
+        return DIRICHLET_ALPHA
 
     @property
     def dirichlet_code_weight(self) -> float:
-        return float(self.contract.partition_config.classification_code_weight)
+        return DIRICHLET_CODE_WEIGHT
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +302,6 @@ class FitConfig:
     """Canonical boundary consumed by the solver, selector, and serializers."""
 
     lambda_value: float
-    major_prior: float
     eps: float
     runtime: RuntimeConfig
     solver: SolverConfig
@@ -172,28 +312,13 @@ class FitConfig:
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.lambda_value)) or float(self.lambda_value) < 0.0:
             raise ValueError("lambda_value must be finite and nonnegative.")
-        if not 0.0 < float(self.major_prior) < 1.0:
-            raise ValueError("major_prior must lie strictly in (0, 1).")
         _positive("eps", self.eps)
-        if self.selection.contract.force_float64 and self.runtime.dtype != "float64":
-            object.__setattr__(self, "runtime", replace(self.runtime, dtype="float64"))
-
-    def validate_integer_workflow(self) -> None:
-        """The public integer mixture has fixed uniform candidate priors."""
-        if float(self.major_prior) != 0.5:
-            raise ValueError(
-                "major_prior is obsolete for the clonal integer workflow; "
-                "use its compatibility default 0.5. Integer candidates have "
-                "fixed uniform priors."
-            )
 
 
 def resolve_fit_config(
     *,
     lambda_value: float = 0.0,
     computation_profile: str = DEFAULT_COMPUTATION_PROFILE,
-    selection_contract: str | None = None,
-    selection_score: str = "fixed_partition_dirichlet_score",
     outer_max_iter: int | None = None,
     inner_max_iter: int | None = None,
     tol: float | None = None,
@@ -203,7 +328,6 @@ def resolve_fit_config(
     certificate_max_iter: int | None = None,
     certificate_refinement_rounds: int | None = None,
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    major_prior: float = 0.5,
     eps: float = 1e-6,
     graph: PairwiseFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
@@ -221,19 +345,10 @@ def resolve_fit_config(
 ) -> FitConfig:
     """Resolve a profile and selection contract once into concrete settings."""
 
-    from .model_selection.contracts import (
-        DEFAULT_SELECTION_CONTRACT,
-        get_selection_contract,
-    )
-
     profile = get_computation_profile(computation_profile)
-    contract = get_selection_contract(selection_contract or DEFAULT_SELECTION_CONTRACT)
-    graph_source = str(contract.graph_pilot_source)
-    if graph_source == "profile_default":
-        graph_source = "partition_guide" if profile.is_strict else "zero_penalty_pilot"
     runtime = RuntimeConfig(
         device=str(device),
-        dtype="float64" if contract.force_float64 else str(dtype or profile.raw_dtype),
+        dtype=str(dtype or profile.raw_dtype),
         fallback=str(dense_fallback_policy),
         verbose=bool(verbose),
     )
@@ -256,9 +371,6 @@ def resolve_fit_config(
         ),
     )
     selection = SelectionConfig(
-        score=str(selection_score),
-        contract=contract,
-        graph_pilot_source=graph_source,
         partition_tolerance=float(profile.partition_tolerance if selection_partition_tol is None else selection_partition_tol),
         refit=RefitConfig(
             tolerance=float(profile.refit_tolerance if selection_refit_tol is None else selection_refit_tol),
@@ -275,7 +387,6 @@ def resolve_fit_config(
     )
     return FitConfig(
         lambda_value=float(lambda_value),
-        major_prior=float(major_prior),
         eps=float(eps),
         runtime=runtime,
         solver=solver,

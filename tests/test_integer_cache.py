@@ -1,0 +1,133 @@
+"""Partition refit reuse is bound to the retained numerical input identity."""
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from CliPP2.config import resolve_fit_config
+from CliPP2.core.fusion.torch_backend import (
+    resolve_runtime, to_torch_tumor_data, validate_torch_tumor_data,
+)
+from CliPP2.core.objective import compile_observed_model
+from CliPP2.io.data import CNFilterRecord, CNFilterReport
+from CliPP2.model_selection import candidates
+from CliPP2.model_selection.partitions import _partition_signature
+from test_integer_likelihood import integer_data
+
+
+def _key(data):
+    labels = np.zeros(data.num_mutations, dtype=np.int64)
+    return candidates._selection_refit_cache_key(
+        data=data,
+        partition_signature=_partition_signature(labels, tuple(data.mutation_ids)),
+        selection_options=resolve_fit_config(device="cpu"),
+    )
+
+
+@pytest.mark.parametrize("change", ["counts", "candidates", "observed", "bounds"])
+def test_numeric_changes_invalidate_same_family_refit_cache(change):
+    original = integer_data(((4,),))
+    changed = replace(original)
+    if change == "counts":
+        changed = replace(original, alt_counts=original.alt_counts + 1)
+    elif change == "candidates":
+        changed = integer_data(((3,),))
+    elif change == "observed":
+        changed = replace(original, count_observed=np.zeros_like(original.alt_counts, dtype=bool))
+    else:
+        changed = replace(original, phi_upper=original.phi_upper * 0.9)
+    assert original.path_likelihood.model_id == changed.path_likelihood.model_id
+    assert _key(original) != _key(changed)
+
+
+def test_changed_integer_prior_is_rejected_before_it_can_enter_a_cache():
+    data = integer_data(((4,),))
+    with pytest.raises(ValueError, match="fixed uniform priors"):
+        replace(data.path_likelihood, log_prior=np.log(np.array([[[0.1, 0.2, 0.3, 0.4]]])))
+
+
+@pytest.mark.parametrize("change", ["reads", "bounds", "eps"])
+def test_same_shape_source_model_must_match_requested_data(change):
+    data = integer_data(((4,),))
+    changed = replace(data, alt_counts=data.alt_counts + 1) if change == "reads" else data
+    source = compile_observed_model(changed, eps=0.01 if change == "eps" else 1e-6)
+    if change == "bounds":
+        source = replace(source, upper=source.upper * 0.8)
+    runtime = resolve_runtime("cpu", dtype="float64")
+    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
+        to_torch_tumor_data(data, runtime, source_model=source)
+
+
+def test_forged_runtime_input_label_cannot_authorize_wrong_source_model():
+    data = integer_data(((4,),))
+    changed = replace(data, alt_counts=data.alt_counts + 1)
+    runtime = resolve_runtime("cpu", dtype="float64")
+    correct = to_torch_tumor_data(data, runtime)
+    wrong = to_torch_tumor_data(changed, runtime)
+    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
+        validate_torch_tumor_data(
+            replace(wrong, data_fingerprint=correct.data_fingerprint), data=data, runtime=runtime,
+        )
+    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
+        validate_torch_tumor_data(replace(correct, source_model=None), data=data, runtime=runtime)
+
+
+def test_runtime_validation_supports_matching_nondefault_eps():
+    data = integer_data(((4,),))
+    runtime = resolve_runtime("cpu", dtype="float64")
+    tensors = to_torch_tumor_data(data, runtime, eps=0.01)
+    validate_torch_tumor_data(tensors, data=data, runtime=runtime, eps=0.01)
+    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
+        validate_torch_tumor_data(tensors, data=data, runtime=runtime)
+
+
+def test_exclusion_provenance_does_not_invalidate_retained_refit_cache():
+    data = integer_data(((4,),))
+    report = CNFilterReport(
+        policy_id="clonal_cn_major_le6_whole_mutation_v1",
+        input_mutation_count=2,
+        retained_mutation_count=1,
+        excluded_mutation_ids=("excluded",),
+        records=(CNFilterRecord("excluded", "r0", "s0", "MAJOR_CN_GT_6", 1, 7),),
+    )
+    assert _key(data) == _key(replace(data, cn_filter_report=report))
+
+
+def test_refit_cache_hit_never_reuses_results_for_changed_counts(monkeypatch):
+    original = integer_data(((4,),))
+    changed = replace(original, alt_counts=original.alt_counts + 1)
+    calls = []
+
+    def fake_refit(data, labels, **kwargs):
+        calls.append(float(data.alt_counts[0, 0]))
+        return SimpleNamespace(
+            global_optimality_gap=0.0,
+            loglik=-float(data.alt_counts[0, 0]),
+            finite_candidate_found=True,
+            refit_finite_coordinate_count=1,
+            refit_coordinate_count=1,
+            global_optimum_certified=True,
+        )
+
+    monkeypatch.setattr(candidates, "partition_constrained_observed_refit", fake_refit)
+    options = resolve_fit_config(device="cpu")
+    labels = np.array([0])
+    signature = _partition_signature(labels, tuple(original.mutation_ids))
+    cache = {}
+
+    def refit(data):
+        return candidates._fixed_labels_refit(
+            data=data, labels=labels, partition_signature=signature,
+            selection_options=options, cache=cache,
+        )
+
+    first = refit(original)
+    assert refit(original) is first
+    second = refit(changed)
+    assert second is not first
+    assert second.result.loglik != first.result.loglik
+    assert refit(changed) is second
+    assert calls == [24.0, 25.0]
+    assert len(cache) == 2

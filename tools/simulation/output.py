@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -12,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import (
+from CliPP2.io.tumor_txt import (
     SCHEMA_COLUMNS as TUMOR_TXT_COLUMNS,
     TUMOR_TXT_SCHEMA,
     load_tumor_txt,
@@ -48,17 +47,18 @@ def _generator_provenance() -> tuple[str, str | None]:
                 digest.update(chunk)
         digest.update(b"\0")
     source_hash = digest.hexdigest()
-    commit = os.environ.get("GIT_COMMIT") or os.environ.get("CI_COMMIT_SHA")
-    if commit:
-        return source_hash, commit
+    project = source_dir.parents[1]
+    if not (project / ".git").exists():
+        return source_hash, None
     try:
         completed = subprocess.run(
-            ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+            ["git", "-C", str(project), "rev-parse", "--verify", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return source_hash, None
     return source_hash, completed.stdout.strip() or None
 

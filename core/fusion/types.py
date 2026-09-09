@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 import numpy as np
 import torch
 
-from .defaults import (
+from ...io.data import TumorData, readonly_array
+from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
@@ -212,9 +213,9 @@ class PairwiseFusionGraph:
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
-        edge_u = np.array(self.edge_u, dtype=np.int32, copy=True, order="C")
-        edge_v = np.array(self.edge_v, dtype=np.int32, copy=True, order="C")
-        edge_w = np.array(self.edge_w, dtype=np.float64, copy=True, order="C")
+        edge_u = readonly_array(self.edge_u, dtype=np.int32)
+        edge_v = readonly_array(self.edge_v, dtype=np.int32)
+        edge_w = readonly_array(self.edge_w, dtype=np.float64)
         if edge_u.ndim != 1 or edge_v.ndim != 1 or edge_w.ndim != 1:
             raise ValueError("PairwiseFusionGraph edge arrays must be one-dimensional.")
         if edge_u.shape != edge_v.shape or edge_u.shape != edge_w.shape:
@@ -248,12 +249,30 @@ class TorchRuntime:
     dtype: torch.dtype
 
 
-@dataclass(frozen=True, slots=True)
-class TensorProblem:
+@dataclass(frozen=True)
+class TorchTumorData:
+    """Runtime tumor payload with one authoritative observed-likelihood model."""
+
     observed_model: TorchObservedModel
-    eps: float
-    major_prior: float
+    data_fingerprint: str
     source_model: ObservedModel | None = None
+    eps: float = 1e-6
+
+    @property
+    def alt(self) -> torch.Tensor:
+        return self.observed_model.alt
+
+    @property
+    def total(self) -> torch.Tensor:
+        return self.observed_model.total
+
+    @property
+    def nonalt(self) -> torch.Tensor:
+        return self.observed_model.nonalt
+
+    @property
+    def phi_upper(self) -> torch.Tensor:
+        return self.observed_model.upper
 
     @property
     def count_observed(self) -> torch.Tensor:
@@ -280,8 +299,9 @@ class TensorFusionGraph:
 
 
 @dataclass(frozen=True, slots=True)
-class SolverContext:
-    problem: TensorProblem
+class PreparedProblem:
+    source_data: TumorData
+    problem: TorchTumorData
     graph: TensorFusionGraph
     graph_spec: PairwiseFusionGraph
     exact_pilot: torch.Tensor
@@ -296,6 +316,9 @@ class SolverContext:
     base_fusion_objective_hash: str = ""
     base_objective_key: BaseObjectiveKey | None = None
     resource_fallback: str | None = None
+    fallback_policy: str = "cpu_allowed"
+    verbose: bool = False
+    adaptive_graph_options: tuple[float, float, float] | None = None
     # Float64 scalar source results, in mutation-major/region-minor order.
     # The legacy exact_pilot tensor may be a float32 view of their argmins;
     # unresolved bounds never imply globally certified scalar minima.
@@ -305,6 +328,55 @@ class SolverContext:
         compare=False,
         repr=False,
     )
+    # Preserve this evidence across dataclasses.replace: changing a runtime
+    # view must not silently establish a new baseline under old source hashes.
+    _tensor_snapshot: tuple = field(default=(), compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._tensor_snapshot:
+            self.assert_runtime_unchanged()
+            return
+        snapshot = []
+        for name, tensor in self._runtime_tensors():
+            if not torch.is_tensor(tensor):
+                raise ValueError(f"Prepared runtime {name} must be a Tensor.")
+            try:
+                version = tensor._version
+            except RuntimeError as error:
+                raise ValueError("Prepared runtime requires version-tracked tensors.") from error
+            snapshot.append((name, tensor, version, tuple(tensor.shape), tensor.dtype, tensor.device))
+        object.__setattr__(self, "_tensor_snapshot", tuple(snapshot))
+
+    def _runtime_tensors(self):
+        model = self.problem.observed_model
+        for name in ("alt", "nonalt", "observed", "lower", "upper", "slope", "log_prior", "valid"):
+            yield f"model.{name}", getattr(model, name)
+        for name in ("edge_index", "weight", "degree", "pdhg_tau_node"):
+            yield f"graph.{name}", getattr(self.graph, name)
+        for name in ("lower", "upper", "exact_pilot", "pooled_start"):
+            yield name, getattr(self, name)
+        for index, tensor in enumerate(self.scalar_well_starts):
+            yield f"scalar_well_starts[{index}]", tensor
+
+    def assert_runtime_unchanged(self) -> None:
+        """Reject ordinary in-place tensor edits without GPU synchronization.
+
+        Runtime views are private implementation state, not writable buffers.
+        As with PyTorch autograd version checks, unsafe writes through ``.data``
+        or foreign memory aliases are outside this interface's contract.
+        """
+        current = tuple(self._runtime_tensors())
+        if len(current) != len(self._tensor_snapshot):
+            raise ValueError("Prepared runtime tensor set changed; prepare a new problem.")
+        for (name, tensor), (original_name, original, version, shape, dtype, device) in zip(
+            current, self._tensor_snapshot,
+        ):
+            if (
+                name != original_name or tensor is not original
+                or tensor._version != version or tuple(tensor.shape) != shape
+                or tensor.dtype != dtype or tensor.device != device
+            ):
+                raise ValueError(f"Prepared runtime tensor {name} changed; prepare a new problem.")
 
 
 @dataclass(slots=True)

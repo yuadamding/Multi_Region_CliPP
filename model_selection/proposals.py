@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from ..core.bic import compute_classic_bic, compute_partition_dirichlet_score
-from ..core.fusion.defaults import normalize_dense_fallback_policy
+from ..core.bic import compute_partition_dirichlet_score
+from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, normalize_dense_fallback_policy
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
 from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
@@ -27,7 +27,7 @@ from ..core.fusion.types import (
     DenseWarmState,
     ExactSolverResourceLimit,
     PrimalOnlyWarmState,
-    SolverContext,
+    PreparedProblem,
     SolverState,
 )
 from ..config import FitConfig
@@ -261,7 +261,7 @@ def escape_path_breakpoint_retry_state(
     start_source: str,
     start_lambda: float,
     target_lambda: float,
-    context: SolverContext,
+    context: PreparedProblem,
     tol: float,
 ) -> tuple[SolverState | None, int]:
     same_lambda_failure = start_source in {
@@ -281,7 +281,7 @@ def solver_recovery_fit_options(
 ) -> FitConfig:
     """Increase solver effort without changing the fixed objective family.
 
-    Occupancy-path likelihoods are generically nonconvex.  Their recovery run
+    Integer-mixture likelihoods are generically nonconvex. Their recovery run
     must therefore remain on ``generic_nonconvex`` rather than claiming the
     unimodal full-step contract.  ``objective_shape_for_data`` enforces that
     invariant while the larger iteration budgets give a failed breakpoint/KKT
@@ -337,16 +337,16 @@ def build_guided_initialization_with_resource_policy(
     data: TumorData,
     guide_phi: StartArray,
     guide_labels: np.ndarray | torch.Tensor,
-    solver_context: SolverContext,
+    solver_context: PreparedProblem,
     fit_options: FitConfig,
-) -> tuple[GuidedFusionInitialization, SolverContext, StartArray]:
+) -> tuple[GuidedFusionInitialization, PreparedProblem, StartArray]:
     """Build guided state with typed allocation failure and optional CPU retry."""
 
     fallback_policy = normalize_dense_fallback_policy(fit_options.runtime.fallback)
 
     def build(
         *,
-        context: SolverContext,
+        context: PreparedProblem,
         phi: StartArray,
         labels: np.ndarray | torch.Tensor,
     ) -> GuidedFusionInitialization:
@@ -405,7 +405,6 @@ def build_guided_initialization_with_resource_policy(
                 data,
                 dense_fallback_policy="device_only",
                 inherited_resource_fallback="dense_cpu",
-                major_prior=float(solver_context.problem.major_prior),
                 eps=float(solver_context.problem.eps),
                 tol=float(fit_options.solver.tolerance),
                 graph=solver_context.graph_spec,
@@ -419,6 +418,7 @@ def build_guided_initialization_with_resource_policy(
                 device="cpu",
                 dtype=dtype_name(solver_context.runtime.dtype),
                 objective_shape=str(fit_options.solver.objective_shape),
+                verbose=bool(fit_options.runtime.verbose),
             )
             cpu_context = transfer_scalar_pilot_certificates(solver_context, cpu_context)
             guided = build(
@@ -440,7 +440,7 @@ def build_partition_guided_graph_with_resource_policy(
     *,
     guide_phi: StartArray,
     guide_curvature: torch.Tensor,
-    solver_context: SolverContext,
+    solver_context: PreparedProblem,
     fit_options: FitConfig,
     noise_divisor: float,
 ):
@@ -519,9 +519,6 @@ def rescore_partition_candidates(
     candidates: list[PartitionCandidate],
     *,
     data: TumorData,
-    normalized_score: str,
-    classification_alpha: float,
-    classification_code_weight: float,
 ) -> list[PartitionCandidate]:
     """Put the active selection score in ``PartitionCandidate.bic``.
 
@@ -536,27 +533,16 @@ def rescore_partition_candidates(
     # generation-time values never become selection authority directly.
     rescored: list[PartitionCandidate] = []
     for candidate in candidates:
-        if normalized_score == "fixed_partition_bic":
-            selected_score = compute_classic_bic(
-                -float(candidate.fit_loss),
-                int(candidate.K),
-                data,
-            )
-        elif normalized_score == "fixed_partition_dirichlet_score":
-            selected_score = compute_partition_dirichlet_score(
-                -float(candidate.fit_loss),
-                np.bincount(
-                    np.asarray(candidate.labels, dtype=np.int64),
-                    minlength=int(candidate.K),
-                ),
-                data=data,
-                alpha=float(classification_alpha),
-                code_weight=float(classification_code_weight),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported partition-generation score {normalized_score!r}."
-            )
+        selected_score = compute_partition_dirichlet_score(
+            -float(candidate.fit_loss),
+            np.bincount(
+                np.asarray(candidate.labels, dtype=np.int64),
+                minlength=int(candidate.K),
+            ),
+            data=data,
+            alpha=DIRICHLET_ALPHA,
+            code_weight=DIRICHLET_CODE_WEIGHT,
+        )
         rescored.append(
             replace(
                 candidate,

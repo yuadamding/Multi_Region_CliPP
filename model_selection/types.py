@@ -7,9 +7,22 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import RawFit
+from ..core.fusion.types import DenseEdgeCertificate, RawFit
 
 StartArray = np.ndarray | torch.Tensor
+
+
+def is_zero_edge_singleton(fit: RawFit) -> bool:
+    """The only admissible zero-lambda raw model has one row and no edges."""
+    witness = fit.certificate.witness
+    return bool(
+        fit.phi.shape[0] == 1
+        and fit.provenance.lambda_value == 0.0
+        and isinstance(witness, DenseEdgeCertificate)
+        and torch.is_tensor(witness.dual)
+        and tuple(witness.dual.shape) == (0, fit.phi.shape[1])
+        and witness.graph_hash == fit.provenance.original_graph_hash
+    )
 
 
 def _immutable_array(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
@@ -27,7 +40,6 @@ class FusionPartition:
         "solver_quotient",
         "verified_primal_equalities",
         "tolerance_defined_primal",
-        "legacy_connected_components",
     ]
     certification_failure_reason: str = "none"
     mutation_ids: tuple[str, ...] = ()
@@ -102,7 +114,10 @@ class RawFusionCandidate:
     def raw_objective_certified(self) -> bool:
         certificate = self.raw_fit.certificate
         return bool(
-            self.raw_fit.provenance.lambda_value > 0.0
+            (
+                self.raw_fit.provenance.lambda_value > 0.0
+                or is_zero_edge_singleton(self.raw_fit)
+            )
             and certificate.certified
             and certificate.admissible
         )

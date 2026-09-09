@@ -7,7 +7,7 @@ import heapq
 
 import numpy as np
 
-from ..io.data import TumorData
+from ..io.data import TumorData, readonly_array
 from .objective import ObservedModel, compile_observed_model
 
 
@@ -18,9 +18,7 @@ class ScalarProblem:
     alt: np.ndarray
     nonalt: np.ndarray
     observed: np.ndarray
-    first_scale: np.ndarray
-    second_scale: np.ndarray
-    switch: np.ndarray
+    slope: np.ndarray
     log_prior: np.ndarray
     valid: np.ndarray
     lower: float
@@ -33,12 +31,10 @@ class ScalarProblem:
         observed = np.asarray(self.observed, dtype=bool).reshape(-1)
         if alt.shape != nonalt.shape or observed.shape != alt.shape:
             raise ValueError("ScalarProblem observation arrays must have one shape.")
-        path_shape = (alt.size, np.asarray(self.first_scale).shape[-1])
+        path_shape = (alt.size, np.asarray(self.slope).shape[-1])
         arrays: dict[str, np.ndarray] = {}
         for name, dtype in (
-            ("first_scale", np.float64),
-            ("second_scale", np.float64),
-            ("switch", np.float64),
+            ("slope", np.float64),
             ("log_prior", np.float64),
             ("valid", bool),
         ):
@@ -59,9 +55,7 @@ class ScalarProblem:
             "observed": observed,
             **arrays,
         }.items():
-            value = np.array(value, copy=True, order="C")
-            value.setflags(write=False)
-            object.__setattr__(self, name, value)
+            object.__setattr__(self, name, readonly_array(value))
         object.__setattr__(self, "lower", lower)
         object.__setattr__(self, "upper", upper)
         object.__setattr__(self, "eps", eps)
@@ -109,9 +103,7 @@ def scalar_problem_from_model(
             (model.observed[rows, region] if respect_observed else True)
             & ((alt + nonalt) > 0.0)
         ),
-        first_scale=model.first_scale[rows, region],
-        second_scale=model.second_scale[rows, region],
-        switch=model.switch[rows, region],
+        slope=model.slope[rows, region],
         log_prior=model.log_prior[rows, region],
         valid=model.valid[rows, region],
         lower=lower,
@@ -152,11 +144,8 @@ def _scalar_terms(
         gradient = np.zeros_like(loss) if with_gradient else None
     else:
         candidate = flat[None, :, None]
-        first = problem.first_scale[active, None, :]
-        second = problem.second_scale[active, None, :]
-        switch = problem.switch[active, None, :]
-        mass = first * np.minimum(candidate, switch)
-        mass += second * np.maximum(candidate - switch, 0.0)
+        candidate_slope = problem.slope[active, None, :]
+        mass = candidate_slope * candidate
         probability = np.clip(mass, problem.eps, 1.0 - problem.eps)
         valid = problem.valid[active, None, :]
         joint = (
@@ -174,10 +163,9 @@ def _scalar_terms(
                 np.exp(joint - log_normalizer[..., None]),
                 0.0,
             )
-            segment_slope = np.where(candidate <= switch, first, second)
             slope = np.where(
                 (mass > problem.eps) & (mass < 1.0 - problem.eps),
-                segment_slope,
+                candidate_slope,
                 0.0,
             )
             state_score = slope * (
@@ -207,19 +195,11 @@ def scalar_breakpoints(
     rows = np.flatnonzero(problem.observed) if observed_only else range(problem.alt.size)
     for row in rows:
         for path in np.flatnonzero(problem.valid[row]):
-            first = float(problem.first_scale[row, path])
-            second = float(problem.second_scale[row, path])
-            switch = float(problem.switch[row, path])
-            if problem.lower < switch < problem.upper:
-                points.append(switch)
+            slope = float(problem.slope[row, path])
             for target in (problem.eps, 1.0 - problem.eps):
-                if first > 0.0:
-                    value = target / first
-                    if problem.lower < value <= min(switch, problem.upper):
-                        points.append(value)
-                if second > 0.0:
-                    value = switch + (target - first * switch) / second
-                    if max(switch, problem.lower) <= value < problem.upper:
+                if slope > 0.0:
+                    value = target / slope
+                    if problem.lower < value < problem.upper:
                         points.append(value)
     return np.unique(
         np.clip(np.asarray(points, dtype=np.float64), problem.lower, problem.upper)
@@ -312,31 +292,18 @@ def _active_path_arrays(problem: ScalarProblem) -> tuple[np.ndarray, ...]:
     return (
         problem.alt[active],
         problem.nonalt[active],
-        problem.first_scale[active],
-        problem.second_scale[active],
-        problem.switch[active],
+        problem.slope[active],
         problem.log_prior[active],
         problem.valid[active],
     )
 
 
-def _copy_mass(
-    beta: float,
-    first: np.ndarray,
-    second: np.ndarray,
-    switch: np.ndarray,
-) -> np.ndarray:
-    mass = first * np.minimum(float(beta), switch)
-    mass += second * np.maximum(float(beta) - switch, 0.0)
-    return mass
-
-
 def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> float:
-    alt, nonalt, first, second, switch, log_prior, valid = _active_path_arrays(
+    alt, nonalt, candidate_slope, log_prior, valid = _active_path_arrays(
         problem
     )
-    mass_left = _copy_mass(left, first, second, switch)
-    mass_right = _copy_mass(right, first, second, switch)
+    mass_left = float(left) * candidate_slope
+    mass_right = float(right) * candidate_slope
     probability_left = np.clip(mass_left, problem.eps, 1.0 - problem.eps)
     probability_right = np.clip(mass_right, problem.eps, 1.0 - problem.eps)
     probability_min = np.minimum(probability_left, probability_right)
@@ -366,7 +333,7 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
     # A budget-coarsened initial interval can straddle a derivative kink.
     # The component envelope remains valid there, but a midpoint Taylor bound
     # based on one branch's slopes does not bound the entire interval.
-    crosses_kink = (left < switch) & (switch < right) & (first != second)
+    crosses_kink = np.zeros_like(valid)
     for threshold in (problem.eps, 1.0 - problem.eps):
         crosses_kink |= (mass_left < threshold) & (threshold < mass_right)
     if np.any(valid & crosses_kink):
@@ -374,11 +341,11 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
 
     midpoint = float(left + 0.5 * (right - left))
     half_width = float(0.5 * (right - left))
-    raw_mass = _copy_mass(midpoint, first, second, switch)
+    raw_mass = midpoint * candidate_slope
     probability = np.clip(raw_mass, problem.eps, 1.0 - problem.eps)
     slope = np.where(
         (raw_mass > problem.eps) & (raw_mass < 1.0 - problem.eps),
-        np.where(midpoint <= switch, first, second),
+        candidate_slope,
         0.0,
     )
     joint = np.where(
@@ -646,7 +613,6 @@ def partition_constrained_observed_refit(
     data: TumorData,
     labels: np.ndarray,
     *,
-    major_prior: float,
     eps: float,
     tol: float,
     max_iter: int,
@@ -679,7 +645,7 @@ def partition_constrained_observed_refit(
     )
     n_regions = int(data.num_regions)
 
-    model = compile_observed_model(data, major_prior=major_prior, eps=epsilon)
+    model = compile_observed_model(data, eps=epsilon)
     if _model is not None and _model.fingerprint != model.fingerprint:
         raise ValueError("The supplied scalar model does not match the tumor objective.")
     if model.shape != (int(data.num_mutations), n_regions):

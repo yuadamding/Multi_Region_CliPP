@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import warnings
 
 import numpy as np
@@ -9,14 +8,14 @@ import torch
 from ...io.data import TumorData, tumor_data_fingerprint
 from ..objective import (
     ObservedModel,
-    TorchObservedModel,
+    TorchObservedTerms,
     compile_observed_model,
     model_to_torch,
     observed_em_terms_torch,
     observed_loss_grid_torch,
     observed_terms_torch,
 )
-from .defaults import DEFAULT_DTYPE
+from ...config import DEFAULT_DTYPE
 from .graph_ops import (
     DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES,
     PDHG_PRECONDITIONER_ETA,
@@ -24,71 +23,7 @@ from .graph_ops import (
     graph_forward_edges,
     project_dual_ball,
 )
-from .types import TorchRuntime
-
-
-@dataclass(frozen=True)
-class TorchTumorData:
-    """Runtime tumor payload with one authoritative observed-likelihood model."""
-
-    observed_model: TorchObservedModel
-    data_fingerprint: str
-    source_model: ObservedModel | None = None
-
-    @property
-    def alt(self) -> torch.Tensor:
-        return self.observed_model.alt
-
-    @property
-    def total(self) -> torch.Tensor:
-        return self.observed_model.total
-
-    @property
-    def nonalt(self) -> torch.Tensor:
-        return self.observed_model.nonalt
-
-    @property
-    def phi_upper(self) -> torch.Tensor:
-        return self.observed_model.upper
-
-    @property
-    def count_observed(self) -> torch.Tensor:
-        return self.observed_model.observed
-
-
-@dataclass(frozen=True)
-class TorchMutationRegionTerms:
-    loss: torch.Tensor
-    grad: torch.Tensor
-    hess_upper: torch.Tensor
-    gamma_major: torch.Tensor
-    path_posterior: torch.Tensor | None = None
-
-
-def _copy_torch_observed_model(
-    model: TorchObservedModel,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> TorchObservedModel:
-    return replace(
-        model,
-        alt=model.alt.to(dtype=dtype, device=device),
-        nonalt=model.nonalt.to(dtype=dtype, device=device),
-        observed=model.observed.to(device=device),
-        lower=model.lower.to(dtype=dtype, device=device),
-        upper=model.upper.to(dtype=dtype, device=device),
-        first_scale=model.first_scale.to(dtype=dtype, device=device),
-        second_scale=model.second_scale.to(dtype=dtype, device=device),
-        switch=model.switch.to(dtype=dtype, device=device),
-        log_prior=model.log_prior.to(dtype=dtype, device=device),
-        valid=model.valid.to(device=device),
-        legacy_major=(
-            None
-            if model.legacy_major is None
-            else model.legacy_major.to(device=device)
-        ),
-    )
+from .types import TorchRuntime, TorchTumorData
 
 
 def copy_torch_tumor_data(
@@ -97,24 +32,15 @@ def copy_torch_tumor_data(
     dtype: torch.dtype,
     device: torch.device,
 ) -> TorchTumorData:
-    """Rebuild a runtime view from source, with a cast-only foreign fallback."""
-
-    if data.source_model is not None:
-        runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
-        observed_model = model_to_torch(data.source_model, runtime)
-        return TorchTumorData(
-            observed_model=observed_model,
-            data_fingerprint=data.data_fingerprint,
-            source_model=data.source_model,
-        )
+    """Rebuild from immutable float64 source; never promote rounded tensors."""
+    if data.source_model is None:
+        raise ValueError("Runtime promotion requires the immutable observed-model source.")
+    runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
     return TorchTumorData(
-        observed_model=_copy_torch_observed_model(
-            data.observed_model,
-            dtype=dtype,
-            device=device,
-        ),
+        observed_model=model_to_torch(data.source_model, runtime),
         data_fingerprint=data.data_fingerprint,
-        source_model=None,
+        source_model=data.source_model,
+        eps=data.eps,
     )
 
 
@@ -165,7 +91,7 @@ def as_runtime_tensor(start, runtime: "TorchRuntime") -> torch.Tensor:
     if torch.is_tensor(start):
         return start.to(dtype=runtime.dtype, device=runtime.device)
     return torch.as_tensor(
-        np.asarray(start), dtype=runtime.dtype, device=runtime.device
+        np.array(start, copy=True), dtype=runtime.dtype, device=runtime.device
     )
 
 
@@ -403,18 +329,18 @@ def to_torch_tumor_data(
     runtime: TorchRuntime,
     *,
     source_model: ObservedModel | None = None,
-    major_prior: float = 0.5,
+
     eps: float = 1e-6,
 ) -> TorchTumorData:
-    source_model = (
-        compile_observed_model(data, major_prior=float(major_prior), eps=float(eps))
-        if source_model is None
-        else source_model
-    )
+    expected_model = compile_observed_model(data, eps=float(eps))
+    if source_model is not None and source_model.fingerprint != expected_model.fingerprint:
+        raise ValueError("ObservedModel source does not match the requested TumorData/eps objective.")
+    source_model = expected_model
     return TorchTumorData(
         observed_model=model_to_torch(source_model, runtime),
         data_fingerprint=tumor_data_fingerprint(data),
         source_model=source_model,
+        eps=float(eps),
     )
 
 
@@ -424,6 +350,7 @@ def validate_torch_tumor_data(
     data: TumorData,
     runtime: TorchRuntime,
     expected_fingerprint: str | None = None,
+    eps: float = 1e-6,
 ) -> None:
     """Reject stale or runtime-incompatible tensors before solver reuse."""
 
@@ -452,10 +379,9 @@ def validate_torch_tumor_data(
 
     host_path = getattr(data, "path_likelihood", None)
     observed_model = tensor_data.observed_model
-    expected_model_shape = (
-        *expected_shape,
-        2 if host_path is None else int(host_path.shape[-1]),
-    )
+    if host_path is None:
+        raise ValueError("An integer multiplicity specification is required.")
+    expected_model_shape = (*expected_shape, int(host_path.copies.shape[-1]))
 
     for name in ("alt", "nonalt", "lower", "upper"):
         validate_tensor(
@@ -470,7 +396,7 @@ def validate_torch_tumor_data(
         shape=expected_shape,
         dtype=torch.bool,
     )
-    for name in ("first_scale", "second_scale", "switch", "log_prior"):
+    for name in ("slope", "log_prior"):
         validate_tensor(
             f"TorchObservedModel.{name}",
             getattr(observed_model, name),
@@ -483,45 +409,18 @@ def validate_torch_tumor_data(
         shape=expected_model_shape,
         dtype=torch.bool,
     )
-    if observed_model.legacy_major is not None:
-        validate_tensor(
-            "TorchObservedModel.legacy_major",
-            observed_model.legacy_major,
-            shape=expected_model_shape,
-            dtype=torch.bool,
-        )
     if not observed_model.source_fingerprint:
         raise ValueError("TorchObservedModel.source_fingerprint must be nonempty.")
-    expected_model_id = (
-        "legacy_major_low_as_paths_v2" if host_path is None else host_path.model_id
-    )
+    expected_model_id = host_path.model_id
     if observed_model.model_id != expected_model_id:
         raise ValueError("TorchObservedModel model_id does not match TumorData.")
 
     source_model = tensor_data.source_model
-    if source_model is not None:
-        if source_model.shape != expected_shape:
-            raise ValueError(f"ObservedModel source must have shape {expected_shape}.")
-        if source_model.path_shape != expected_model_shape:
-            raise ValueError(
-                f"ObservedModel source paths must have shape {expected_model_shape}."
-            )
-        if source_model.fingerprint != observed_model.source_fingerprint:
-            raise ValueError(
-                "TorchObservedModel was not built from the retained ObservedModel."
-            )
-
-
-def _mutation_terms_from_observed(
-    terms,
-) -> TorchMutationRegionTerms:
-    return TorchMutationRegionTerms(
-        loss=terms.loss,
-        grad=terms.gradient,
-        hess_upper=terms.hessian_upper,
-        gamma_major=terms.legacy_major_probability,
-        path_posterior=terms.posterior,
-    )
+    expected_model = compile_observed_model(data, eps=float(eps))
+    if source_model is None or source_model.fingerprint != expected_model.fingerprint:
+        raise ValueError("ObservedModel source does not match the requested TumorData/eps objective.")
+    if source_model.fingerprint != observed_model.source_fingerprint:
+        raise ValueError("TorchObservedModel was not built from the retained ObservedModel.")
 
 
 def downward_kink_mask_torch(
@@ -554,41 +453,17 @@ def mutation_region_loss_grid_torch(
 
 
 def mutation_region_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    major_prior: float,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    # ``major_prior`` remains in this public low-level signature while callers
-    # migrate; the immutable source model already contains the authoritative
-    # prior and no runtime likelihood branch may rewrite it.
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not 0.0 < prior < 1.0:
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    return _mutation_terms_from_observed(
-        observed_terms_torch(
-            data.observed_model,
-            phi,
-            eps=eps,
-        ),
-    )
+    data: TorchTumorData, phi: torch.Tensor, *, eps: float,
+) -> TorchObservedTerms:
+    return observed_terms_torch(data.observed_model, phi, eps=eps)
 
 
 def em_surrogate_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    responsibilities: torch.Tensor,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    return _mutation_terms_from_observed(
-        observed_em_terms_torch(
-            data.observed_model,
-            phi,
-            responsibilities=responsibilities,
-            eps=eps,
-        )
+    data: TorchTumorData, phi: torch.Tensor, *,
+    responsibilities: torch.Tensor, eps: float,
+) -> TorchObservedTerms:
+    return observed_em_terms_torch(
+        data.observed_model, phi, responsibilities=responsibilities, eps=eps,
     )
 
 

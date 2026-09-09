@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import numpy as np
 
 from ..core.bic import (
     cluster_sizes_from_labels,
     compute_dirichlet_exact_partition_log_mass,
-    fixed_partition_bic,
     fixed_partition_dirichlet_score,
 )
-from ..config import FitConfig
-from ..core.model import fit_fixed_objective
+from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, FitConfig, SELECTION_SCORE
 from ..core.objective import ObservedModel
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
@@ -19,16 +17,13 @@ from ..core.scalar import (
     canonical_partition_labels as _canonical_partition_labels,
     partition_constrained_observed_refit,
 )
-from ..core.fusion.types import SolverState
 from ..io.data import TumorData, tumor_data_fingerprint
 from .partitions import (
     _partition_signature,
     extract_certified_fusion_partition,
-    extract_connected_component_partition,
 )
 from .scoring import (
     _effective_bic_partition_tol,
-    _normalize_selection_score_name,
 )
 from .types import (
     DirectPartition,
@@ -38,7 +33,7 @@ from .types import (
     RawFusionCandidate,
     SelectionScore,
     SelectablePartitionCandidate,
-    StartArray,
+    is_zero_edge_singleton,
 )
 
 
@@ -62,8 +57,13 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         raise AssertionError("Refit partition signature does not match partition.")
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
-    if str(score.name).startswith("clonal_"):
-        raise AssertionError("Clonal-anchor selection scores were removed.")
+    if score.name != SELECTION_SCORE:
+        raise AssertionError("Only the fixed-partition Dirichlet score is supported.")
+    if (
+        float(score.assignment_dirichlet_alpha) != DIRICHLET_ALPHA
+        or float(score.assignment_code_weight) != DIRICHLET_CODE_WEIGHT
+    ):
+        raise AssertionError("Dirichlet score parameters differ from the production policy.")
     score_tolerance = 1e-10 * (1.0 + abs(float(score.value)))
     if not np.isclose(
         float(score.loglik),
@@ -75,48 +75,40 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
     expected_bic_penalty = float(score.degrees_of_freedom) * np.log(
         max(int(score.n_eff), 1)
     )
-    dirichlet_score = score.name == "fixed_partition_dirichlet_score"
-    if dirichlet_score:
-        expected_log_evidence = compute_dirichlet_exact_partition_log_mass(
-            cluster_sizes_from_labels(partition.labels),
-            alpha=float(score.assignment_dirichlet_alpha),
+    expected_log_evidence = compute_dirichlet_exact_partition_log_mass(
+        cluster_sizes_from_labels(partition.labels),
+        alpha=float(score.assignment_dirichlet_alpha),
+    )
+    expected_assignment_penalty = float(
+        -2.0 * float(score.assignment_code_weight) * expected_log_evidence
+    )
+    if not np.isclose(
+        float(score.assignment_log_evidence),
+        expected_log_evidence,
+        rtol=0.0,
+        atol=score_tolerance,
+    ):
+        raise AssertionError(
+            "Stored Dirichlet allocation mass is not reconstructible."
         )
-        expected_assignment_penalty = float(
-            -2.0 * float(score.assignment_code_weight) * expected_log_evidence
+    if not np.isclose(
+        float(score.assignment_penalty),
+        expected_assignment_penalty,
+        rtol=0.0,
+        atol=score_tolerance,
+    ):
+        raise AssertionError(
+            "Stored Dirichlet allocation penalty is not reconstructible."
         )
-        if not np.isclose(
-            float(score.assignment_log_evidence),
-            expected_log_evidence,
-            rtol=0.0,
-            atol=score_tolerance,
-        ):
-            raise AssertionError(
-                "Stored Dirichlet allocation mass is not reconstructible."
-            )
-        if not np.isclose(
-            float(score.assignment_penalty),
-            expected_assignment_penalty,
-            rtol=0.0,
-            atol=score_tolerance,
-        ):
-            raise AssertionError(
-                "Stored Dirichlet allocation penalty is not reconstructible."
-            )
-        if (
-            not np.isfinite(float(score.assignment_arithmetic_uncertainty))
-            or float(score.assignment_arithmetic_uncertainty) < 0.0
-            or float(score.numerical_uncertainty) + score_tolerance
-            < float(score.assignment_arithmetic_uncertainty)
-        ):
-            raise AssertionError(
-                "Score uncertainty does not cover Dirichlet arithmetic."
-            )
-    else:
-        expected_assignment_penalty = 0.0
-        if not np.isclose(
-            float(score.assignment_penalty), 0.0, rtol=0.0, atol=score_tolerance
-        ):
-            raise AssertionError("BIC score contains an ICL allocation penalty.")
+    if (
+        not np.isfinite(float(score.assignment_arithmetic_uncertainty))
+        or float(score.assignment_arithmetic_uncertainty) < 0.0
+        or float(score.numerical_uncertainty) + score_tolerance
+        < float(score.assignment_arithmetic_uncertainty)
+    ):
+        raise AssertionError(
+            "Score uncertainty does not cover Dirichlet arithmetic."
+        )
     expected_penalty = expected_bic_penalty + expected_assignment_penalty
     if not np.isclose(
         float(score.penalty), expected_penalty, rtol=0.0, atol=score_tolerance
@@ -163,7 +155,7 @@ def _candidate_ineligibility_reason(
     if isinstance(partition, FusionPartition):
         if raw_fit is None:
             raise ValueError("Raw-fusion eligibility requires its raw fit.")
-        if float(raw_fit.provenance.lambda_value) <= 0.0:
+        if float(raw_fit.provenance.lambda_value) <= 0.0 and not is_zero_edge_singleton(raw_fit):
             return "nonpositive_lambda"
         if not bool(raw_fit.certificate.certified) or not bool(
             raw_fit.certificate.admissible
@@ -213,7 +205,6 @@ def _selection_refit_cache_key(
     refit = selection_options.selection.refit
     return (
         str(partition_signature),
-        float(selection_options.major_prior),
         float(selection_options.eps),
         float(refit.tolerance),
         int(refit.max_iter),
@@ -247,7 +238,6 @@ def _fixed_labels_refit(
         return cache[refit_spec_key]
 
     kwargs = dict(
-        major_prior=float(selection_options.major_prior),
         eps=float(selection_options.eps),
         tol=float(refit_config.tolerance),
         max_iter=int(refit_config.max_iter),
@@ -319,15 +309,8 @@ def _score_fixed_labels(
     partition_signature: str,
     refit_result: PartitionRefitResult,
     selection_options: FitConfig,
-    selection_score: str,
 ) -> SelectionScore:
-    canonical_score_name = _normalize_selection_score_name(selection_score)
     computation_profile = selection_options.computation_profile
-    score_function = (
-        fixed_partition_dirichlet_score
-        if canonical_score_name == "fixed_partition_dirichlet_score"
-        else fixed_partition_bic
-    )
     score_kwargs: dict[str, object] = {
         "loglik": float(refit_result.loglik),
         "num_clusters": int(np.unique(labels).size),
@@ -340,15 +323,14 @@ def _score_fixed_labels(
             else 0.0
         ),
     }
-    if canonical_score_name == "fixed_partition_dirichlet_score":
-        score_kwargs.update(
-            alpha=float(selection_options.selection.dirichlet_alpha),
-            code_weight=float(selection_options.selection.dirichlet_code_weight),
-        )
-    score = score_function(**score_kwargs)
-    if str(score.name) != canonical_score_name:
+    score_kwargs.update(
+        alpha=float(selection_options.selection.dirichlet_alpha),
+        code_weight=float(selection_options.selection.dirichlet_code_weight),
+    )
+    score = fixed_partition_dirichlet_score(**score_kwargs)
+    if str(score.name) != SELECTION_SCORE:
         raise AssertionError(
-            f"Requested score {canonical_score_name} produced {score.name}."
+            f"Expected score {SELECTION_SCORE} but got {score.name}."
         )
     return score
 
@@ -359,7 +341,6 @@ def evaluate_partition(
     partition: FusionPartition | DirectPartition,
     selection_options: FitConfig,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
-    selection_score: str | None = None,
     source_model: ObservedModel | None = None,
 ) -> PartitionEvaluation:
     """Evaluate raw and direct label sets through one refit/score path."""
@@ -379,11 +360,6 @@ def evaluate_partition(
         partition_signature=partition.signature,
         refit_result=refit_result,
         selection_options=selection_options,
-        selection_score=(
-            selection_options.selection.score
-            if selection_score is None
-            else selection_score
-        ),
     )
     return PartitionEvaluation(
         refit=_build_refit_summary(
@@ -399,45 +375,16 @@ def evaluate_raw_fusion_candidate(
     *,
     data: TumorData,
     fit_options: FitConfig,
-    candidate_fit_options: FitConfig | None,
-    phi_start: StartArray | None,
-    exact_pilot: StartArray | None,
-    pooled_start: StartArray | None,
-    scalar_well_starts: list[StartArray] | None,
-    start_mode: str,
-    runtime,
-    torch_data,
-    solver_context,
-    solver_state: SolverState | None,
     lambda_value: float,
-    selection_score: str,
+    precomputed_fit: RawFit,
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
-    precomputed_fit: RawFit | None = None,
     source_model: ObservedModel | None = None,
 ) -> tuple[RawFit, RawFusionCandidate]:
-    canonical_score_name = _normalize_selection_score_name(selection_score)
-    raw_fit_options = (
-        fit_options if candidate_fit_options is None else candidate_fit_options
-    )
     selection_options = fit_options
     computation_profile = selection_options.computation_profile
 
     fit = precomputed_fit
-    if fit is None:
-        fit = fit_fixed_objective(
-            data=data,
-            config=replace(raw_fit_options, lambda_value=float(lambda_value)),
-            phi_start=phi_start,
-            exact_pilot=exact_pilot,
-            pooled_start=pooled_start,
-            scalar_well_starts=scalar_well_starts,
-            start_mode=start_mode,
-            runtime=runtime,
-            torch_data=torch_data,
-            solver_context=solver_context,
-            solver_state=solver_state,
-        )
-    elif not np.isclose(
+    if not np.isclose(
         float(fit.provenance.lambda_value), float(lambda_value), rtol=0.0, atol=1e-12
     ):
         raise ValueError("Precomputed raw fit has the wrong lambda value.")
@@ -446,14 +393,10 @@ def evaluate_raw_fusion_candidate(
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
+    if fit.provenance.original_graph_hash != graph.fingerprint:
+        raise ValueError("Precomputed raw fit belongs to a different fusion graph.")
     partition_tolerance = _effective_bic_partition_tol(selection_options)
-    contract = selection_options.selection.contract
-    partition_extractor = (
-        extract_connected_component_partition
-        if contract.raw_partition_rule == "legacy_connected_components"
-        else extract_certified_fusion_partition
-    )
-    partition = partition_extractor(
+    partition = extract_certified_fusion_partition(
         fit,
         graph=graph,
         tolerance=partition_tolerance,
@@ -465,7 +408,6 @@ def evaluate_raw_fusion_candidate(
         partition=partition,
         selection_options=selection_options,
         refit_cache=bic_refit_cache,
-        selection_score=canonical_score_name,
         source_model=source_model,
     )
     refit = evaluation.refit

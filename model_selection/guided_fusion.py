@@ -28,14 +28,13 @@ from ..core.fusion.graph_ops import (
     graph_adjoint_edges,
     project_dual_ball,
 )
-from ..core.fusion.solver import torch_data_from_context
 from ..core.fusion.torch_backend import (
     graph_fusion_kkt_residual_from_grad_torch,
     mutation_region_terms_torch,
 )
 from ..core.fusion.types import (
     ExactSolverResourceLimit,
-    SolverContext,
+    PreparedProblem,
     SolverState,
 )
 
@@ -123,7 +122,7 @@ def _canonical_labels(labels: GuideLabels, *, num_mutations: int) -> np.ndarray:
     return canonical
 
 
-def _validate_complete_graph(context: SolverContext, *, num_mutations: int) -> None:
+def _validate_complete_graph(context: PreparedProblem, *, num_mutations: int) -> None:
     graph = context.graph
     expected_edges = int(num_mutations) * max(int(num_mutations) - 1, 0) // 2
     if not bool(graph.is_complete) or int(graph.weight.numel()) != expected_edges:
@@ -131,7 +130,7 @@ def _validate_complete_graph(context: SolverContext, *, num_mutations: int) -> N
             "Guided KKT initialization currently requires the complete pairwise-fusion graph."
         )
     if int(graph.num_nodes) != int(num_mutations):
-        raise ValueError("SolverContext graph size does not match guide_phi.")
+        raise ValueError("PreparedProblem graph size does not match guide_phi.")
     if not bool(torch.all(torch.isfinite(graph.weight)).item()) or bool(
         torch.any(graph.weight <= 0.0).item()
     ):
@@ -158,7 +157,7 @@ def _canonical_guide_phi(
         torch.max(torch.maximum(lower_violation, upper_violation)).item()
     )
     if max_box_violation > float(partition_tolerance):
-        raise ValueError("guide_phi lies outside the SolverContext box constraints.")
+        raise ValueError("guide_phi lies outside the PreparedProblem box constraints.")
     phi = torch.minimum(torch.maximum(phi_input, lower), upper).clone()
 
     max_deviation = 0.0
@@ -568,7 +567,7 @@ def build_guided_fusion_initialization(
     guide_phi: GuideArray,
     guide_labels: GuideLabels,
     *,
-    solver_context: SolverContext,
+    solver_context: PreparedProblem,
     partition_tolerance: float = 1e-8,
     kkt_atol: float = 1e-8,
     max_capacity_iterations: int = 64,
@@ -613,7 +612,7 @@ def build_guided_fusion_initialization(
     upper = solver_context.upper
     if lower.ndim != 2 or tuple(upper.shape) != tuple(lower.shape):
         raise ValueError(
-            "SolverContext bounds must be matching two-dimensional tensors."
+            "PreparedProblem bounds must be matching two-dimensional tensors."
         )
     num_mutations, num_regions = (int(lower.shape[0]), int(lower.shape[1]))
     if num_mutations <= 0 or num_regions <= 0:
@@ -631,12 +630,11 @@ def build_guided_fusion_initialization(
     )
 
     terms = mutation_region_terms_torch(
-        torch_data_from_context(solver_context),
+        solver_context.problem,
         phi,
-        major_prior=float(solver_context.problem.major_prior),
         eps=float(solver_context.problem.eps),
     )
-    grad = terms.grad.detach()
+    grad = terms.gradient.detach()
     gradient_source = "observed_likelihood"
 
     graph = solver_context.graph

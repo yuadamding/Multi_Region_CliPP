@@ -96,7 +96,7 @@ def _resolve_partition_runtime(
     torch_data: TorchTumorData | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
-    major_prior: float = 0.5,
+
     eps: float = 1e-6,
 ) -> tuple[TorchRuntime, TorchTumorData]:
     if torch_data is not None:
@@ -155,7 +155,6 @@ def _resolve_partition_runtime(
     return runtime, to_torch_tumor_data(
         data,
         runtime,
-        major_prior=float(major_prior),
         eps=float(eps),
     )
 
@@ -170,13 +169,12 @@ def _mutation_region_loss_matrix_torch(
     torch_data: TorchTumorData,
     beta: torch.Tensor,
     *,
-    major_prior: float,
+
     eps: float,
 ) -> torch.Tensor:
     return mutation_region_terms_torch(
         torch_data,
         beta,
-        major_prior=float(major_prior),
         eps=float(eps),
     ).loss
 
@@ -186,7 +184,7 @@ def observed_curvature_at_pilot_torch(
     data: TumorData,
     exact_pilot: np.ndarray | torch.Tensor | object,
     *,
-    major_prior: float,
+
     eps: float,
     step_fraction: float = 1e-3,
     min_step: float = 1e-4,
@@ -202,7 +200,6 @@ def observed_curvature_at_pilot_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
-        major_prior=major_prior,
         eps=eps,
     )
     phi0 = _as_torch(exact_pilot, runtime=runtime)
@@ -223,13 +220,13 @@ def observed_curvature_at_pilot_torch(
     valid = (h_left > 1e-12) & (h_right > 1e-12)
 
     f_left = _mutation_region_loss_matrix_torch(
-        torch_data, left, major_prior=major_prior, eps=eps
+        torch_data, left, eps=eps
     )
     f0 = _mutation_region_loss_matrix_torch(
-        torch_data, x0, major_prior=major_prior, eps=eps
+        torch_data, x0, eps=eps
     )
     f_right = _mutation_region_loss_matrix_torch(
-        torch_data, right, major_prior=major_prior, eps=eps
+        torch_data, right, eps=eps
     )
     denom = h_left * h_right * (h_left + h_right)
     curvature = (
@@ -509,14 +506,14 @@ def _loss_to_centers(
     data: TumorData,
     centers: np.ndarray,
     *,
-    major_prior: float,
+
     eps: float,
     infeasible_penalty: float = 1e100,
     _model: ObservedModel | None = None,
 ) -> np.ndarray:
     centers = np.asarray(centers, dtype=np.float64)
     model = (
-        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        compile_observed_model(data, eps=eps)
         if _model is None
         else _model
     )
@@ -542,7 +539,7 @@ def _loss_to_centers_torch(
     data: TumorData,
     centers: np.ndarray | torch.Tensor,
     *,
-    major_prior: float,
+
     eps: float,
     infeasible_penalty: float = 1e100,
     torch_data: TorchTumorData | None = None,
@@ -555,7 +552,6 @@ def _loss_to_centers_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
-        major_prior=major_prior,
         eps=eps,
     )
     centers_t = _as_torch(centers, runtime=runtime)
@@ -728,7 +724,7 @@ def refine_partition_likelihood_with_trace(
     data: TumorData,
     labels: np.ndarray,
     *,
-    major_prior: float,
+
     eps: float,
     tol: float,
     max_iter: int = 12,
@@ -747,7 +743,7 @@ def refine_partition_likelihood_with_trace(
         classification_code_weight
     )
     model = (
-        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        compile_observed_model(data, eps=eps)
         if _model is None
         else _model
     )
@@ -758,7 +754,6 @@ def refine_partition_likelihood_with_trace(
         return partition_constrained_observed_refit(
             data,
             current_labels,
-            major_prior=float(major_prior),
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
@@ -788,7 +783,6 @@ def refine_partition_likelihood_with_trace(
         count_cost = _loss_to_centers(
             data,
             refit.cluster_centers,
-            major_prior=float(major_prior),
             eps=float(eps),
             _model=model,
         )
@@ -860,7 +854,7 @@ def partition_constrained_observed_refit_torch(
     data: TumorData,
     labels: np.ndarray,
     *,
-    major_prior: float,
+
     eps: float,
     tol: float,
     max_iter: int,
@@ -878,7 +872,6 @@ def partition_constrained_observed_refit_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
-        major_prior=major_prior,
         eps=eps,
     )
     labels_np = _validated_refinement_labels(data, labels)
@@ -1047,7 +1040,7 @@ def refine_partition_likelihood_torch_with_trace(
     data: TumorData,
     labels: np.ndarray,
     *,
-    major_prior: float,
+
     eps: float,
     tol: float,
     max_iter: int = 12,
@@ -1067,7 +1060,6 @@ def refine_partition_likelihood_torch_with_trace(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
-        major_prior=major_prior,
         eps=eps,
     )
     labels = _validated_refinement_labels(data, labels)
@@ -1083,7 +1075,6 @@ def refine_partition_likelihood_torch_with_trace(
         return partition_constrained_observed_refit_torch(
             data,
             current_labels,
-            major_prior=float(major_prior),
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
@@ -1116,7 +1107,6 @@ def refine_partition_likelihood_torch_with_trace(
         cost_t = _loss_to_centers_torch(
             data,
             refit.cluster_centers,
-            major_prior=float(major_prior),
             eps=float(eps),
             torch_data=torch_data,
             device=runtime.device,
@@ -1203,7 +1193,7 @@ def generate_likelihood_partition_starts(
     data: TumorData,
     *,
     exact_pilot: np.ndarray | object,
-    major_prior: float,
+
     eps: float,
     K_grid: Sequence[int],
     max_candidates_per_K: int = 5,
@@ -1236,7 +1226,6 @@ def generate_likelihood_partition_starts(
             torch_data=torch_data,
             device=device,
             dtype=dtype,
-            major_prior=major_prior,
             eps=eps,
         )
     phi0 = (
@@ -1259,7 +1248,7 @@ def generate_likelihood_partition_starts(
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
     source_model = compile_observed_model(
-        data, major_prior=float(major_prior), eps=float(eps)
+        data, eps=float(eps)
     )
     # This cache never escapes one generation call, so labels fully identify a
     # refit under the shared data, tolerance, hint, runtime, and backend.
@@ -1278,7 +1267,6 @@ def generate_likelihood_partition_starts(
             result = partition_constrained_observed_refit_torch(
                 data,
                 labels,
-                major_prior=float(major_prior),
                 eps=float(eps),
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
@@ -1291,7 +1279,6 @@ def generate_likelihood_partition_starts(
             result = partition_constrained_observed_refit(
                 data,
                 labels,
-                major_prior=float(major_prior),
                 eps=float(eps),
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
@@ -1320,7 +1307,6 @@ def generate_likelihood_partition_starts(
                     trace = refine_partition_likelihood_torch_with_trace(
                         data,
                         labels,
-                        major_prior=float(major_prior),
                         eps=float(eps),
                         tol=float(tol),
                         max_iter=int(cem_max_iter),
@@ -1338,7 +1324,6 @@ def generate_likelihood_partition_starts(
                     trace = refine_partition_likelihood_with_trace(
                         data,
                         labels,
-                        major_prior=float(major_prior),
                         eps=float(eps),
                         tol=float(tol),
                         max_iter=int(cem_max_iter),

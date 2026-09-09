@@ -1,4 +1,4 @@
-"""Command-line interface for CliPP2 simulation generation."""
+"""Source-tree-only command-line interface for matched simulation generation."""
 
 from __future__ import annotations
 

@@ -20,17 +20,10 @@ from ..objective import (
     observed_internal_breakpoints_torch,
     observed_one_sided_gradients_torch,
 )
-from .defaults import (
-    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    DEFAULT_CERTIFICATE_MAX_ITER,
-    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
-    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
-    DEFAULT_DENSE_FALLBACK_POLICY,
+from ...config import (
+    SolverConfig,
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
-    DEFAULT_WORKSET_ADD_BATCH,
-    DEFAULT_WORKSET_MAX_BYTES,
-    DEFAULT_WORKSET_MAX_EXPANSIONS,
     normalize_dense_fallback_policy,
 )
 from .certificates import (
@@ -93,10 +86,9 @@ from .types import (
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
     RawFit,
-    SolverContext,
+    PreparedProblem,
     SolverState,
     TensorFusionGraph,
-    TensorProblem,
     TorchRuntime,
     WorkCounters,
     WorksetMemoryOptions,
@@ -130,7 +122,7 @@ def _float64_audit_context(
         cached = cache.get(key)
         if cached is not None:
             if not isinstance(cached, _Float64AuditContext):
-                raise TypeError("SolverContext float64 audit cache is corrupted.")
+                raise TypeError("PreparedProblem float64 audit cache is corrupted.")
             return cached
     runtime = TorchRuntime(
         device=device,
@@ -173,7 +165,7 @@ def _terminal_backward_error_audit_float64(
     graph_spec: PairwiseFusionGraph,
     graph_hash: str,
     lambda_value: float,
-    major_prior: float,
+
     eps: float,
     tol: float,
     audit_context_cache: dict[tuple[str, str, str], object] | None = None,
@@ -194,13 +186,12 @@ def _terminal_backward_error_audit_float64(
     terms64 = mutation_region_terms_torch(
         data64,
         phi64,
-        major_prior=float(major_prior),
         eps=float(eps),
     )
     gradient = build_certificate_gradient(
         data64,
         phi=phi64,
-        smooth_gradient=terms64.grad,
+        smooth_gradient=terms64.gradient,
         lower=lower64,
         upper=upper64,
         eps=float(eps),
@@ -221,7 +212,7 @@ def _terminal_backward_error_audit_float64(
         gradient = build_certificate_gradient(
             data64,
             phi=phi64,
-            smooth_gradient=terms64.grad,
+            smooth_gradient=terms64.gradient,
             lower=lower64,
             upper=upper64,
             eps=float(eps),
@@ -339,63 +330,28 @@ _PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
 _CONVEX_GLOBAL_OPTIMALITY_BASIS = "convex_fixed_linear_objective_plus_kkt"
 OBJECTIVE_SHAPE_AUTO = "auto"
-PATH_OBJECTIVE_SHAPE = "generic_nonconvex"
-
-
-def uses_explicit_path_likelihood(data: TumorData) -> bool:
-    """Whether ``data`` carries an explicit categorical occupancy-path model."""
-
-    return getattr(data, "path_likelihood", None) is not None
-
-
-def uses_nonconvex_path_likelihood(data: TumorData) -> bool:
-    """Whether an explicit path family requires generic nonconvex handling."""
-
-    path = getattr(data, "path_likelihood", None)
-    return bool(
-        path is not None and not bool(getattr(path, "has_fixed_linear_emission", False))
-    )
+INTEGER_MIXTURE_OBJECTIVE_SHAPE = "generic_nonconvex"
 
 
 def uses_nonconvex_observed_likelihood(data: TumorData) -> bool:
-    """Whether the observed-data likelihood can contain competing wells.
-
-    A legacy major/minor mixture is no more globally unimodal than an explicit
-    occupancy-path mixture.  Only a fixed linear emission is known to retain
-    the convex binomial-loss contract used by the global KKT claim.
-    """
-
-    legacy_mixture = bool(
-        getattr(data, "path_likelihood", None) is None
-        and np.any(np.asarray(data.multiplicity_estimation_mask, dtype=bool))
-    )
-    return bool(legacy_mixture or uses_nonconvex_path_likelihood(data))
-
-
-def _effective_major_prior(data: TumorData, major_prior: float) -> float:
-    """Canonicalize a legacy option that is absent from fixed-prior path models."""
-
-    if uses_explicit_path_likelihood(data):
-        return 0.5
-    return float(major_prior)
+    """Only a fixed single-candidate linear binomial loss has convex KKT authority."""
+    return bool(np.any(np.asarray(data.major_cn) > 1))
 
 
 def objective_shape_for_data(data: TumorData, requested: str) -> str:
     """Return the only solver shape declaration valid for this likelihood.
 
-    Competing or genuinely piecewise paths can be multimodal and therefore
-    always use the generic route. A path specification whose valid candidates
-    all reduce to the same fixed linear emission reuses the existing scalar
-    route without discarding its path provenance.
+    Competing integer emissions can be multimodal and use the generic route.
+    Only structurally singleton emissions are eligible for the convex route.
     """
 
     normalized = _normalize_objective_shape(requested)
-    if uses_nonconvex_path_likelihood(data):
-        return PATH_OBJECTIVE_SHAPE
+    if uses_nonconvex_observed_likelihood(data):
+        return INTEGER_MIXTURE_OBJECTIVE_SHAPE
     return "unimodal" if normalized == OBJECTIVE_SHAPE_AUTO else normalized
 
 
-def _path_smooth_interval_bounds(
+def _clipping_smooth_interval_bounds(
     torch_data: TorchTumorData,
     phi: torch.Tensor,
     *,
@@ -403,12 +359,11 @@ def _path_smooth_interval_bounds(
     upper: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Restrict one MM trial to the current smooth path interval.
+    """Restrict one MM trial to the current smooth clipping interval.
 
-    The path kernel returns the left derivative at an exact breakpoint, so an
-    exact breakpoint is treated as the upper end of its left interval.  The
-    nonconvex start bank separately seeds both sides of nearby occupancy
-    switches.
+    The kernel returns the left derivative at an exact breakpoint, so an
+    exact breakpoint is treated as the upper end of its left interval.
+    The start bank separately seeds both sides of nearby clipping kinks.
     """
 
     points, valid = observed_internal_breakpoints_torch(
@@ -452,8 +407,8 @@ def _safe_surrogate_curvature_and_gradient(
     surrogate_terms,
     count_observed: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    h_base = torch.clamp(surrogate_terms.hess_upper, min=_MISSING_SURROGATE_CURVATURE)
-    surrogate_grad = surrogate_terms.grad
+    h_base = torch.clamp(surrogate_terms.hessian_upper, min=_MISSING_SURROGATE_CURVATURE)
+    surrogate_grad = surrogate_terms.gradient
     if count_observed is None:
         return h_base, surrogate_grad
 
@@ -740,36 +695,10 @@ def _rebase_certificate_hint(
     )
 
 
-def _tensor_problem_from_torch_data(
-    torch_data: TorchTumorData,
-    *,
-    major_prior: float,
-    eps: float,
-) -> TensorProblem:
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    return TensorProblem(
-        observed_model=torch_data.observed_model,
-        eps=float(eps),
-        major_prior=prior,
-        source_model=torch_data.source_model,
-    )
-
-
-def torch_data_from_context(context: SolverContext) -> TorchTumorData:
-    problem = context.problem
-    return TorchTumorData(
-        observed_model=problem.observed_model,
-        data_fingerprint=context.data_fingerprint,
-        source_model=problem.source_model,
-    )
-
-
 def transfer_scalar_pilot_certificates(
-    source: SolverContext,
-    target: SolverContext,
-) -> SolverContext:
+    source: PreparedProblem,
+    target: PreparedProblem,
+) -> PreparedProblem:
     """Preserve scalar evidence only for the identical model and pilot."""
 
     if not source.scalar_pilot_certificates:
@@ -783,7 +712,7 @@ def transfer_scalar_pilot_certificates(
         or source_model.fingerprint != source.problem.observed_model.source_fingerprint
         or target_model.fingerprint != target.problem.observed_model.source_fingerprint
         or float(source.problem.eps) != float(target.problem.eps)
-        or float(source.problem.major_prior) != float(target.problem.major_prior)
+
         or not torch.equal(
             source.exact_pilot.detach().cpu().double(),
             target.exact_pilot.detach().cpu().double(),
@@ -794,14 +723,15 @@ def transfer_scalar_pilot_certificates(
 
 
 def promote_solver_context_dtype(
-    context: SolverContext,
+    context: PreparedProblem,
     *,
     dtype: torch.dtype,
     device: torch.device | None = None,
     start_override: np.ndarray | torch.Tensor | None = None,
-) -> SolverContext:
+) -> PreparedProblem:
     """Rebuild one frozen objective from its immutable host sources."""
 
+    context.assert_runtime_unchanged()
     if dtype not in {torch.float32, torch.float64}:
         raise ValueError("Promoted solver contexts require float32 or float64.")
     target_device = context.runtime.device if device is None else torch.device(device)
@@ -813,9 +743,9 @@ def promote_solver_context_dtype(
         return context
     source_model = context.problem.source_model
     if source_model is None:
-        raise ValueError("SolverContext lacks an immutable observed-model source.")
+        raise ValueError("PreparedProblem lacks an immutable observed-model source.")
     promoted_data = copy_torch_tumor_data(
-        torch_data_from_context(context),
+        context.problem,
         dtype=dtype,
         device=target_device,
     )
@@ -829,11 +759,6 @@ def promote_solver_context_dtype(
         context.graph_spec,
         runtime,
         num_nodes=int(source_model.shape[0]),
-    )
-    problem = _tensor_problem_from_torch_data(
-        promoted_data,
-        major_prior=float(context.problem.major_prior),
-        eps=float(context.problem.eps),
     )
     override = (
         None
@@ -852,7 +777,8 @@ def promote_solver_context_dtype(
         wells = ()
     return replace(
         context,
-        problem=problem,
+        _tensor_snapshot=(),
+        problem=promoted_data,
         graph=graph,
         exact_pilot=exact,
         pooled_start=pooled,
@@ -900,11 +826,11 @@ def _require_dense_memory(
 
 def _float64_context(
     data: TumorData,
-    context: SolverContext,
+    context: PreparedProblem,
     *,
     device: torch.device | None = None,
     cause: BaseException | None = None,
-) -> SolverContext:
+) -> PreparedProblem:
     target = context.runtime.device if device is None else torch.device(device)
     runtime = replace(
         context.runtime,
@@ -927,7 +853,7 @@ def _float64_context(
 def _finalize_precision_polish(
     polished: RawFit,
     working: RawFit,
-    source_context: SolverContext,
+    source_context: PreparedProblem,
     *,
     on_cpu: bool,
 ) -> RawFit:
@@ -989,7 +915,7 @@ def _finalize_precision_polish(
 def escape_path_breakpoint_solver_state(
     state: SolverState | None,
     *,
-    context: SolverContext,
+    context: PreparedProblem,
     tol: float,
 ) -> tuple[SolverState | None, int]:
     """Nudge a failed dense-certificate state off exact path breakpoints.
@@ -1004,7 +930,7 @@ def escape_path_breakpoint_solver_state(
     model = context.problem.observed_model
     if (
         state is None
-        or model.model_id == "legacy_major_low_as_paths_v2"
+
         or not isinstance(certificate, DenseEdgeCertificate)
         or certificate.certificate_scope != "full_original_graph"
         or certificate.gradient_scope == "mm_surrogate"
@@ -1028,7 +954,7 @@ def escape_path_breakpoint_solver_state(
     ):
         return state, 0
 
-    torch_data = torch_data_from_context(context)
+    torch_data = context.problem
     with torch.no_grad():
         fusion_adjustment = graph_adjoint_edges(
             dual,
@@ -1106,7 +1032,7 @@ def escape_path_breakpoint_solver_state(
 def prepare_torch_problem(
     data: TumorData,
     *,
-    major_prior: float,
+
     eps: float,
     tol: float,
     inner_max_iter: int,
@@ -1126,17 +1052,17 @@ def prepare_torch_problem(
     torch_data: TorchTumorData | None = None,
     objective_shape: str = OBJECTIVE_SHAPE_AUTO,
     defer_graph: bool = False,
-) -> SolverContext:
+    verbose: bool = False,
+) -> PreparedProblem:
     tol = _validate_solver_tolerance(tol)
     objective_shape = objective_shape_for_data(data, objective_shape)
-    major_prior = _effective_major_prior(data, major_prior)
+
     use_unimodal_objective = objective_shape.startswith("unimodal")
     effective_runtime = (
         resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     )
     source_model = compile_observed_model(
         data,
-        major_prior=float(major_prior),
         eps=float(eps),
     )
     if torch_data is None:
@@ -1144,6 +1070,7 @@ def prepare_torch_problem(
             data,
             effective_runtime,
             source_model=source_model,
+            eps=float(eps),
         )
         data_fingerprint = effective_torch_data.data_fingerprint
     else:
@@ -1151,6 +1078,7 @@ def prepare_torch_problem(
             torch_data,
             source_model=source_model,
             observed_model=model_to_torch(source_model, effective_runtime),
+            eps=float(eps),
         )
         data_fingerprint = tumor_data_fingerprint(data)
         validate_torch_tumor_data(
@@ -1158,6 +1086,7 @@ def prepare_torch_problem(
             data=data,
             runtime=effective_runtime,
             expected_fingerprint=data_fingerprint,
+            eps=float(eps),
         )
 
     pilot_certificates = (
@@ -1169,7 +1098,6 @@ def prepare_torch_problem(
             compute_scalar_mutation_region_wells_torch(
                 effective_torch_data,
                 phi_init=data.phi_init,
-                major_prior=float(major_prior),
                 eps=float(eps),
                 tol=tol,
                 max_iter=max(int(inner_max_iter), 16),
@@ -1183,7 +1111,6 @@ def prepare_torch_problem(
                 compute_scalar_mutation_region_wells_torch(
                     effective_torch_data,
                     phi_init=data.phi_init,
-                    major_prior=float(major_prior),
                     eps=float(eps),
                     tol=tol,
                     max_iter=max(int(inner_max_iter), 16),
@@ -1267,7 +1194,6 @@ def prepare_torch_problem(
     elif pooled_start is None:
         pooled_start_tensor = compute_pooled_observed_data_start_torch(
             effective_torch_data,
-            major_prior=float(major_prior),
             eps=float(eps),
             tol=tol,
             max_iter=max(int(inner_max_iter), 16),
@@ -1299,11 +1225,6 @@ def prepare_torch_problem(
         dtype=effective_runtime.dtype,
         device=effective_runtime.device,
     )
-    problem = _tensor_problem_from_torch_data(
-        effective_torch_data,
-        major_prior=float(major_prior),
-        eps=float(eps),
-    )
     graph_hash = effective_graph.fingerprint
     base_objective_key = make_base_objective_key(
         source_model,
@@ -1314,8 +1235,9 @@ def prepare_torch_problem(
     )
     base_fusion_objective_hash = base_objective_key.fingerprint
     objective_spec_hash = base_fusion_objective_hash
-    return SolverContext(
-        problem=problem,
+    return PreparedProblem(
+        source_data=data,
+        problem=effective_torch_data,
         graph=tensor_graph,
         graph_spec=effective_graph,
         exact_pilot=exact_pilot_tensor,
@@ -1332,7 +1254,13 @@ def prepare_torch_problem(
         objective_spec_hash=objective_spec_hash,
         base_fusion_objective_hash=base_fusion_objective_hash,
         base_objective_key=base_objective_key,
+        verbose=bool(verbose),
         scalar_pilot_certificates=tuple(pilot_certificates or ()),
+        adaptive_graph_options=(
+            (float(adaptive_weight_gamma), float(adaptive_weight_floor),
+             float(adaptive_weight_baseline))
+            if graph is None and not defer_graph else None
+        ),
     )
 
 
@@ -1342,7 +1270,7 @@ def prepare_torch_problem_with_resource_policy(
     dense_fallback_policy: str,
     inherited_resource_fallback: str | None = None,
     **prepare_kwargs,
-) -> SolverContext:
+) -> PreparedProblem:
     """Prepare an immutable context under the same typed fallback policy as fits."""
     normalized_policy = normalize_dense_fallback_policy(dense_fallback_policy)
     kwargs = dict(prepare_kwargs)
@@ -1370,7 +1298,7 @@ def prepare_torch_problem_with_resource_policy(
             ) from exc
         resolved_by_cpu_fallback = True
 
-    def prepare_on_runtime(*, retain_torch_data: bool) -> SolverContext:
+    def prepare_on_runtime(*, retain_torch_data: bool) -> PreparedProblem:
         reusable_tensor_graph = supplied_prebuilt_tensor_graph
         graph_runtime = None if reusable_tensor_graph is None else (
             reusable_tensor_graph.weight.device,
@@ -1388,7 +1316,7 @@ def prepare_torch_problem_with_resource_policy(
             **kwargs,
         )
         fallback = "dense_cpu" if resolved_by_cpu_fallback else inherited_resource_fallback
-        return replace(context, resource_fallback=fallback)
+        return replace(context, resource_fallback=fallback, fallback_policy=normalized_policy)
 
     while True:
         if resolved_by_cpu_fallback:
@@ -1631,7 +1559,7 @@ def _fit_from_start(
     base_objective_key: BaseObjectiveKey,
     objective_spec_hash: str,
     lambda_value: float,
-    major_prior: float,
+
     eps: float,
     outer_max_iter: int,
     inner_max_iter: int,
@@ -1788,7 +1716,7 @@ def _fit_from_start(
     full_step_curvature_multiplier = torch.ones_like(phi)
 
     current_mutation_region_terms = mutation_region_terms_torch(
-        torch_data, phi, major_prior=major_prior, eps=eps
+        torch_data, phi, eps=eps
     )
     fit_loss, penalty, objective = (
         _objective_value_from_mutation_region_terms_torch(
@@ -1808,7 +1736,7 @@ def _fit_from_start(
             surrogate_terms = current_mutation_region_terms
             surrogate_fit_loss = float(fit_loss)
         else:
-            responsibilities = current_mutation_region_terms.path_posterior
+            responsibilities = current_mutation_region_terms.posterior
             if responsibilities is None:
                 raise AssertionError("Observed terms lack path responsibilities.")
             surrogate_terms = em_surrogate_terms_torch(
@@ -1825,7 +1753,7 @@ def _fit_from_start(
         if use_unimodal_objective:
             smooth_lower, smooth_upper = lower, upper
         else:
-            smooth_lower, smooth_upper = _path_smooth_interval_bounds(
+            smooth_lower, smooth_upper = _clipping_smooth_interval_bounds(
                 torch_data,
                 phi,
                 lower=lower,
@@ -1843,7 +1771,7 @@ def _fit_from_start(
             forcing_gradient = build_certificate_gradient(
                 torch_data,
                 phi=phi,
-                smooth_gradient=current_mutation_region_terms.grad,
+                smooth_gradient=current_mutation_region_terms.gradient,
                 lower=lower,
                 upper=upper,
                 eps=eps,
@@ -1996,7 +1924,7 @@ def _fit_from_start(
                 inner_dual_start_is_actual = bool(use_alm)
             delta = phi_trial - phi
             trial_mutation_region_terms = mutation_region_terms_torch(
-                torch_data, phi_trial, major_prior=major_prior, eps=eps
+                torch_data, phi_trial, eps=eps
             )
             trial_fit_loss, _, trial_objective = (
                 _objective_value_from_mutation_region_terms_torch(
@@ -2019,7 +1947,7 @@ def _fit_from_start(
             else:
                 quadratic_gap = float(
                     torch.sum(
-                        surrogate_terms.grad * delta + 0.5 * h * torch.square(delta)
+                        surrogate_terms.gradient * delta + 0.5 * h * torch.square(delta)
                     ).item()
                 )
                 majorizer_rhs = surrogate_fit_loss + quadratic_gap
@@ -2217,7 +2145,7 @@ def _fit_from_start(
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
                 theta_mutation_region_terms = mutation_region_terms_torch(
-                    torch_data, phi_theta, major_prior=major_prior, eps=eps
+                    torch_data, phi_theta, eps=eps
                 )
                 theta_fit_loss, _, theta_objective = (
                     _objective_value_from_mutation_region_terms_torch(
@@ -2325,7 +2253,7 @@ def _fit_from_start(
             periodic_gradient = build_certificate_gradient(
                 torch_data,
                 phi,
-                smooth_gradient=outer_terms.grad,
+                smooth_gradient=outer_terms.gradient,
                 lower=lower,
                 upper=upper,
                 eps=eps,
@@ -2395,7 +2323,7 @@ def _fit_from_start(
     certificate_gradient = build_certificate_gradient(
         torch_data,
         phi,
-        smooth_gradient=final_terms.grad,
+        smooth_gradient=final_terms.gradient,
         lower=lower,
         upper=upper,
         eps=eps,
@@ -2438,7 +2366,7 @@ def _fit_from_start(
         next_gradient = build_certificate_gradient(
             torch_data,
             phi,
-            smooth_gradient=final_terms.grad,
+            smooth_gradient=final_terms.gradient,
             lower=lower,
             upper=upper,
             eps=eps,
@@ -2497,7 +2425,6 @@ def _fit_from_start(
             graph_spec=graph,
             graph_hash=graph_hash,
             lambda_value=lambda_value,
-            major_prior=major_prior,
             eps=eps,
             tol=cert_tol,
             audit_context_cache=audit_context_cache,
@@ -2663,124 +2590,79 @@ def _fit_from_start(
     )
 
 
-def fit_observed_data_pairwise_fusion(
-    data: TumorData,
-    *,
-    lambda_value: float,
-    major_prior: float,
-    eps: float,
-    outer_max_iter: int,
-    inner_max_iter: int,
-    tol: float,
-    certification_tol: float | None = None,
-    use_backward_error_progress: bool = False,
-    phi_start: np.ndarray | torch.Tensor | None = None,
-    graph: PairwiseFusionGraph | None = None,
-    adaptive_weight_gamma: float = 1.0,
-    adaptive_weight_floor: float = 1e-6,
-    adaptive_weight_baseline: float = 1.0,
-    exact_pilot: np.ndarray | torch.Tensor | None = None,
-    pooled_start: np.ndarray | torch.Tensor | None = None,
-    scalar_well_starts: list[np.ndarray | torch.Tensor]
-    | tuple[np.ndarray | torch.Tensor, ...]
-    | None = None,
-    start_mode: str = "full",
-    append_default_nonconvex_starts: bool | None = None,
-    device: str | None = DEFAULT_DEVICE,
-    dtype: str | None = DEFAULT_DTYPE,
-    runtime=None,
-    torch_data=None,
-    solver_context: SolverContext | None = None,
-    solver_state: SolverState | None = None,
-    objective_shape: str = OBJECTIVE_SHAPE_AUTO,
-    workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES,
-    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
-    dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY,
-    workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH,
-    workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS,
-    certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER,
-    certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
-    certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    verbose: bool = False,
-) -> RawFit:
-    tol = _validate_solver_tolerance(tol)
-    certification_tol = _validate_solver_tolerance(
-        tol if certification_tol is None else certification_tol
-    )
-    lambda_value = validate_lambda_value(lambda_value)
-    objective_shape = objective_shape_for_data(data, objective_shape)
-    major_prior = _effective_major_prior(data, major_prior)
-    normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
-    if solver_context is None:
-        solver_context = prepare_torch_problem_with_resource_policy(
-            data,
-            dense_fallback_policy=normalized_fallback_policy,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=tol,
-            inner_max_iter=int(inner_max_iter),
-            graph=graph,
-            adaptive_weight_gamma=float(adaptive_weight_gamma),
-            adaptive_weight_floor=float(adaptive_weight_floor),
-            adaptive_weight_baseline=float(adaptive_weight_baseline),
-            exact_pilot=exact_pilot,
-            pooled_start=pooled_start,
-            scalar_well_starts=scalar_well_starts,
-            device=device,
-            dtype=dtype,
-            runtime=runtime,
-            torch_data=torch_data,
-            objective_shape=objective_shape,
-        )
-    else:
-        expected_data_fingerprint = tumor_data_fingerprint(data)
-        if (
-            getattr(solver_context, "data_fingerprint", None)
-            != expected_data_fingerprint
-        ):
-            raise ValueError(
-                "SolverContext data fingerprint does not match the requested TumorData."
-            )
-        if (
-            abs(float(solver_context.problem.major_prior) - float(major_prior)) > 0.0
-            or abs(float(solver_context.problem.eps) - float(eps)) > 0.0
-        ):
-            raise ValueError(
-                "SolverContext major_prior/eps do not match the requested fit options."
-            )
-
-    context_prepared_by_cpu_fallback = bool(
-        solver_context.resource_fallback == "dense_cpu"
-    )
-    effective_runtime = solver_context.runtime
-    effective_exact_pilot = (
-        solver_context.exact_pilot if exact_pilot is None else exact_pilot
-    )
-    effective_pooled_start = (
-        solver_context.pooled_start if pooled_start is None else pooled_start
-    )
-    effective_scalar_well_starts = (
-        solver_context.scalar_well_starts
-        if scalar_well_starts is None
-        else tuple(scalar_well_starts)
+def _validate_prepared_problem(context: PreparedProblem) -> None:
+    """Validate frozen source identity without accepting a competing request."""
+    context.assert_runtime_unchanged()
+    data = context.source_data
+    if context.data_fingerprint != tumor_data_fingerprint(data):
+        raise ValueError("Prepared problem data fingerprint is inconsistent.")
+    source = compile_observed_model(data, eps=context.problem.eps)
+    if (
+        context.problem.source_model is None
+        or context.problem.source_model.fingerprint != source.fingerprint
+    ):
+        raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
+    if context.graph_spec.name == "deferred_likelihood_pilot":
+        raise ValueError("A deferred likelihood pilot is not a prepared fusion graph.")
+    if context.graph_hash != context.graph_spec.fingerprint:
+        raise ValueError("Prepared problem graph identity is inconsistent.")
+    key = make_base_objective_key(
+        source, graph_hash=context.graph_hash, eps=context.problem.eps,
+        lower=source.lower, upper=source.upper,
     )
     if (
-        uses_explicit_path_likelihood(data)
-        and not effective_scalar_well_starts
-        and solver_context.scalar_well_starts
+        context.base_objective_key != key
+        or context.objective_spec_hash != key.fingerprint
+        or context.base_fusion_objective_hash != key.fingerprint
     ):
-        effective_scalar_well_starts = solver_context.scalar_well_starts
+        raise ValueError("Prepared problem objective identity is inconsistent.")
 
-    normalized_start_mode = str(start_mode).strip().lower()
-    if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
-        raise ValueError(f"Unknown start_mode: {start_mode}")
-    append_defaults = normalized_start_mode == "full"
-    if append_default_nonconvex_starts is None:
-        append_defaults = bool(
-            append_defaults or uses_explicit_path_likelihood(data)
-        )
-    else:
-        append_defaults = bool(append_default_nonconvex_starts)
+
+def fit_prepared(
+    problem: PreparedProblem,
+    lambda_value: float,
+    solver_options: SolverConfig,
+    *,
+    warm_state: SolverState | None = None,
+    phi_start: np.ndarray | torch.Tensor | None = None,
+    include_default_starts: bool = True,
+) -> RawFit:
+    """Solve a lambda on one frozen objective; no competing data/graph/runtime.
+
+    Warm state and starts may change numerical effort, never the compiled
+    likelihood, adaptive graph, epsilon, or float64 source authority.
+    """
+    _validate_prepared_problem(problem)
+    solver_context = problem
+    data = problem.source_data
+    eps = float(problem.problem.eps)
+    solver_state = warm_state
+    tol = _validate_solver_tolerance(solver_options.tolerance)
+    certification_tol = _validate_solver_tolerance(
+        tol if solver_options.certification_tolerance is None
+        else solver_options.certification_tolerance
+    )
+    lambda_value = validate_lambda_value(lambda_value)
+    objective_shape = objective_shape_for_data(data, solver_options.objective_shape)
+    outer_max_iter = max(int(solver_options.outer_max_iter), 1)
+    inner_max_iter = max(int(solver_options.inner_max_iter), 16)
+    use_backward_error_progress = bool(solver_options.use_backward_error_progress)
+    resources = solver_options.resources
+    workset_max_bytes = int(resources.workset_max_bytes)
+    compressed_cache_max_bytes = int(resources.compressed_cache_max_bytes)
+    workset_add_batch = int(resources.workset_add_batch)
+    workset_max_expansions = int(resources.workset_max_expansions)
+    certificate = solver_options.certificate
+    certificate_max_iter = int(certificate.max_iter)
+    certificate_refinement_rounds = int(certificate.refinement_rounds)
+    certificate_column_tol_scale = float(certificate.column_tolerance_scale)
+    verbose = bool(problem.verbose)
+    normalized_fallback_policy = normalize_dense_fallback_policy(problem.fallback_policy)
+    context_prepared_by_cpu_fallback = problem.resource_fallback == "dense_cpu"
+    effective_runtime = problem.runtime
+    effective_exact_pilot = problem.exact_pilot
+    effective_pooled_start = problem.pooled_start
+    effective_scalar_well_starts = problem.scalar_well_starts
 
     if objective_shape.startswith("unimodal"):
         start_bank = [phi_start] if phi_start is not None else [effective_exact_pilot]
@@ -2788,23 +2670,23 @@ def fit_observed_data_pairwise_fusion(
         start_bank: list[np.ndarray | torch.Tensor] = []
         if phi_start is not None:
             start_bank.append(phi_start)
-        if append_defaults:
+        if include_default_starts:
             start_bank.extend(effective_scalar_well_starts)
             start_bank.append(effective_pooled_start)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     def solve_start_once(
         *,
-        context: SolverContext,
+        context: PreparedProblem,
         start: np.ndarray | torch.Tensor,
         state: SolverState | None,
         polish: bool = False,
     ) -> RawFit:
         if context.base_objective_key is None:
-            raise ValueError("SolverContext lacks a typed base-objective key.")
+            raise ValueError("PreparedProblem lacks a typed base-objective key.")
         return _fit_from_start(
             data,
-            torch_data=torch_data_from_context(context),
+            torch_data=context.problem,
             runtime=context.runtime,
             graph=context.graph_spec,
             tensor_graph=context.graph,
@@ -2812,7 +2694,6 @@ def fit_observed_data_pairwise_fusion(
             base_objective_key=context.base_objective_key,
             objective_spec_hash=str(context.objective_spec_hash),
             lambda_value=lambda_value,
-            major_prior=major_prior,
             eps=eps,
             outer_max_iter=1 if polish else outer_max_iter,
             inner_max_iter=inner_max_iter,
@@ -2836,11 +2717,11 @@ def fit_observed_data_pairwise_fusion(
             scalar_pilot_certificates=context.scalar_pilot_certificates,
         )
 
-    cpu_fallback_context: SolverContext | None = None
+    cpu_fallback_context: PreparedProblem | None = None
     best_artifacts: RawFit | None = None
     best_artifacts_index = -1
     start_artifacts: list[RawFit] = []
-    start_contexts: list[SolverContext] = []
+    start_contexts: list[PreparedProblem] = []
     for start in start_bank:
         state_for_start = (
             solver_state
@@ -2985,7 +2866,7 @@ def fit_observed_data_pairwise_fusion(
         raise AssertionError("Best multistart fit lacks a source context.")
     selected_start_context = start_contexts[best_artifacts_index]
     working_artifacts = best_artifacts
-    precision_context: SolverContext | None = None
+    precision_context: PreparedProblem | None = None
     precision_on_cpu = False
     policy_state = PolicyState(
         phase="selected",

@@ -8,9 +8,13 @@ from ._version import __version__
 
 _EXPORTS = {
     "FitConfig": ".config",
-    "FitResult": ".core.model",
+    "FitResult": ".api",
     "TumorData": ".io.data",
-    "fit_fixed_objective": ".core.model",
+    "fit_fixed_objective": ".api",
+    "prepare_problem": ".api",
+    "PreparedProblem": ".core.fusion.types",
+    "fit_prepared": ".core.fusion.solver",
+    "process_tumor": ".api",
     "load_tumor_txt": ".io.tumor_txt",
     "resolve_fit_config": ".config",
 }
@@ -21,6 +25,10 @@ __all__ = [
     "TumorData",
     "__version__",
     "fit_fixed_objective",
+    "prepare_problem",
+    "PreparedProblem",
+    "fit_prepared",
+    "process_tumor",
     "load_tumor_txt",
     "resolve_fit_config",
 ]

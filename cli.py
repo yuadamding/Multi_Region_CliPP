@@ -4,7 +4,7 @@ import argparse
 import math
 from pathlib import Path
 
-from .core.fusion.defaults import (
+from .config import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_DENSE_FALLBACK_POLICY,
@@ -16,38 +16,11 @@ from .core.fusion.defaults import (
     normalize_dense_fallback_policy,
 )
 
-from .core.fusion.profiles import (
+from .config import (
     COMPUTATION_PROFILE_NAMES,
     DEFAULT_COMPUTATION_PROFILE,
 )
 from .config import FitConfig, resolve_fit_config
-from .model_selection.contracts import (
-    DEFAULT_SELECTION_CONTRACT,
-    SELECTION_CONTRACT_IDS,
-)
-from .simulation.cli import (
-    add_simulation_arguments,
-    tumor_simulation_config_from_args,
-)
-
-
-def _selection_score_argument(value: str) -> str:
-    normalized = str(value).strip().lower().replace("_", "-")
-    if normalized.startswith("clonal-"):
-        raise argparse.ArgumentTypeError(
-            "clonal-anchor selection scores were removed; use "
-            "fixed-partition-dirichlet-score or fixed-partition-bic"
-        )
-    allowed = {
-        "fixed-partition-dirichlet-score",
-        "fixed-partition-bic",
-    }
-    if normalized not in allowed:
-        raise argparse.ArgumentTypeError(
-            "selection score must be fixed-partition-dirichlet-score, "
-            "or fixed-partition-bic"
-        )
-    return normalized
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
@@ -63,46 +36,13 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             "all profiles use a bounded lambda search."
         ),
     )
-    parser.add_argument(
-        "--unsupported-policy", choices=["error", "mask"], default="error",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--dosage-prior-penalty",
-        type=float,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--outer-max-iter", type=int, default=None)
     parser.add_argument("--inner-max-iter", type=int, default=None)
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--selection-partition-tol", type=float, default=None)
     parser.add_argument("--selection-refit-tol", type=float, default=None)
     parser.add_argument("--selection-refit-max-iter", type=int, default=None)
-    parser.add_argument(
-        "--selection-contract",
-        choices=SELECTION_CONTRACT_IDS,
-        default=DEFAULT_SELECTION_CONTRACT,
-        help=(
-            "Immutable partition-selection contract. Raw-only selects "
-            "certified raw partitions; hybrid adds Ward/CEM partitions. The "
-            "legacy contract retains its selection settings, not the old "
-            "likelihood: every public input uses the clonal integer mixture."
-        ),
-    )
-    parser.add_argument(
-        "--selection-score",
-        type=_selection_score_argument,
-        default="fixed-partition-dirichlet-score",
-        help=(
-            "Fixed-label selection criterion. The Dirichlet score is BIC plus "
-            "the active selection contract's declared weight times the "
-            "deviance of one exact allocation under its integrated symmetric "
-            "Dirichlet prior. This is not posterior-entropy ICL."
-        ),
-    )
     parser.add_argument("--disable-warm-start", action="store_true")
-    parser.add_argument("--major-prior", type=float, default=0.5, help=argparse.SUPPRESS)
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default=DEFAULT_DEVICE
     )
@@ -160,10 +100,6 @@ def build_parser() -> argparse.ArgumentParser:
         "fit", formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     _add_fit_args(fit_parser)
-    simulate_parser = subparsers.add_parser(
-        "simulate", formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    add_simulation_arguments(simulate_parser)
     return parser
 
 
@@ -171,21 +107,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "fit":
-        if args.dosage_prior_penalty is not None:
-            parser.error(
-                "--dosage-prior-penalty was removed: integer candidates have "
-                "fixed uniform priors. Omit this option."
-            )
-        if args.major_prior != 0.5:
-            parser.error(
-                "--major-prior is obsolete: integer candidates have fixed "
-                "uniform priors. Omit this option."
-            )
-        if args.unsupported_policy != "error":
-            parser.error(
-                "--unsupported-policy mask was removed: subclonal CN and "
-                "major CN > 6 exclude the entire mutation across all samples."
-            )
         for option_name in (
             "selection_partition_tol",
             "selection_refit_tol",
@@ -211,12 +132,9 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
-        selection_score=args.selection_score.replace("-", "_"),
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
         selection_refit_max_iter=args.selection_refit_max_iter,
-        selection_contract=args.selection_contract,
-        major_prior=args.major_prior,
         device=args.device,
         dtype=args.dtype,
         workset_max_bytes=args.workset_max_bytes,
@@ -253,12 +171,7 @@ def _printable_summary(value: object) -> object:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    if args.command == "simulate":
-        from .simulation import simulate_tumor
-
-        print(simulate_tumor(tumor_simulation_config_from_args(args)))
-        return
-    from .runners.pipeline import process_tumor
+    from .api import process_tumor
 
     summary = process_tumor(
         tumor_file=Path(args.input_file),
@@ -266,8 +179,6 @@ def main(argv: list[str] | None = None) -> None:
         fit_config=_fit_config_from_args(args),
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_outputs,
-        unsupported_policy=args.unsupported_policy,
-        dosage_prior_penalty=args.dosage_prior_penalty,
     )
     print(_printable_summary(summary))
 

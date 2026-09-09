@@ -1,7 +1,7 @@
 """Canonical source representation of CliPP2's observed-count likelihood.
 
-Both the historical major/minor model and an explicit occupancy-path model are
-represented as mixtures of clipped piecewise-affine binomial emissions.
+The supported model is a uniform mixture over clonal integer multiplicities,
+represented by clipped linear binomial emissions.
 Runtime tensors are always rebuilt from immutable float64 source arrays; a
 lower-precision runtime is never the source of a higher-precision view.
 """
@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from ..io.data import readonly_array as _readonly_array
 from ..io.multiplicity import (
     CLONAL_INTEGER_MODEL_ID,
     build_clonal_integer_likelihood,
@@ -25,17 +26,11 @@ if TYPE_CHECKING:
     from .fusion.types import TorchRuntime
 
 
-_MODEL_FINGERPRINT_SCHEMA = "clipp2.observed-model.v1"
-_LIKELIHOOD_FINGERPRINT_SCHEMA = "clipp2.observed-likelihood.v1"
+_MODEL_FINGERPRINT_SCHEMA = "clipp2.observed-model.linear.v2"
+_LIKELIHOOD_FINGERPRINT_SCHEMA = "clipp2.observed-likelihood.linear.v2"
 _BOX_FINGERPRINT_SCHEMA = "clipp2.objective-box.v1"
 _BASE_OBJECTIVE_KEY_SCHEMA = "clipp2.base-objective-key.v1"
 _LAMBDA_OBJECTIVE_KEY_SCHEMA = "clipp2.lambda-objective-key.v1"
-
-
-def _readonly_array(value: object, *, dtype: np.dtype) -> np.ndarray:
-    array = np.array(value, dtype=dtype, copy=True, order="C")
-    array.setflags(write=False)
-    return array
 
 
 def _hash_text(digest: object, value: str) -> None:
@@ -65,9 +60,7 @@ def _model_fingerprint(model: "ObservedModel") -> str:
         "observed",
         "lower",
         "upper",
-        "first_scale",
-        "second_scale",
-        "switch",
+        "slope",
         "log_prior",
         "valid",
     ):
@@ -84,9 +77,7 @@ def _likelihood_fingerprint(model: "ObservedModel") -> str:
         "alt",
         "nonalt",
         "observed",
-        "first_scale",
-        "second_scale",
-        "switch",
+        "slope",
         "log_prior",
         "valid",
     ):
@@ -150,14 +141,9 @@ class LambdaObjectiveKey:
 class ObservedModel:
     """Immutable float64 source model for observed mutation counts.
 
-    The path arrays have shape ``(mutation, region, path)``.  For CCF ``phi``,
-    a path's scaled mutant-copy mass is
-
-    ``first_scale * min(phi, switch) + second_scale * max(phi-switch, 0)``.
-
-    ``legacy_major`` is reporting metadata and is deliberately excluded from
-    the numerical fingerprint.  ``model_id`` likewise names the source family
-    without changing the represented likelihood.
+    Candidate arrays have shape ``(mutation, region, candidate)``. A
+    candidate's scaled mutant-copy mass is ``slope * phi``. Runtime views
+    are reconstructed from these immutable float64 sources.
     """
 
     alt: np.ndarray
@@ -165,12 +151,9 @@ class ObservedModel:
     observed: np.ndarray
     lower: np.ndarray
     upper: np.ndarray
-    first_scale: np.ndarray
-    second_scale: np.ndarray
-    switch: np.ndarray
+    slope: np.ndarray
     log_prior: np.ndarray
     valid: np.ndarray
-    legacy_major: np.ndarray | None
     model_id: str
     fingerprint: str = field(init=False)
     likelihood_fingerprint: str = field(init=False)
@@ -205,9 +188,9 @@ class ObservedModel:
 
         path_arrays = {
             name: np.array(getattr(self, name), dtype=np.float64, copy=True, order="C")
-            for name in ("first_scale", "second_scale", "switch", "log_prior")
+            for name in ("slope", "log_prior")
         }
-        path_shape = path_arrays["first_scale"].shape
+        path_shape = path_arrays["slope"].shape
         if len(path_shape) != 3 or path_shape[:2] != shape or not path_shape[2]:
             raise ValueError(
                 "ObservedModel path arrays must have nonempty shape (M, S, K)."
@@ -220,20 +203,13 @@ class ObservedModel:
             raise ValueError(f"ObservedModel.valid must have shape {path_shape}.")
         if not np.all(np.any(valid, axis=-1)):
             raise ValueError("Every mutation-region entry must have a valid path.")
-        for name in ("first_scale", "second_scale"):
-            values = path_arrays[name][valid]
-            if np.any(~np.isfinite(values)) or np.any(values < 0.0):
-                raise ValueError(f"Valid {name} values must be finite and nonnegative.")
-        switches = path_arrays["switch"][valid]
-        if np.any(~np.isfinite(switches)) or np.any(
-            (switches < 0.0) | (switches > 1.0)
-        ):
-            raise ValueError("Valid switch values must be finite and lie in [0, 1].")
+        slopes = path_arrays["slope"][valid]
+        if np.any(~np.isfinite(slopes)) or np.any(slopes < 0.0):
+            raise ValueError("Valid slope values must be finite and nonnegative.")
         if np.any(~np.isfinite(path_arrays["log_prior"][valid])):
             raise ValueError("Valid log_prior values must be finite.")
 
-        for name in ("first_scale", "second_scale", "switch"):
-            path_arrays[name] = np.where(valid, path_arrays[name], 0.0)
+        path_arrays["slope"] = np.where(valid, path_arrays["slope"], 0.0)
         path_arrays["log_prior"] = np.where(
             valid, path_arrays["log_prior"], -np.inf
         )
@@ -256,17 +232,6 @@ class ObservedModel:
         if not np.allclose(normalizer, 0.0, rtol=0.0, atol=1e-10):
             raise ValueError("ObservedModel.log_prior must normalize over valid paths.")
 
-        legacy_major = self.legacy_major
-        if legacy_major is not None:
-            legacy_major = np.array(
-                legacy_major, dtype=bool, copy=True, order="C"
-            )
-            if legacy_major.shape != path_shape:
-                raise ValueError(
-                    f"ObservedModel.legacy_major must have shape {path_shape}."
-                )
-            legacy_major &= valid
-
         model_id = str(self.model_id).strip()
         if not model_id:
             raise ValueError("ObservedModel.model_id must be nonempty.")
@@ -276,13 +241,6 @@ class ObservedModel:
         for name, value in path_arrays.items():
             object.__setattr__(self, name, _readonly_array(value, dtype=np.float64))
         object.__setattr__(self, "valid", _readonly_array(valid, dtype=bool))
-        object.__setattr__(
-            self,
-            "legacy_major",
-            None
-            if legacy_major is None
-            else _readonly_array(legacy_major, dtype=bool),
-        )
         object.__setattr__(self, "model_id", model_id)
         object.__setattr__(self, "fingerprint", _model_fingerprint(self))
         object.__setattr__(
@@ -297,7 +255,7 @@ class ObservedModel:
 
     @property
     def path_shape(self) -> tuple[int, int, int]:
-        return tuple(int(value) for value in self.first_scale.shape)
+        return tuple(int(value) for value in self.slope.shape)
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,12 +267,9 @@ class TorchObservedModel:
     observed: torch.Tensor
     lower: torch.Tensor
     upper: torch.Tensor
-    first_scale: torch.Tensor
-    second_scale: torch.Tensor
-    switch: torch.Tensor
+    slope: torch.Tensor
     log_prior: torch.Tensor
     valid: torch.Tensor
-    legacy_major: torch.Tensor | None
     model_id: str
     source_fingerprint: str
 
@@ -324,7 +279,7 @@ class TorchObservedModel:
 
     @property
     def path_shape(self) -> tuple[int, int, int]:
-        return tuple(int(value) for value in self.first_scale.shape)
+        return tuple(int(value) for value in self.slope.shape)
 
     @property
     def total(self) -> torch.Tensor:
@@ -337,7 +292,6 @@ class ObservedTerms:
     gradient: np.ndarray
     hessian_upper: np.ndarray
     posterior: np.ndarray
-    legacy_major_probability: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,7 +300,6 @@ class TorchObservedTerms:
     gradient: torch.Tensor
     hessian_upper: torch.Tensor
     posterior: torch.Tensor
-    legacy_major_probability: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,78 +316,27 @@ class _TorchPathKernel:
     slope: torch.Tensor
 
 
-def _compile_legacy_as_paths(data: "TumorData", major_prior: float) -> dict[str, object]:
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not 0.0 < prior < 1.0:
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    scaling = np.asarray(data.scaling, dtype=np.float64)
-    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-    fixed = scaling * np.asarray(data.fixed_multiplicity, dtype=np.float64)
-    low = scaling * np.asarray(data.multiplicity_low, dtype=np.float64)
-    major = scaling * np.asarray(data.major_cn, dtype=np.float64)
-    first_scale = np.stack((np.where(ambiguous, low, fixed), major), axis=-1)
-    valid = np.stack((np.ones_like(ambiguous), ambiguous), axis=-1)
-    log_prior = np.stack(
-        (
-            np.where(ambiguous, np.log1p(-prior), 0.0),
-            np.full_like(fixed, np.log(prior)),
-        ),
-        axis=-1,
-    )
-    legacy_major = np.stack((~ambiguous, np.ones_like(ambiguous)), axis=-1)
-    return {
-        "first_scale": first_scale,
-        "second_scale": first_scale.copy(),
-        "switch": np.zeros_like(first_scale),
-        "log_prior": np.where(valid, log_prior, -np.inf),
-        "valid": valid,
-        "legacy_major": legacy_major & valid,
-        "model_id": "legacy_major_low_as_paths_v2",
-    }
-
-
-def _compile_explicit_paths(data: "TumorData") -> dict[str, object]:
+def _compile_integer_candidates(data: "TumorData") -> dict[str, object]:
     spec = data.path_likelihood
-    if spec is None:
-        raise ValueError("TumorData does not contain an explicit path likelihood.")
+    if spec is None or spec.model_id != CLONAL_INTEGER_MODEL_ID:
+        raise ValueError("TumorData must contain the supported clonal integer likelihood.")
     shape = tuple(int(value) for value in np.asarray(data.alt_counts).shape)
     spec.validate_observation_shape(shape)
-    if spec.model_id == CLONAL_INTEGER_MODEL_ID:
-        expected = build_clonal_integer_likelihood(data.major_cn)
-        # Model names are not permission to skip the candidate/prior contract.
-        # Reconstructing this at the compilation boundary also rejects stale
-        # specifications after a caller changes the retained copy numbers.
-        for name in (
-            "first_copy", "second_copy", "switch_fraction", "log_prior", "valid"
-        ):
-            supplied = np.asarray(getattr(spec, name))
-            required = np.asarray(getattr(expected, name))
-            if supplied.shape != required.shape or not np.array_equal(
-                supplied, required
-            ):
-                raise ValueError(
-                    "Clonal integer likelihood requires complete ordered 1..major_cn "
-                    "linear candidates and fixed uniform priors."
-                )
-    elif not np.allclose(
-        np.asarray(data.phi_upper, dtype=np.float64),
-        1.0,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError("An explicit path likelihood requires full CCF support [0, 1].")
+    expected = build_clonal_integer_likelihood(data.major_cn)
+    # A model ID cannot authorize stale candidates or changed priors.
+    for name in ("copies", "log_prior", "valid"):
+        supplied = np.asarray(getattr(spec, name))
+        required = np.asarray(getattr(expected, name))
+        if supplied.shape != required.shape or not np.array_equal(supplied, required):
+            raise ValueError(
+                "Clonal integer likelihood requires complete ordered 1..major_cn "
+                "linear candidates and fixed uniform priors."
+            )
     scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
     return {
-        "first_scale": scale * np.asarray(spec.first_copy, dtype=np.float64),
-        "second_scale": scale * np.asarray(spec.second_copy, dtype=np.float64),
-        "switch": np.asarray(spec.switch_fraction, dtype=np.float64),
+        "slope": scale * np.asarray(spec.copies, dtype=np.float64),
         "log_prior": np.asarray(spec.log_prior, dtype=np.float64),
         "valid": np.asarray(spec.valid, dtype=bool),
-        "legacy_major": (
-            None
-            if spec.legacy_major_indicator is None
-            else np.asarray(spec.legacy_major_indicator, dtype=bool)
-        ),
         "model_id": spec.model_id,
     }
 
@@ -442,14 +344,16 @@ def _compile_explicit_paths(data: "TumorData") -> dict[str, object]:
 def compile_observed_model(
     data: "TumorData",
     *,
-    major_prior: float,
     eps: float,
 ) -> ObservedModel:
-    """Compile either supported likelihood family into one float64 model."""
+    """Compile the supported uniform integer likelihood into float64 sources."""
 
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    cached = data._compiled_models.get(epsilon)
+    if cached is not None:
+        return cached
     alt = np.asarray(data.alt_counts, dtype=np.float64)
     total = np.asarray(data.total_counts, dtype=np.float64)
     if alt.shape != total.shape:
@@ -460,19 +364,15 @@ def compile_observed_model(
         if observed_value is None
         else np.asarray(observed_value, dtype=bool)
     )
-    compiled = (
-        _compile_legacy_as_paths(data, major_prior)
-        if getattr(data, "path_likelihood", None) is None
-        else _compile_explicit_paths(data)
-    )
-    return ObservedModel(
+    model = ObservedModel(
         alt=alt,
         nonalt=total - alt,
         observed=observed,
         lower=np.full(alt.shape, epsilon, dtype=np.float64),
         upper=np.asarray(data.phi_upper, dtype=np.float64),
-        **compiled,
+        **_compile_integer_candidates(data),
     )
+    return data._compiled_models.setdefault(epsilon, model)
 
 
 def model_to_torch(
@@ -500,14 +400,9 @@ def model_to_torch(
         observed=boolean(model.observed),
         lower=numeric(model.lower),
         upper=numeric(model.upper),
-        first_scale=numeric(model.first_scale),
-        second_scale=numeric(model.second_scale),
-        switch=numeric(model.switch),
+        slope=numeric(model.slope),
         log_prior=numeric(model.log_prior),
         valid=boolean(model.valid),
-        legacy_major=(
-            None if model.legacy_major is None else boolean(model.legacy_major)
-        ),
         model_id=model.model_id,
         source_fingerprint=model.fingerprint,
     )
@@ -577,18 +472,11 @@ def _path_kernel_numpy(
     phi_array = np.asarray(phi, dtype=np.float64)
     if phi_array.shape != model.shape or not np.all(np.isfinite(phi_array)):
         raise ValueError(f"phi must be a finite array with shape {model.shape}.")
-    expanded_phi = phi_array[..., None]
-    mass = model.first_scale * np.minimum(expanded_phi, model.switch)
-    mass += model.second_scale * np.maximum(expanded_phi - model.switch, 0.0)
+    mass = model.slope * phi_array[..., None]
     probability = np.clip(mass, epsilon, 1.0 - epsilon)
-    segment_slope = np.where(
-        expanded_phi <= model.switch,
-        model.first_scale,
-        model.second_scale,
-    )
     slope = np.where(
         (mass > epsilon) & (mass < 1.0 - epsilon),
-        segment_slope,
+        model.slope,
         0.0,
     )
     return _NumpyPathKernel(mass=mass, probability=probability, slope=slope)
@@ -622,17 +510,13 @@ def _path_kernel_torch(
         return value.reshape(path_shape)
 
     expanded_phi = phi.unsqueeze(-1)
-    first = path_view(model.first_scale)
-    second = path_view(model.second_scale)
-    switch = path_view(model.switch)
-    mass = first * torch.minimum(expanded_phi, switch)
-    mass = mass + second * torch.clamp(expanded_phi - switch, min=0.0)
+    candidate_slope = path_view(model.slope)
+    mass = candidate_slope * expanded_phi
     probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    segment_slope = torch.where(expanded_phi <= switch, first, second)
     slope = torch.where(
         (mass > epsilon) & (mass < 1.0 - epsilon),
-        segment_slope,
-        torch.zeros_like(segment_slope),
+        candidate_slope,
+        torch.zeros_like(candidate_slope),
     )
     return _TorchPathKernel(mass=mass, probability=probability, slope=slope)
 
@@ -678,17 +562,11 @@ def observed_terms_numpy(
     hessian_upper = np.where(
         model.observed, np.maximum(hessian_upper, 1e-8), 0.0
     )
-    legacy_major_probability = (
-        np.ones(model.shape, dtype=np.float64)
-        if model.legacy_major is None
-        else np.sum(posterior * model.legacy_major, axis=-1)
-    )
     return ObservedTerms(
         loss=loss,
         gradient=gradient,
         hessian_upper=hessian_upper,
         posterior=posterior,
-        legacy_major_probability=legacy_major_probability,
     )
 
 
@@ -732,17 +610,11 @@ def observed_terms_torch(
         torch.clamp(hessian_upper, min=1e-8),
         torch.zeros_like(hessian_upper),
     )
-    legacy_major_probability = (
-        torch.ones_like(loss)
-        if model.legacy_major is None
-        else torch.sum(posterior * model.legacy_major.to(posterior.dtype), dim=-1)
-    )
     return TorchObservedTerms(
         loss=loss,
         gradient=gradient,
         hessian_upper=hessian_upper,
         posterior=posterior,
-        legacy_major_probability=legacy_major_probability,
     )
 
 
@@ -854,19 +726,11 @@ def observed_em_terms_torch(
         torch.clamp(hessian_upper, min=1e-8),
         torch.zeros_like(hessian_upper),
     )
-    legacy_major_probability = (
-        torch.ones_like(loss)
-        if model.legacy_major is None
-        else torch.sum(
-            posterior * model.legacy_major.to(dtype=posterior.dtype), dim=-1
-        )
-    )
     return TorchObservedTerms(
         loss=loss,
         gradient=gradient,
         hessian_upper=hessian_upper,
         posterior=posterior,
-        legacy_major_probability=legacy_major_probability,
     )
 
 
@@ -889,41 +753,25 @@ def observed_internal_breakpoints_torch(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return path switches and clipping points with aligned validity."""
+    """Return linear-emission clipping points with aligned validity."""
 
     epsilon = _validated_epsilon(eps)
-    points = [model.switch]
-    masks = [model.valid]
+    points = []
+    masks = []
     for target in (epsilon, 1.0 - epsilon):
-        left = torch.where(
-            model.first_scale > 0.0,
-            model.first_scale.new_full((), target) / model.first_scale,
-            torch.full_like(model.first_scale, float("nan")),
+        point = torch.where(
+            model.slope > 0.0,
+            model.slope.new_full((), target) / model.slope,
+            torch.full_like(model.slope, float("nan")),
         )
-        left_valid = (
+        valid = (
             model.valid
-            & torch.isfinite(left)
-            & (left >= 0.0)
-            & (left <= model.switch)
+            & torch.isfinite(point)
+            & (point >= 0.0)
+            & (point <= 1.0)
         )
-        right = torch.where(
-            model.second_scale > 0.0,
-            model.switch
-            + (
-                model.second_scale.new_full((), target)
-                - model.first_scale * model.switch
-            )
-            / model.second_scale,
-            torch.full_like(model.second_scale, float("nan")),
-        )
-        right_valid = (
-            model.valid
-            & torch.isfinite(right)
-            & (right >= model.switch)
-            & (right <= 1.0)
-        )
-        points.extend((left, right))
-        masks.extend((left_valid, right_valid))
+        points.append(point)
+        masks.append(valid)
     return torch.cat(points, dim=-1), torch.cat(masks, dim=-1)
 
 
@@ -940,12 +788,8 @@ def observed_one_sided_gradients_torch(
         raise ValueError(f"phi must have shape {model.shape}.")
     kernel = _path_kernel_torch(model, phi, eps=epsilon)
     expanded_phi = phi.unsqueeze(-1)
-    left_slope = torch.where(
-        expanded_phi <= model.switch, model.first_scale, model.second_scale
-    )
-    right_slope = torch.where(
-        expanded_phi < model.switch, model.first_scale, model.second_scale
-    )
+    left_slope = model.slope
+    right_slope = model.slope
     outside = (kernel.mass < epsilon) | (kernel.mass > 1.0 - epsilon)
     left_slope = torch.where(outside, torch.zeros_like(left_slope), left_slope)
     right_slope = torch.where(outside, torch.zeros_like(right_slope), right_slope)

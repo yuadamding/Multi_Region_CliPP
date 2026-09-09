@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import gzip
 from pathlib import Path
 from typing import Any
@@ -14,17 +14,21 @@ import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
 from .multiplicity import MAX_MAJOR_CN, build_clonal_integer_likelihood
-from .path_compiler import (
-    LocalCopyNumberState,
-    initialize_path_marginal_phi,
-)
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 CN_FILTER_POLICY_ID = "clonal_cn_major_le6_whole_mutation_v1"
 SUBCLONAL_CN_REGION = "SUBCLONAL_CN_REGION"
 MAJOR_CN_GT_6 = "MAJOR_CN_GT_6"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCopyNumberState:
+    fraction: float
+    allele_a_cn: int
+    allele_b_cn: int
+
+
 # The complete model-defining schema is the header of exampleTumor1.tsv.
 # Writers emit these first, followed by any inert provenance columns.
 SCHEMA_COLUMNS = (
@@ -584,7 +588,6 @@ def _build_tumor_data(
     normal_cn = np.empty(shape, dtype=np.float64)
     major_cn = np.empty(shape, dtype=np.float64)
     minor_cn = np.empty(shape, dtype=np.float64)
-    has_cna = np.empty(shape, dtype=bool)
     mean_total_cn = np.empty(shape, dtype=np.float64)
 
     for unit, rows in validated.rows_by_unit.items():
@@ -613,7 +616,6 @@ def _build_tumor_data(
         major_cn[i, j] = float(state.allele_a_cn)
         minor_cn[i, j] = float(state.allele_b_cn)
         mean_total_cn[i, j] = state.allele_a_cn + state.allele_b_cn
-        has_cna[i, j] = state.allele_a_cn != 1 or state.allele_b_cn != 1
 
     alt_counts = np.where(count_observed, alt_counts, 0.0)
     total_counts = np.where(count_observed, total_counts, 0.0)
@@ -640,40 +642,25 @@ def _build_tumor_data(
         major_cn=major_cn,
         minor_cn=minor_cn,
         normal_cn=normal_cn,
-        has_cna=has_cna,
         scaling=scaling,
         phi_upper=phi_upper,
         phi_init=np.clip(np.full(shape, 0.5, dtype=np.float64), eps, phi_upper),
-        init_major_mask=np.zeros(shape, dtype=bool),
         count_observed=count_observed,
         path_likelihood=path_likelihood,
-        path_unsupported_reason=np.full(shape, None, dtype=object),
     )
 
-    data.phi_init = initialize_path_marginal_phi(data, eps=eps)
-    return data
+    from ..core.fusion.starts import initialize_marginal_phi
+
+    return replace(data, phi_init=initialize_marginal_phi(data, eps=eps))
 
 
 def load_tumor_txt(
     path: str | Path,
     *,
-    unsupported_policy: str = "error",
-    dosage_prior_penalty: float | None = None,
     eps: float = 1e-6,
 ) -> TumorData:
     """Validate, filter whole SNVs, and compile uniform integer multiplicities."""
 
-    policy = str(unsupported_policy).strip().lower()
-    if policy != "error":
-        raise ValueError(
-            "unsupported_policy must be 'error'; masking cannot replace "
-            "whole-mutation CN filtering."
-        )
-    if dosage_prior_penalty is not None:
-        raise ValueError(
-            "dosage_prior_penalty is obsolete: integer multiplicities use a "
-            "fixed uniform prior; omit this option."
-        )
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
@@ -682,8 +669,7 @@ def load_tumor_txt(
     validated = _validate_long_table(metadata, table)
     filtered, report = _filter_snv_cn(validated)
     data = _build_tumor_data(filtered, eps=epsilon)
-    data.cn_filter_report = report
-    return data
+    return replace(data, cn_filter_report=report)
 
 
 def _format_number(value: float) -> str:
@@ -778,7 +764,6 @@ def write_tumor_txt(
 
 __all__ = [
     "CN_FILTER_POLICY_ID",
-    "DEFAULT_DOSAGE_PRIOR_PENALTY",
     "SCHEMA_COLUMNS",
     "MAJOR_CN_GT_6",
     "NoEligibleSNVsError",

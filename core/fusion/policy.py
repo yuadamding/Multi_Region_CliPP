@@ -43,7 +43,10 @@ def _compressed_representation_incomplete(result: RawFit) -> bool:
     terminal = result.certificate
     if not isinstance(terminal.witness, CompressedEdgeCertificate):
         return False
-    return terminal.status in {"resource_limit", "workset_incomplete"}
+    return terminal.status in {"resource_limit", "workset_incomplete"} or (
+        terminal.status == "not_certified"
+        and result.work.full_certificate_audit_passes == 0
+    )
 
 
 def _precision_residual_is_only_blocker(result: RawFit) -> bool:
@@ -51,6 +54,7 @@ def _precision_residual_is_only_blocker(result: RawFit) -> bool:
     status_supported = terminal.status in _AUDIT_COMPATIBLE_STATUSES or (
         isinstance(terminal.witness, CompressedEdgeCertificate)
         and terminal.status == "not_certified"
+        and result.work.full_certificate_audit_passes > 0
     )
     return (
         np.isfinite(result.objective.total)

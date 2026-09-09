@@ -1,56 +1,157 @@
-"""Thin command-line facade for one canonical CliPP2 fit."""
-
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from pathlib import Path
-from typing import Any
 
-from .config import (
+from .core.fusion.defaults import (
+    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
+    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
+    DEFAULT_DENSE_FALLBACK_POLICY,
+    DEFAULT_DEVICE,
+    DEFAULT_WORKSET_ADD_BATCH,
+    DEFAULT_WORKSET_MAX_BYTES,
+    DEFAULT_WORKSET_MAX_EXPANSIONS,
+    DENSE_FALLBACK_POLICIES,
+    normalize_dense_fallback_policy,
+)
+
+from .core.fusion.profiles import (
     COMPUTATION_PROFILE_NAMES,
-    FAILURE_POLICIES,
-    CheckpointRequest,
-    FitConfig,
-    RunConfig,
-    resolve_fit_config,
-    resolve_run_config_mapping,
+    DEFAULT_COMPUTATION_PROFILE,
+)
+from .config import FitConfig, resolve_fit_config
+from .model_selection.contracts import (
+    DEFAULT_SELECTION_CONTRACT,
+    SELECTION_CONTRACT_IDS,
+)
+from .simulation.cli import (
+    add_simulation_arguments,
+    tumor_simulation_config_from_args,
 )
 
 
-CONFIG_SCHEMA_VERSION = 1
+def _selection_score_argument(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized.startswith("clonal-"):
+        raise argparse.ArgumentTypeError(
+            "clonal-anchor selection scores were removed; use "
+            "fixed-partition-dirichlet-score or fixed-partition-bic"
+        )
+    allowed = {
+        "fixed-partition-dirichlet-score",
+        "fixed-partition-bic",
+    }
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(
+            "selection score must be fixed-partition-dirichlet-score, "
+            "or fixed-partition-bic"
+        )
+    return normalized
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--outdir", default="clipp2_results")
-    parser.add_argument("--profile", choices=COMPUTATION_PROFILE_NAMES)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--failure-policy", choices=FAILURE_POLICIES)
     parser.add_argument(
-        "--checkpoint",
-        metavar="PATH",
-        help="Save an exact-resume checkpoint after each completed transaction.",
+        "--profile",
+        choices=COMPUTATION_PROFILE_NAMES,
+        default=DEFAULT_COMPUTATION_PROFILE,
+        help=(
+            "Single-tumor computation contract. Strict strengthens "
+            "per-candidate KKT checks and fixed-partition refit certification; "
+            "all profiles use a bounded lambda search."
+        ),
     )
     parser.add_argument(
-        "--resume",
-        metavar="PATH",
-        help="Resume and continue updating an identity-matched checkpoint.",
+        "--unsupported-policy", choices=["error", "mask"], default="error",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--config",
-        metavar="JSON",
-        help="Versioned JSON file containing expert fit and runner settings.",
+        "--dosage-prior-penalty",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
+    parser.add_argument("--outer-max-iter", type=int, default=None)
+    parser.add_argument("--inner-max-iter", type=int, default=None)
+    parser.add_argument("--tol", type=float, default=None)
+    parser.add_argument("--selection-partition-tol", type=float, default=None)
+    parser.add_argument("--selection-refit-tol", type=float, default=None)
+    parser.add_argument("--selection-refit-max-iter", type=int, default=None)
+    parser.add_argument(
+        "--selection-contract",
+        choices=SELECTION_CONTRACT_IDS,
+        default=DEFAULT_SELECTION_CONTRACT,
+        help=(
+            "Immutable partition-selection contract. Raw-only selects "
+            "certified raw partitions; hybrid adds Ward/CEM partitions. The "
+            "legacy contract retains its selection settings, not the old "
+            "likelihood: every public input uses the clonal integer mixture."
+        ),
+    )
+    parser.add_argument(
+        "--selection-score",
+        type=_selection_score_argument,
+        default="fixed-partition-dirichlet-score",
+        help=(
+            "Fixed-label selection criterion. The Dirichlet score is BIC plus "
+            "the active selection contract's declared weight times the "
+            "deviance of one exact allocation under its integrated symmetric "
+            "Dirichlet prior. This is not posterior-entropy ICL."
+        ),
+    )
+    parser.add_argument("--disable-warm-start", action="store_true")
+    parser.add_argument("--major-prior", type=float, default=0.5, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default=DEFAULT_DEVICE
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "float32", "float64"],
+        default=None,
+    )
+    parser.add_argument(
+        "--workset-max-bytes", type=int, default=DEFAULT_WORKSET_MAX_BYTES
+    )
+    parser.add_argument(
+        "--compressed-cache-max-bytes",
+        type=int,
+        default=DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
+    )
+    parser.add_argument(
+        "--dense-fallback-policy",
+        choices=[value.replace("_", "-") for value in DENSE_FALLBACK_POLICIES],
+        default=DEFAULT_DENSE_FALLBACK_POLICY.replace("_", "-"),
+    )
+    parser.add_argument(
+        "--workset-add-batch", type=int, default=DEFAULT_WORKSET_ADD_BATCH
+    )
+    parser.add_argument(
+        "--workset-max-expansions", type=int, default=DEFAULT_WORKSET_MAX_EXPANSIONS
+    )
+    parser.add_argument("--certificate-max-iter", type=int, default=None)
+    parser.add_argument(
+        "--certificate-refinement-rounds",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--certificate-column-tol-scale",
+        type=float,
+        default=DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
+    )
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--skip-outputs", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
         description=(
-            "Fit certified pairwise-fusion candidates and select an immutable "
-            "Ward/CEM partition by fixed-partition BIC."
+            "Fit raw pairwise-fusion candidates and select an immutable "
+            "partition by a reconstructible fixed-partition score under an "
+            "explicit computation profile."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -59,84 +160,87 @@ def build_parser() -> argparse.ArgumentParser:
         "fit", formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     _add_fit_args(fit_parser)
+    simulate_parser = subparsers.add_parser(
+        "simulate", formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    add_simulation_arguments(simulate_parser)
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "fit" and args.checkpoint and args.resume:
-        parser.error("--checkpoint and --resume are mutually exclusive")
+    if args.command == "fit":
+        if args.dosage_prior_penalty is not None:
+            parser.error(
+                "--dosage-prior-penalty was removed: integer candidates have "
+                "fixed uniform priors. Omit this option."
+            )
+        if args.major_prior != 0.5:
+            parser.error(
+                "--major-prior is obsolete: integer candidates have fixed "
+                "uniform priors. Omit this option."
+            )
+        if args.unsupported_policy != "error":
+            parser.error(
+                "--unsupported-policy mask was removed: subclonal CN and "
+                "major CN > 6 exclude the entire mutation across all samples."
+            )
+        for option_name in (
+            "selection_partition_tol",
+            "selection_refit_tol",
+        ):
+            raw_value = getattr(args, option_name)
+            if raw_value is not None and (
+                not math.isfinite(float(raw_value)) or float(raw_value) <= 0.0
+            ):
+                parser.error(
+                    f"--{option_name.replace('_', '-')} must be positive and finite"
+                )
+        if (
+            args.selection_refit_max_iter is not None
+            and int(args.selection_refit_max_iter) < 1
+        ):
+            parser.error("--selection-refit-max-iter must be positive")
     return args
 
 
-def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"Configuration repeats JSON key: {key}")
-        value[key] = item
-    return value
-
-
-def _load_config(path: str | None) -> tuple[dict[str, object], dict[str, object]]:
-    if path is None:
-        return {}, {}
-    source = Path(path)
-    if not source.is_file():
-        raise ValueError(f"Configuration must be a file: {source}")
-    try:
-        payload = json.loads(
-            source.read_text(encoding="utf-8"),
-            object_pairs_hook=_json_object,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"Invalid JSON constant: {value}")
-            ),
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cannot read CliPP2 JSON configuration: {source}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("CliPP2 configuration must be a JSON object.")
-    allowed = {"schema_version", "fit", "run"}
-    if set(payload) - allowed:
-        raise ValueError(
-            "Unknown configuration section(s): "
-            + ", ".join(sorted(set(payload) - allowed))
-        )
-    if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
-        raise ValueError(
-            "Unsupported configuration schema_version; required value is "
-            f"{CONFIG_SCHEMA_VERSION}."
-        )
-    fit = payload.get("fit", {})
-    run = payload.get("run", {})
-    if not isinstance(fit, dict) or not isinstance(run, dict):
-        raise ValueError("Configuration fit and run sections must be JSON objects.")
-    if "graph" in fit:
-        raise ValueError("The graph override is available only to the Python API.")
-    return dict(fit), dict(run)
-
-
-def _resolved_cli(args: argparse.Namespace) -> tuple[FitConfig, RunConfig]:
-    fit_values, run_values = _load_config(args.config)
-    if args.profile is not None:
-        fit_values["computation_profile"] = args.profile
-    if args.device is not None:
-        fit_values["device"] = args.device
-    if args.failure_policy is not None:
-        run_values["failure_policy"] = args.failure_policy
-    run_config = resolve_run_config_mapping(run_values)
-    return resolve_fit_config(**fit_values), run_config
-
-
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
-    """Resolve the single FitConfig used by programmatic CLI tests."""
-
-    return _resolved_cli(args)[0]
+    return resolve_fit_config(
+        lambda_value=0.0,
+        outer_max_iter=args.outer_max_iter,
+        inner_max_iter=args.inner_max_iter,
+        tol=args.tol,
+        selection_score=args.selection_score.replace("-", "_"),
+        selection_partition_tol=args.selection_partition_tol,
+        selection_refit_tol=args.selection_refit_tol,
+        selection_refit_max_iter=args.selection_refit_max_iter,
+        selection_contract=args.selection_contract,
+        major_prior=args.major_prior,
+        device=args.device,
+        dtype=args.dtype,
+        workset_max_bytes=args.workset_max_bytes,
+        compressed_cache_max_bytes=args.compressed_cache_max_bytes,
+        dense_fallback_policy=normalize_dense_fallback_policy(
+            args.dense_fallback_policy
+        ),
+        workset_add_batch=args.workset_add_batch,
+        workset_max_expansions=args.workset_max_expansions,
+        certificate_max_iter=args.certificate_max_iter,
+        certificate_refinement_rounds=args.certificate_refinement_rounds,
+        certificate_column_tol_scale=args.certificate_column_tol_scale,
+        verbose=args.verbose,
+        computation_profile=args.profile,
+    )
 
 
 def _printable_summary(value: object) -> object:
-    """Replace non-finite floats before emitting a Python-literal summary."""
+    """Return the summary with non-finite floats replaced by None.
+
+    The printed representation is consumed by launch wrappers as a Python
+    literal; bare nan/inf tokens are name nodes, not literals, so a
+    non-finite value must never reach stdout.
+    """
 
     if isinstance(value, dict):
         return {key: _printable_summary(entry) for key, entry in value.items()}
@@ -147,40 +251,23 @@ def _printable_summary(value: object) -> object:
     return value
 
 
-def process_tumor(
-    *,
-    tumor_file: Path,
-    outdir: Path,
-    fit_config: FitConfig,
-    run_config: RunConfig,
-    checkpoint: CheckpointRequest,
-) -> dict[str, object]:
-    """Lazily enter the heavy inference stack."""
-
-    from .runners.pipeline import process_tumor as run
-
-    return run(
-        tumor_file=tumor_file,
-        outdir=outdir,
-        fit_config=fit_config,
-        run_config=run_config,
-        checkpoint=checkpoint,
-    )
-
-
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    fit_config, run_config = _resolved_cli(args)
+    if args.command == "simulate":
+        from .simulation import simulate_tumor
+
+        print(simulate_tumor(tumor_simulation_config_from_args(args)))
+        return
+    from .runners.pipeline import process_tumor
+
     summary = process_tumor(
         tumor_file=Path(args.input_file),
         outdir=Path(args.outdir),
-        fit_config=fit_config,
-        run_config=run_config,
-        checkpoint=CheckpointRequest(
-            path=args.resume or args.checkpoint,
-            enabled=bool(args.checkpoint or args.resume),
-            resume=args.resume is not None,
-        ),
+        fit_config=_fit_config_from_args(args),
+        use_warm_starts=not args.disable_warm_start,
+        write_outputs=not args.skip_outputs,
+        unsupported_policy=args.unsupported_policy,
+        dosage_prior_penalty=args.dosage_prior_penalty,
     )
     print(_printable_summary(summary))
 

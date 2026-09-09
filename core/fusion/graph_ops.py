@@ -270,7 +270,7 @@ def _complete_adaptive_raw_weights(
     *,
     edge_u: torch.Tensor,
     edge_v: torch.Tensor,
-    likelihood_included: torch.Tensor | None,
+    count_observed: torch.Tensor | None,
     gamma: float,
     tau: float,
 ) -> torch.Tensor:
@@ -283,8 +283,8 @@ def _complete_adaptive_raw_weights(
     the historical vector-norm calculation byte-for-byte.
     """
 
-    included = likelihood_included
-    all_observed = included is None or bool(torch.all(included).item())
+    observed = count_observed
+    all_observed = observed is None or bool(torch.all(observed).item())
     num_regions = int(pilot.shape[1])
     num_edges = int(edge_u.numel())
     raw_weight = torch.empty((num_edges,), dtype=pilot.dtype, device=pilot.device)
@@ -307,10 +307,10 @@ def _complete_adaptive_raw_weights(
         if all_observed:
             distance = torch.linalg.vector_norm(diff, dim=1)
         else:
-            assert included is not None
-            jointly_observed = included.index_select(
+            assert observed is not None
+            jointly_observed = observed.index_select(
                 0, edge_u[start:stop]
-            ) & included.index_select(0, edge_v[start:stop])
+            ) & observed.index_select(0, edge_v[start:stop])
             diff.masked_fill_(~jointly_observed, 0.0)
             shared_count = torch.sum(jointly_observed, dim=1)
             normalized_squared_distance = torch.sum(torch.square(diff), dim=1) * (
@@ -334,7 +334,6 @@ def _tensor_graph_from_edges(
     num_nodes: int,
     name: str,
     known_complete: bool | None = None,
-    source_graph_fingerprint: str = "",
 ) -> TensorFusionGraph:
     edge_index = torch.stack(
         [edge_u.to(dtype=torch.long), edge_v.to(dtype=torch.long)], dim=0
@@ -358,7 +357,6 @@ def _tensor_graph_from_edges(
         num_nodes=int(num_nodes),
         is_complete=is_complete,
         name=str(name),
-        source_graph_fingerprint=str(source_graph_fingerprint),
     )
 
 
@@ -379,7 +377,6 @@ def tensorize_graph(
         weight=weight,
         num_nodes=int(num_nodes),
         name=str(graph.name),
-        source_graph_fingerprint=graph.fingerprint,
     )
 
 
@@ -387,7 +384,7 @@ def build_complete_adaptive_tensor_graph(
     pilot_phi: torch.Tensor,
     runtime: TorchRuntime,
     *,
-    likelihood_included: torch.Tensor | None = None,
+    count_observed: torch.Tensor | None = None,
     gamma: float = 1.0,
     tau: float = 1e-6,
     baseline: float = 1.0,
@@ -408,14 +405,14 @@ def build_complete_adaptive_tensor_graph(
 
     weight_work_dtype = _adaptive_weight_work_dtype(runtime.dtype)
     pilot = pilot_phi.to(dtype=weight_work_dtype, device=runtime.device)
-    included = (
+    observed = (
         None
-        if likelihood_included is None
-        else likelihood_included.to(dtype=torch.bool, device=runtime.device)
+        if count_observed is None
+        else count_observed.to(dtype=torch.bool, device=runtime.device)
     )
-    if included is not None and included.shape != pilot.shape:
+    if observed is not None and observed.shape != pilot.shape:
         raise ValueError(
-            "likelihood_included must match the mutation-by-region pilot shape."
+            "count_observed must have the same mutation-by-region shape as pilot_phi."
         )
     num_nodes = int(pilot.shape[0])
     _check_complete_tensor_graph_memory(
@@ -447,7 +444,7 @@ def build_complete_adaptive_tensor_graph(
         pilot,
         edge_u=edge_index[0],
         edge_v=edge_index[1],
-        likelihood_included=included,
+        count_observed=observed,
         gamma=float(gamma),
         tau=float(tau),
     )
@@ -534,7 +531,7 @@ def build_likelihood_noise_regularized_adaptive_tensor_graph(
     *,
     lower: torch.Tensor,
     upper: torch.Tensor,
-    likelihood_included: torch.Tensor | None = None,
+    count_observed: torch.Tensor | None = None,
     gamma: float = 1.0,
     minimum_tau: float = 1e-6,
     baseline: float = 1.0,
@@ -576,7 +573,7 @@ def build_likelihood_noise_regularized_adaptive_tensor_graph(
     graph = build_complete_adaptive_tensor_graph(
         pilot_phi,
         runtime,
-        likelihood_included=likelihood_included,
+        count_observed=count_observed,
         gamma=float(gamma),
         tau=tau,
         baseline=float(baseline),

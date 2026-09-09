@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 
 from .config import (
-    DEFAULT_MAX_LOCAL_CN_STATES_PER_MUTATION,
     CopyNumberEvolutionConfig,
     TumorSimulationConfig,
 )
@@ -35,7 +34,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--mutation-count",
         type=int,
         default=defaults.mutation_count,
-        help="Exact number of SNVs.",
+        help="Exact number of CN-eligible SNVs retained by CliPP2.",
     )
     parser.add_argument(
         "--mean-depth",
@@ -53,7 +52,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--cna-event-rate",
         type=float,
         default=defaults.copy_number.cna_event_rate,
-        help="Evolutionary branch gain rate per genomic segment.",
+        help="Trunk gain rate per genomic segment; descendant CN is unchanged.",
     )
     parser.add_argument(
         "--region-count",
@@ -80,16 +79,10 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         help="Length of each simulated genomic interval.",
     )
     parser.add_argument(
-        "--min-two-state-snv-fraction",
-        type=float,
-        default=defaults.copy_number.min_two_state_snv_fraction,
-        help="Required SNV fraction on exactly two local copy-number states.",
-    )
-    parser.add_argument(
         "--max-rejection-tries",
         type=int,
         default=defaults.max_rejection_tries,
-        help="Maximum attempts used to satisfy the simulation invariants.",
+        help="Maximum attempts used to satisfy tree/CCF constraints.",
     )
 
 
@@ -110,25 +103,23 @@ def tumor_simulation_config_from_args(
             n_segments=args.n_segments,
             segment_size_bp=args.segment_size_bp,
             cna_event_rate=args.cna_event_rate,
-            max_local_cn_states_per_mutation=(DEFAULT_MAX_LOCAL_CN_STATES_PER_MUTATION),
-            min_two_state_snv_fraction=args.min_two_state_snv_fraction,
         ),
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate one canonical CliPP2 simulation tumor."
+        description="Generate one clonal-CN tumor with major CN <= 6."
     )
     add_simulation_arguments(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    from .generator import simulate_tumor
-
     parser = build_parser()
     args = parser.parse_args(argv)
+    from .generator import simulate_tumor
+
     written_dir = simulate_tumor(tumor_simulation_config_from_args(args))
     print(f"Generated {written_dir}")
 

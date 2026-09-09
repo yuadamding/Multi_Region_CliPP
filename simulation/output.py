@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from CliPP2.io.tumor_txt import (
+from ..io.tumor_txt import (
     SCHEMA_COLUMNS as TUMOR_TXT_COLUMNS,
     TUMOR_TXT_SCHEMA,
     load_tumor_txt,
@@ -136,10 +136,75 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
         if unexpected_region:
             raise ValueError(f"{region_id} has non-truth files: {unexpected_region}.")
 
-    if not bool(np.all(np.asarray(data.likelihood_supported, dtype=bool))):
-        raise ValueError(
-            "Generated tumor contains unsupported local copy-number states."
-        )
+    report = data.cn_filter_report
+    if report is None or report.excluded_mutation_ids:
+        raise ValueError("Generated tumor must retain every mutation after CN filtering.")
+    truth = pd.read_csv(tumor_dir / "truth.txt", sep="\t")
+    if truth.mutation_id.duplicated().any() or set(truth.mutation_id) != set(data.mutation_ids):
+        raise ValueError("Mutation truth must match the complete retained input.")
+    observed = pd.read_csv(canonical_input, sep="\t", comment="#")
+    region_numbers = {f"region{i + 1}": i for i in range(len(data.region_ids))}
+    if set(data.region_ids) != set(region_numbers):
+        raise ValueError("Generated samples must be region1 through regionN.")
+    observed["sample_id"] = observed.sample_id.map(region_numbers)
+    keys = ["mutation_id", "sample_id"]
+    expected_rows = len(truth) * len(region_numbers)
+    if len(observed) != expected_rows or observed.duplicated(keys).any():
+        raise ValueError("Matched simulation input requires one clonal CN row per unit.")
+    sample_truth = pd.read_csv(tumor_dir / "truth_mutation_sample.tsv", sep="\t")
+    if (
+        len(sample_truth) != expected_rows
+        or sample_truth.duplicated(keys).any()
+        or set(map(tuple, sample_truth[keys].to_numpy()))
+        != set(map(tuple, observed[keys].to_numpy()))
+    ):
+        raise ValueError("Mutation-sample truth must match every input unit exactly once.")
+    aligned = observed.merge(sample_truth, on=keys, validate="one_to_one")
+    major = aligned[["allele_a_cn", "allele_b_cn"]].max(axis=1)
+    total = aligned.allele_a_cn + aligned.allele_b_cn
+    multiplicity = aligned.multiplicity.to_numpy(dtype=float)
+    ccf = aligned.ccf.to_numpy(dtype=float)
+    if (
+        not np.all(np.isfinite(multiplicity))
+        or np.any(multiplicity != np.rint(multiplicity))
+        or np.any((multiplicity < 1) | (multiplicity > major))
+        or not np.all(np.isfinite(ccf))
+        or np.any((ccf <= 0) | (ccf > 1 + 1e-8))
+    ):
+        raise ValueError("Truth requires positive CCF and integer multiplicity in 1..major CN.")
+    expected_vaf = aligned.purity * ccf * multiplicity / (
+        aligned.purity * total + (1 - aligned.purity) * aligned.normal_cn
+    )
+    for name, expected in (
+        ("effective_multiplicity", multiplicity),
+        ("mutant_copy_mass", ccf * multiplicity),
+        ("mean_tumor_total_cn", total),
+        ("expected_vaf", expected_vaf),
+    ):
+        if not np.allclose(aligned[name], expected, atol=1e-8, rtol=0.0):
+            raise ValueError(f"Truth {name} disagrees with the clonal integer-CN model.")
+    clone_truth = pd.read_csv(tumor_dir / "truth_clone_sample.txt", sep="\t")
+    linked = aligned.merge(truth, on="mutation_id", validate="many_to_one").merge(
+        clone_truth, left_on=["cluster_id", "sample_id"],
+        right_on=["clone_id", "sample_id"], how="left", validate="many_to_one",
+        suffixes=("", "_clone"),
+    )
+    if not np.allclose(linked.ccf, linked.ccf_clone, atol=1e-8, rtol=0.0):
+        raise ValueError("Mutation CCF truth disagrees with acquisition-clone CCF truth.")
+    manifest_path = tumor_dir / "scenario_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        input_hashes, truth_hashes = _output_file_hashes(tumor_dir)
+        if (
+            manifest["output_schema_version"] != OUTPUT_SCHEMA_VERSION
+            or manifest["generator_version"] != GENERATOR_VERSION
+            or manifest["intended_factors"]["mutation_count"] != len(truth)
+            or manifest["realized_factors"]["retained_mutation_count"] != len(truth)
+            or manifest["realized_factors"]["excluded_mutation_count"] != 0
+            or manifest["input_file_hashes"] != input_hashes
+            or manifest["truth_file_hashes"] != truth_hashes
+        ):
+            raise ValueError("Generated bundle does not match its versioned manifest.")
 
 
 def _cn_clone_profile_table(
@@ -184,12 +249,8 @@ def _local_cn_state_table(
     unique_profiles: np.ndarray,
     cn_clone_fraction: np.ndarray,
     segments: list[GenomeSegment],
-) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    dominant_a = np.empty(len(segments), dtype=int)
-    dominant_b = np.empty(len(segments), dtype=int)
-    dominant_fraction = np.empty(len(segments), dtype=float)
-    dominant_state_id = np.empty(len(segments), dtype=int)
     for segment in segments:
         groups: dict[tuple[int, int], dict[str, object]] = {}
         for cn_clone_id, profile in enumerate(unique_profiles):
@@ -220,15 +281,6 @@ def _local_cn_state_table(
                     ),
                 }
             )
-        best_state_id, (best_state, best_group) = max(
-            enumerate(ordered_groups),
-            key=lambda item: float(item[1][1]["fraction"]),
-        )
-        dominant_a[segment.segment_id] = int(best_state[0])
-        dominant_b[segment.segment_id] = int(best_state[1])
-        dominant_fraction[segment.segment_id] = float(best_group["fraction"])
-        dominant_state_id[segment.segment_id] = int(best_state_id)
-
     table = pd.DataFrame(rows)
     if not np.allclose(
         table.groupby("segment_id", sort=False)["tumor_fraction"].sum().to_numpy(),
@@ -237,7 +289,7 @@ def _local_cn_state_table(
         rtol=0.0,
     ):
         raise AssertionError("Region-local CN-state fractions do not sum to one.")
-    return table, dominant_a, dominant_b, dominant_fraction, dominant_state_id
+    return table
 
 
 def _canonical_observation_table(

@@ -28,6 +28,7 @@ from ..core.fusion.graph_ops import (
     graph_adjoint_edges,
     project_dual_ball,
 )
+from ..core.fusion.solver import torch_data_from_context
 from ..core.fusion.torch_backend import (
     graph_fusion_kkt_residual_from_grad_torch,
     mutation_region_terms_torch,
@@ -145,10 +146,7 @@ def _canonical_guide_phi(
     upper: torch.Tensor,
     partition_tolerance: float,
 ) -> tuple[torch.Tensor, float, float]:
-    phi_array = np.asarray(guide_phi)
-    if not phi_array.flags.writeable:
-        phi_array = phi_array.copy()
-    phi_input = torch.as_tensor(phi_array, dtype=lower.dtype, device=lower.device)
+    phi_input = torch.as_tensor(guide_phi, dtype=lower.dtype, device=lower.device)
     if tuple(phi_input.shape) != tuple(lower.shape):
         raise ValueError(f"guide_phi must have shape {tuple(lower.shape)}.")
     if not bool(torch.all(torch.isfinite(phi_input)).item()):
@@ -611,8 +609,8 @@ def build_guided_fusion_initialization(
     if int(max_capacity_iterations) <= 0:
         raise ValueError("max_capacity_iterations must be positive.")
 
-    lower = solver_context.observed_model.lower
-    upper = solver_context.observed_model.upper
+    lower = solver_context.lower
+    upper = solver_context.upper
     if lower.ndim != 2 or tuple(upper.shape) != tuple(lower.shape):
         raise ValueError(
             "SolverContext bounds must be matching two-dimensional tensors."
@@ -633,11 +631,12 @@ def build_guided_fusion_initialization(
     )
 
     terms = mutation_region_terms_torch(
-        solver_context.observed_model,
+        torch_data_from_context(solver_context),
         phi,
-        eps=float(solver_context.eps),
+        major_prior=float(solver_context.problem.major_prior),
+        eps=float(solver_context.problem.eps),
     )
-    grad = terms.gradient.detach()
+    grad = terms.grad.detach()
     gradient_source = "observed_likelihood"
 
     graph = solver_context.graph
@@ -809,13 +808,11 @@ def build_guided_fusion_initialization(
             max_between_dual_ball_ratio=_max_dual_ratio(
                 dual, mask=between, radius=radius
             ),
-            kkt_residual=float(audit.diagnostics.kkt_residual),
-            stationarity_residual=float(audit.diagnostics.stationarity_residual),
-            edge_subgradient_residual=float(
-                audit.diagnostics.edge_subgradient_residual
-            ),
-            dual_ball_residual=float(audit.diagnostics.dual_ball_residual),
-            box_residual=float(audit.diagnostics.box_residual),
+            kkt_residual=float(audit["kkt_residual"]),
+            stationarity_residual=float(audit["stationarity_residual"]),
+            edge_subgradient_residual=float(audit["edge_subgradient_residual"]),
+            dual_ball_residual=float(audit["dual_ball_residual"]),
+            box_residual=float(audit["box_residual"]),
             num_exact_lower_active_coordinates=int(
                 torch.sum(lower_active & ~upper_active).item()
             ),

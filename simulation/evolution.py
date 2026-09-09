@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from ..io.multiplicity import MAX_MAJOR_CN
 from .config import CopyNumberEvolutionConfig, _validate_copy_number_config
 
 
@@ -110,18 +111,13 @@ def simulate_branch_cna_events(
     parent: np.ndarray,
     config: CopyNumberEvolutionConfig,
     *,
-    constrained_segment_ids: np.ndarray | None = None,
     random_state=None,
 ) -> list[CNAEvent]:
-    """Sample contiguous gain events on each incoming clone branch.
+    """Sample contiguous trunk gains, with no gains on descendant branches.
 
-    When ``max_local_cn_states_per_mutation`` is configured, callers may
-    provide the mutation-bearing segments in ``constrained_segment_ids``.
-    When they are omitted, all segments are constrained.  At most
-    ``max_local_cn_states_per_mutation - 1`` gain events are retained per
-    constrained segment.  Because branch-event descendant sets are laminar on
-    one clone tree, this conservatively guarantees no more than the requested
-    number of final allele-specific states at those loci.
+    Repeated trunk gains change the shared clonal CN without creating a
+    local-state mixture. The physical-copy evolution caps each allele at the
+    configured maximum; no events are conditioned on mutation placement.
     """
 
     _validate_copy_number_config(config)
@@ -131,61 +127,28 @@ def simulate_branch_cna_events(
         rng = np.random.default_rng(random_state)
 
     parent = np.asarray(parent, dtype=int)
+    _tree_order_and_ancestry(parent)
     events: list[CNAEvent] = []
-    event_id = 0
     geometric_p = 1.0 / float(config.mean_cna_span_segments)
-    for clone_id, parent_clone_id in enumerate(parent):
-        rate_multiplier = (
-            config.trunk_cna_rate_multiplier if parent_clone_id == -1 else 1.0
-        )
-        expected_events = (
-            float(config.cna_event_rate)
-            * float(config.n_segments)
-            * rate_multiplier
-            / float(config.mean_cna_span_segments)
-        )
-        n_events = int(rng.poisson(expected_events))
-        for _ in range(n_events):
-            span = min(int(rng.geometric(geometric_p)), int(config.n_segments))
-            start = int(rng.integers(0, config.n_segments - span + 1))
-            events.append(
-                CNAEvent(
-                    event_id=event_id,
-                    clone_id=int(clone_id),
-                    parent_clone_id=int(parent_clone_id),
-                    branch_time=float(rng.random()),
-                    segment_ids=tuple(range(start, start + span)),
-                    allele=int(rng.integers(0, 2)),
-                )
+    expected_events = (
+        float(config.cna_event_rate)
+        * float(config.n_segments)
+        / float(config.mean_cna_span_segments)
+    )
+    for event_id in range(int(rng.poisson(expected_events))):
+        span = min(int(rng.geometric(geometric_p)), int(config.n_segments))
+        start = int(rng.integers(0, config.n_segments - span + 1))
+        events.append(
+            CNAEvent(
+                event_id=event_id,
+                clone_id=0,
+                parent_clone_id=-1,
+                branch_time=float(rng.random()),
+                segment_ids=tuple(range(start, start + span)),
+                allele=int(rng.integers(0, 2)),
             )
-            event_id += 1
-
-    max_local_states = config.max_local_cn_states_per_mutation
-    if max_local_states is None:
-        return events
-    if constrained_segment_ids is None:
-        constrained_segment_ids = np.arange(int(config.n_segments), dtype=int)
-
-    constrained = np.zeros(int(config.n_segments), dtype=bool)
-    constrained_ids = np.asarray(constrained_segment_ids, dtype=int).reshape(-1)
-    if np.any((constrained_ids < 0) | (constrained_ids >= int(config.n_segments))):
-        raise ValueError("constrained_segment_ids contains an invalid segment ID.")
-    constrained[constrained_ids] = True
-
-    event_budget = int(max_local_states) - 1
-    retained_event_count = np.zeros(int(config.n_segments), dtype=int)
-    accepted: list[CNAEvent] = []
-    for event_index in rng.permutation(len(events)):
-        event = events[int(event_index)]
-        segment_ids = np.asarray(event.segment_ids, dtype=int)
-        affected_constrained = segment_ids[constrained[segment_ids]]
-        if affected_constrained.size and np.any(
-            retained_event_count[affected_constrained] >= event_budget
-        ):
-            continue
-        accepted.append(event)
-        retained_event_count[affected_constrained] += 1
-    return sorted(accepted, key=lambda event: event.event_id)
+        )
+    return events
 
 
 def _copy_genome_state(genome):
@@ -235,7 +198,7 @@ def simulate_joint_snv_cna_evolution(
     mutation_segment: np.ndarray,
     branch_cna_events: list[CNAEvent],
     n_segments: int,
-    max_allele_cn: int = 6,
+    max_allele_cn: int = MAX_MAJOR_CN,
     ensure_positive_descendant_dosage: bool = True,
     mutation_branch_time: np.ndarray | None = None,
     mutation_origin_allele: np.ndarray | None = None,
@@ -562,7 +525,7 @@ def compute_mutation_sample_truth(
     }
 
 
-def _simulate_constrained_cn_evolution(
+def _simulate_clonal_cn_evolution(
     *,
     cna_rng: np.random.Generator,
     mutation_time_rng: np.random.Generator,
@@ -571,41 +534,10 @@ def _simulate_constrained_cn_evolution(
     mutation_origin_clone: np.ndarray,
     mutation_segment: np.ndarray,
     config: CopyNumberEvolutionConfig,
-    max_rejection_tries: int,
 ) -> tuple[JointEvolutionResult, np.ndarray, np.ndarray, dict[str, int]]:
-    _validate_copy_number_config(config)
-    K = int(np.asarray(parent).shape[0])
-    required_cn_clones = (
-        K if config.require_unique_cn_profiles else int(config.min_cn_clone_count)
-    )
-    if required_cn_clones > K:
-        raise ValueError(
-            "The requested minimum CN-clone count exceeds the evolutionary clone count."
-        )
-    if config.cna_event_rate == 0.0 and required_cn_clones > 1:
-        raise ValueError(
-            "A zero CNA event rate can generate only one diploid CN profile."
-        )
-    if config.max_allele_cn == 1 and required_cn_clones > 1:
-        raise ValueError("max_allele_cn=1 can generate only one diploid CN profile.")
-    min_two_state_fraction = config.min_two_state_snv_fraction
-    if min_two_state_fraction is not None:
-        if np.asarray(mutation_segment).size == 0:
-            raise ValueError(
-                "min_two_state_snv_fraction requires at least one mutation."
-            )
-        if K < 2:
-            raise ValueError(
-                "min_two_state_snv_fraction requires at least two evolutionary clones."
-            )
-        if config.cna_event_rate == 0.0:
-            raise ValueError(
-                "A positive min_two_state_snv_fraction cannot be met with a zero CNA event rate."
-            )
+    """Evolve one clonal CN history; eligibility requires no rejection sampling."""
 
-    rejection_limit = max(int(max_rejection_tries), 1)
-    best_two_state_fraction = float("-inf")
-    best_cn_clone_count = 0
+    _validate_copy_number_config(config)
     mutation_count = int(np.asarray(mutation_origin_clone).shape[0])
     mutation_branch_time = mutation_time_rng.random(mutation_count)
     mutation_origin_allele = mutation_time_rng.integers(
@@ -614,80 +546,24 @@ def _simulate_constrained_cn_evolution(
         size=mutation_count,
         dtype=int,
     )
-    for attempt in range(1, rejection_limit + 1):
-        events = simulate_branch_cna_events(
-            parent,
-            config,
-            constrained_segment_ids=np.unique(mutation_segment),
-            random_state=cna_rng,
-        )
-        evolution = simulate_joint_snv_cna_evolution(
-            parent=parent,
-            mutation_origin_clone=mutation_origin_clone,
-            mutation_segment=mutation_segment,
-            branch_cna_events=events,
-            n_segments=config.n_segments,
-            max_allele_cn=config.max_allele_cn,
-            ensure_positive_descendant_dosage=config.ensure_positive_descendant_dosage,
-            mutation_branch_time=mutation_branch_time,
-            mutation_origin_allele=mutation_origin_allele,
-            random_state=physical_copy_rng,
-        )
-        cn_clone_id, unique_profiles = canonicalize_cn_clone_profiles(
-            evolution.clone_allele_cn
-        )
-        best_cn_clone_count = max(best_cn_clone_count, int(unique_profiles.shape[0]))
-        state_count_by_segment = np.asarray(
-            [
-                np.unique(unique_profiles[:, segment_id, :], axis=0).shape[0]
-                for segment_id in range(int(config.n_segments))
-            ],
-            dtype=int,
-        )
-        max_local_states = config.max_local_cn_states_per_mutation
-        if max_local_states is not None:
-            mutation_state_counts = state_count_by_segment[
-                np.asarray(mutation_segment, dtype=int)
-            ]
-            if np.any(mutation_state_counts > int(max_local_states)):
-                raise AssertionError(
-                    "The constrained CNA event generator exceeded "
-                    "max_local_cn_states_per_mutation."
-                )
-        else:
-            mutation_state_counts = state_count_by_segment[
-                np.asarray(mutation_segment, dtype=int)
-            ]
-
-        two_state_fraction = float(np.mean(mutation_state_counts == 2))
-        best_two_state_fraction = max(best_two_state_fraction, two_state_fraction)
-        meets_two_state_fraction = (
-            min_two_state_fraction is None
-            or two_state_fraction >= float(min_two_state_fraction)
-        )
-        if unique_profiles.shape[0] >= required_cn_clones and meets_two_state_fraction:
-            return (
-                evolution,
-                cn_clone_id,
-                unique_profiles,
-                {
-                    "attempts": int(attempt),
-                    "accepted_cna_events": int(len(events)),
-                },
-            )
-    raise RuntimeError(
-        "Failed to generate copy-number evolution satisfying the configured "
-        f"invariants within {rejection_limit} attempts: "
-        f"required_cn_clone_count={required_cn_clones}, "
-        f"best_cn_clone_count={best_cn_clone_count}, "
-        "min_two_state_snv_fraction="
-        f"{min_two_state_fraction}, "
-        "best_two_state_snv_fraction="
-        f"{best_two_state_fraction:.6f}, "
-        "max_local_cn_states_per_mutation="
-        f"{config.max_local_cn_states_per_mutation}. "
-        "The two-state fraction is weighted by mutation IDs, not unique segments."
+    events = simulate_branch_cna_events(parent, config, random_state=cna_rng)
+    evolution = simulate_joint_snv_cna_evolution(
+        parent=parent,
+        mutation_origin_clone=mutation_origin_clone,
+        mutation_segment=mutation_segment,
+        branch_cna_events=events,
+        n_segments=int(config.n_segments),
+        max_allele_cn=int(config.max_allele_cn),
+        mutation_branch_time=mutation_branch_time,
+        mutation_origin_allele=mutation_origin_allele,
+        random_state=physical_copy_rng,
     )
+    cn_clone_id, unique_profiles = canonicalize_cn_clone_profiles(
+        evolution.clone_allele_cn
+    )
+    if unique_profiles.shape[0] != 1:
+        raise AssertionError("Trunk gains must leave one inherited clonal CN profile.")
+    return evolution, cn_clone_id, unique_profiles, {"accepted_cna_events": len(events)}
 
 
 __all__ = [

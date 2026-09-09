@@ -4,12 +4,11 @@ import numpy as np
 
 from ..config import FitConfig
 from ..core.fusion.types import RawFit
+from .config import SELECTION_SCORE_NAMES
 from .types import (
     CandidateRecord,
     CandidateSelectionDecision,
     RawFusionCandidate,
-    SelectionScore,
-    UnscoredRawFusionCandidate,
 )
 
 
@@ -39,15 +38,27 @@ def _number_or_nan(value: object) -> float:
         return float("nan")
 
 
-def raw_fit_has_exact_fusion_certificate(fit: RawFit) -> bool:
-    """Apply the complete schema-2 admission contract to one raw fit.
+def _normalize_selection_score_name(selection_score: str) -> str:
+    normalized = str(selection_score).strip().lower().replace("-", "_")
+    if normalized in SELECTION_SCORE_NAMES:
+        return normalized
+    allowed = ", ".join(SELECTION_SCORE_NAMES)
+    raise ValueError(
+        f"Unknown selection_score: {selection_score}. Expected one of: {allowed}."
+    )
 
-    This predicate deliberately excludes partition, refit, and score status.
-    The online controller must be able to distinguish an uncertified raw
-    objective from a certified raw fit whose downstream partition or score is
-    unavailable.
+
+def raw_candidate_has_exact_fusion_certificate(
+    candidate: RawFusionCandidate,
+) -> bool:
+    """Apply the complete schema-2 raw admission contract.
+
+    Keep every raw-candidate consumer on this typed predicate so selection,
+    raw-reference provenance, final-Phi parents, and controller certification
+    cannot drift apart.
     """
 
+    fit = candidate.raw_fit
     certificate = fit.certificate
     provenance = fit.provenance
     residual_method = str(certificate.residual_method)
@@ -55,7 +66,10 @@ def raw_fit_has_exact_fusion_certificate(fit: RawFit) -> bool:
     tolerance = _number_or_nan(certificate.tolerance)
     schema_version = _number_or_nan(certificate.schema_version)
     return bool(
-        float(provenance.lambda_value) > 0.0
+        candidate.eligible_for_selection
+        and candidate.raw_objective_certified
+        and float(provenance.lambda_value) > 0.0
+        and candidate.partition.certified
         and schema_version == _EXACT_CERTIFICATE_SCHEMA_VERSION
         and residual_method == _EXACT_CERTIFICATE_RESIDUAL_METHOD
         and str(certificate.audit_dtype) == "float64"
@@ -64,25 +78,15 @@ def raw_fit_has_exact_fusion_certificate(fit: RawFit) -> bool:
         and bool(str(provenance.original_graph_hash).strip())
         and bool(str(provenance.certificate_problem_hash).strip())
         and str(certificate.scope) == "full_original_graph"
-        and str(certificate.gradient_scope) in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
+        and str(certificate.gradient_scope)
+        in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
         and bool(certificate.certified)
-        and str(certificate.status) in _EXACT_CERTIFICATE_STATUSES
+        and str(certificate.status)
+        in _EXACT_CERTIFICATE_STATUSES
         and np.isfinite(residual)
         and np.isfinite(tolerance)
         and tolerance > 0.0
         and residual <= tolerance
-    )
-
-
-def raw_candidate_has_exact_fusion_certificate(
-    candidate: RawFusionCandidate,
-) -> bool:
-    """Apply raw, partition, and score admission to a scored candidate."""
-
-    return bool(
-        candidate.eligible_for_selection
-        and candidate.partition.certified
-        and raw_fit_has_exact_fusion_certificate(candidate.raw_fit)
     )
 
 
@@ -96,16 +100,7 @@ def candidate_is_selection_eligible(
     candidate = record.candidate
     if isinstance(candidate, RawFusionCandidate):
         return raw_candidate_has_exact_fusion_certificate(candidate)
-    if isinstance(candidate, UnscoredRawFusionCandidate):
-        return False
     return bool(candidate.eligible_for_selection and not strict_positive_exact_fusion)
-
-
-def _require_record_score(record: CandidateRecord) -> SelectionScore:
-    score = record.score
-    if score is None:
-        raise AssertionError("An unscored raw attempt reached partition selection.")
-    return score
 
 
 def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
@@ -118,10 +113,10 @@ def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
         if len(matches) < 2:
             continue
         reference = matches[0]
-        reference_score = _require_record_score(reference)
+        reference_score = reference.score
         reference_refit = reference.candidate.refit
         for record in matches[1:]:
-            score = _require_record_score(record)
+            score = record.score
             refit = record.candidate.refit
             score_consistent = (score.name, score.degrees_of_freedom, score.n_eff) == (
                 reference_score.name,
@@ -186,10 +181,9 @@ def candidate_representative_ids(
 def _candidate_representative_key(
     record: CandidateRecord,
 ) -> tuple[float, float, int, int, str, float, int]:
-    score = _require_record_score(record)
     return (
-        float(score.value),
-        float(score.numerical_uncertainty),
+        float(record.score.value),
+        float(record.score.numerical_uncertainty),
         0 if record.candidate.refit.global_optimum_certified else 1,
         0 if record.family == "raw_fusion" else 1,
         str(record.candidate.partition.source),
@@ -226,16 +220,12 @@ def select_candidate_records(
     ]
     if not eligible:
         raise ValueError("No typed candidates are eligible for model selection.")
-    if any(
-        not np.isfinite(float(_require_record_score(record).value))
-        for record in eligible
-    ):
+    if any(not np.isfinite(float(record.score.value)) for record in eligible):
         raise ValueError("Every selectable fixed-partition score must be finite.")
 
     def score_interval(record: CandidateRecord) -> tuple[float, float]:
-        score = _require_record_score(record)
-        uncertainty = max(float(score.numerical_uncertainty), 0.0)
-        value = float(score.value)
+        uncertainty = max(float(record.score.numerical_uncertainty), 0.0)
+        value = float(record.score.value)
         return value - uncertainty, value + uncertainty
 
     minimum_upper = min(score_interval(record)[1] for record in eligible)
@@ -256,9 +246,7 @@ def select_candidate_records(
         ]
         return (
             min(record.n_clusters for record in rows),
-            min(
-                int(_require_record_score(record).degrees_of_freedom) for record in rows
-            ),
+            min(int(record.score.degrees_of_freedom) for record in rows),
             min(raw_lambdas) if raw_lambdas else float("inf"),
             0 if any(record.family == "raw_fusion" for record in rows) else 1,
             str(signature),
@@ -290,7 +278,7 @@ def select_candidate_records(
     # immutable partition.
     selected_lambdas = sorted(
         {
-            canonical_lambda(float(record.lambda_value))
+            _canonical_lambda(float(record.lambda_value))
             for record in records
             if record.partition_signature == selected_signature
             and isinstance(record.candidate, RawFusionCandidate)
@@ -330,26 +318,18 @@ def select_candidate_records(
         selection_hits_upper_boundary=bool(upper_hit),
         selection_boundary_unresolved=bool(boundary_unresolved),
     )
-
-
-def canonical_lambda(value: float) -> float:
+def _canonical_lambda(value: float) -> float:
     return float(np.round(float(value), 12))
 
 
-def prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
+def _prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
     if incumbent is None:
         return True
     certified = candidate.certificate.admissible
     if certified != incumbent.certificate.admissible:
         return bool(certified)
-    candidate_values = (
-        candidate.objective.total,
-        candidate.certificate.components.residual,
-    )
-    incumbent_values = (
-        incumbent.objective.total,
-        incumbent.certificate.components.residual,
-    )
+    candidate_values = (candidate.objective.total, candidate.certificate.components.residual)
+    incumbent_values = (incumbent.objective.total, incumbent.certificate.components.residual)
     for candidate_value, incumbent_value in zip(
         candidate_values, incumbent_values, strict=True
     ):
@@ -371,7 +351,7 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def effective_bic_partition_tol(options: FitConfig) -> float:
+def _effective_bic_partition_tol(options: FitConfig) -> float:
     value = options.selection.partition_tolerance
     return float(max(float(value), 1e-12))
 

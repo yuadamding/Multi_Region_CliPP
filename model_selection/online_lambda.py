@@ -8,7 +8,7 @@ lambda is proposed at a time from certified exact-fusion observations:
 * move toward the guide cluster count using the observed count discrepancy or
   a secant estimate on ``log(K)`` versus ``log(lambda)``;
 * bracket a skipped cluster-count transition and bisect it geometrically;
-* bracket the best observed BIC basin on both sides and geometrically resolve
+* bracket the best observed ICL basin on both sides and geometrically resolve
   its two partition boundaries.
 
 The controller is intentionally solver-agnostic. The caller owns solver warm
@@ -29,9 +29,6 @@ from dataclasses import dataclass
 from math import exp, isfinite, log
 
 import numpy as np
-
-
-ONLINE_LAMBDA_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -56,9 +53,7 @@ class OnlineLambdaConfig:
     # anchors before failing the entire raw path.  These probes are separate
     # from the statistical exploration budget because no path exists yet.
     max_bootstrap_anchor_lambdas: int = 3
-    # Applies only to certified statistical refinement proposals.  Initial
-    # path exploration remains exhaustive within its independent budget.
-    no_progress_patience: int = 3
+    partition_event_mode: bool = False
 
     def __post_init__(self) -> None:
         if int(self.num_mutations) < 1:
@@ -92,8 +87,6 @@ class OnlineLambdaConfig:
             raise ValueError("max_solver_retries_per_lambda must be nonnegative.")
         if int(self.max_bootstrap_anchor_lambdas) < 0:
             raise ValueError("max_bootstrap_anchor_lambdas must be nonnegative.")
-        if int(self.no_progress_patience) < 1:
-            raise ValueError("no_progress_patience must be positive.")
 
 
 @dataclass(frozen=True)
@@ -103,7 +96,7 @@ class OnlineLambdaObservation:
     lambda_value: float
     n_clusters: int
     partition_signature: str
-    partition_bic: float
+    partition_icl: float
     kkt_residual: float
     raw_objective_certified: bool
     partition_certified: bool
@@ -124,26 +117,6 @@ class OnlineLambdaProposal:
     bracket_left_lambda: float | None = None
     bracket_right_lambda: float | None = None
     retry_number: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class OnlineLambdaState:
-    """Immutable checkpoint snapshot for the partition-event controller."""
-
-    version: int
-    config: OnlineLambdaConfig
-    initial_lambda: float
-    initial_reason: str
-    certified: tuple[tuple[float, OnlineLambdaObservation], ...]
-    last_observation: OnlineLambdaObservation | None
-    retry_key: float | None
-    attempts: tuple[tuple[float, float, str, int], ...]
-    proposal_history: tuple[OnlineLambdaProposal, ...]
-    solver_recovery_keys: tuple[float, ...]
-    bootstrap_anchor_keys: tuple[float, ...]
-    uncertified_exhausted_keys: tuple[float, ...]
-    no_progress_streak: int
-    stop_reason: str | None
 
 
 def _lambda_key(value: float) -> float:
@@ -181,8 +154,11 @@ class OnlineLambdaController:
     scale can record ``"partition_guide_kkt_balance"`` without changing any
     proposal rule.
 
-    The production search treats every change in partition identity as a model
-    event and resolves those events without assuming monotone cluster counts.
+    The search is conditional on the usual one-dimensional path assumption:
+    increasing lambda should not increase the number of fused groups, and ICL
+    has a locally bracketable basin near the likelihood-partition guide.  A
+    certified violation of cluster-count monotonicity is geometrically refined
+    and reported rather than silently used for selection.
     """
 
     def __init__(
@@ -214,7 +190,6 @@ class OnlineLambdaController:
         self._solver_recovery_keys: set[float] = set()
         self._bootstrap_anchor_keys: set[float] = set()
         self._uncertified_exhausted_keys: set[float] = set()
-        self._no_progress_streak = 0
         self._stop_reason: str | None = None
 
     @property
@@ -231,179 +206,6 @@ class OnlineLambdaController:
             sorted(self._certified.values(), key=lambda item: item.lambda_value)
         )
 
-    def snapshot(self) -> OnlineLambdaState:
-        """Freeze the controller between complete proposal transactions."""
-
-        if self._pending is not None:
-            raise RuntimeError(
-                "OnlineLambdaController can be checkpointed only after the "
-                "outstanding proposal has been observed."
-            )
-        return OnlineLambdaState(
-            version=ONLINE_LAMBDA_STATE_VERSION,
-            config=self.config,
-            initial_lambda=float(self.initial_lambda),
-            initial_reason=str(self.initial_reason),
-            certified=tuple(sorted(self._certified.items())),
-            last_observation=self._last_observation,
-            retry_key=self._retry_key,
-            attempts=tuple(
-                (
-                    float(key),
-                    float(value),
-                    str(self._attempted_phase[key]),
-                    int(self._attempt_count[key]),
-                )
-                for key, value in self._attempted_lambda.items()
-            ),
-            proposal_history=tuple(self._proposal_history),
-            solver_recovery_keys=tuple(sorted(self._solver_recovery_keys)),
-            bootstrap_anchor_keys=tuple(sorted(self._bootstrap_anchor_keys)),
-            uncertified_exhausted_keys=tuple(
-                sorted(self._uncertified_exhausted_keys)
-            ),
-            no_progress_streak=int(self._no_progress_streak),
-            stop_reason=self._stop_reason,
-        )
-
-    @classmethod
-    def from_snapshot(cls, state: OnlineLambdaState) -> "OnlineLambdaController":
-        """Restore one typed snapshot, validating cross-field invariants."""
-
-        if not isinstance(state, OnlineLambdaState):
-            raise TypeError("controller snapshot must be OnlineLambdaState.")
-        if int(state.version) != ONLINE_LAMBDA_STATE_VERSION:
-            raise ValueError("Unsupported online-lambda state version.")
-        controller = cls(
-            initial_lambda=float(state.initial_lambda),
-            config=state.config,
-            initial_reason=str(state.initial_reason),
-        )
-        if controller.initial_lambda != float(state.initial_lambda):
-            raise ValueError("Stored initial lambda lies outside its configured bounds.")
-        controller._certified = dict(state.certified)
-        controller._last_observation = state.last_observation
-        controller._retry_key = state.retry_key
-        controller._attempted_lambda = {
-            float(key): float(value) for key, value, _, _ in state.attempts
-        }
-        controller._attempted_phase = {
-            float(key): str(phase) for key, _, phase, _ in state.attempts
-        }
-        controller._attempt_count = {
-            float(key): int(count) for key, _, _, count in state.attempts
-        }
-        if len(controller._attempted_lambda) != len(state.attempts):
-            raise ValueError("Controller snapshot contains duplicate attempt keys.")
-        controller._proposal_history = list(state.proposal_history)
-        controller._solver_recovery_keys = set(state.solver_recovery_keys)
-        controller._bootstrap_anchor_keys = set(state.bootstrap_anchor_keys)
-        controller._uncertified_exhausted_keys = set(
-            state.uncertified_exhausted_keys
-        )
-        if any(
-            len(values) != len(set(values))
-            for values in (
-                state.solver_recovery_keys,
-                state.bootstrap_anchor_keys,
-                state.uncertified_exhausted_keys,
-            )
-        ):
-            raise ValueError("Controller snapshot contains duplicate recovery keys.")
-        controller._no_progress_streak = int(state.no_progress_streak)
-        controller._stop_reason = state.stop_reason
-        controller._validate_restored_state()
-        return controller
-
-    def _validate_restored_state(self) -> None:
-        """Validate relationships that individual field decoders cannot see."""
-
-        attempted_keys = set(self._attempted_lambda)
-        if attempted_keys != set(self._attempted_phase) or attempted_keys != set(
-            self._attempt_count
-        ):
-            raise ValueError("Controller attempted-lambda maps have different keys.")
-        for key, value in self._attempted_lambda.items():
-            if (
-                not isfinite(float(value))
-                or not float(self.config.lambda_min)
-                <= float(value)
-                <= float(self.config.lambda_max)
-                or _lambda_key(value) != key
-            ):
-                raise ValueError("Controller state contains a noncanonical lambda key.")
-
-        history_counts: dict[float, int] = {}
-        history_first_phase: dict[float, str] = {}
-        for proposal in self._proposal_history:
-            key = _lambda_key(proposal.lambda_value)
-            if key not in attempted_keys:
-                raise ValueError("Proposal history contains an unrecorded lambda.")
-            history_counts[key] = int(history_counts.get(key, 0) + 1)
-            history_first_phase.setdefault(key, str(proposal.phase))
-        if history_counts != self._attempt_count:
-            raise ValueError("Proposal history does not reproduce attempt counts.")
-        if history_first_phase != self._attempted_phase:
-            raise ValueError("Proposal history does not reproduce first-attempt phases.")
-
-        for key, observation in self._certified.items():
-            if key not in attempted_keys or _lambda_key(observation.lambda_value) != key:
-                raise ValueError("Certified observation has inconsistent lambda identity.")
-            if not 1 <= int(observation.n_clusters) <= int(
-                self.config.num_mutations
-            ):
-                raise ValueError("Certified observation has an invalid cluster count.")
-            if not self._is_exact_fusion_certified(observation):
-                raise ValueError("Certified observation fails the controller KKT rule.")
-
-        tracked_key_sets = (
-            self._solver_recovery_keys,
-            self._bootstrap_anchor_keys,
-            self._uncertified_exhausted_keys,
-        )
-        if any(not keys.issubset(attempted_keys) for keys in tracked_key_sets):
-            raise ValueError("Controller recovery state refers to an unattempted lambda.")
-        if len(self._bootstrap_anchor_keys) > int(
-            self.config.max_bootstrap_anchor_lambdas
-        ):
-            raise ValueError("Controller state exceeds its bootstrap-anchor budget.")
-        if (
-            self._stop_reason == "online_lambda_no_meaningful_progress"
-            and int(self._no_progress_streak)
-            < int(self.config.no_progress_patience)
-        ):
-            raise ValueError(
-                "No-progress stop reason lacks the required certified streak."
-            )
-
-        if not self._proposal_history:
-            if (
-                self._last_observation is not None
-                or attempted_keys
-                or self._certified
-                or any(tracked_key_sets)
-                or self._retry_key is not None
-                or int(self._no_progress_streak) != 0
-                or self._stop_reason is not None
-            ):
-                raise ValueError("Empty proposal history has nonempty controller state.")
-            return
-        if self._last_observation is None:
-            raise ValueError("Proposal history lacks its last observation.")
-        last_key = _lambda_key(self._last_observation.lambda_value)
-        if last_key != _lambda_key(self._proposal_history[-1].lambda_value):
-            raise ValueError("Last observation does not match the last proposal.")
-        if self._retry_key is not None:
-            if self._retry_key != last_key or self._is_exact_fusion_certified(
-                self._last_observation
-            ):
-                raise ValueError("Retry key does not identify the failed observation.")
-        elif (
-            self._stop_reason is None
-            and not self._is_exact_fusion_certified(self._last_observation)
-        ):
-            raise ValueError("Uncertified active state lacks its retry key.")
-
     @property
     def best_observation(self) -> OnlineLambdaObservation | None:
         finite = [
@@ -413,25 +215,43 @@ class OnlineLambdaController:
         ]
         if not finite:
             return None
-        minimum_upper = min(
-            float(item.partition_bic)
-            + max(float(item.score_numerical_uncertainty), 0.0)
-            for item in finite
+        if bool(self.config.partition_event_mode):
+            minimum_upper = min(
+                float(item.partition_icl)
+                + max(float(item.score_numerical_uncertainty), 0.0)
+                for item in finite
+            )
+            tied = [
+                item
+                for item in finite
+                if float(item.partition_icl)
+                - max(float(item.score_numerical_uncertainty), 0.0)
+                <= minimum_upper
+            ]
+            return min(
+                tied,
+                key=lambda item: (
+                    int(item.n_clusters),
+                    int(item.degrees_of_freedom),
+                    float(item.lambda_value),
+                    str(item.partition_signature),
+                ),
+            )
+        best_score = min(float(item.partition_icl) for item in finite)
+        score_tol = float(self.config.score_relative_tolerance) * (
+            1.0 + abs(best_score)
         )
         tied = [
             item
             for item in finite
-            if float(item.partition_bic)
-            - max(float(item.score_numerical_uncertainty), 0.0)
-            <= minimum_upper
+            if float(item.partition_icl) <= best_score + score_tol
         ]
         return min(
             tied,
             key=lambda item: (
-                int(item.n_clusters),
-                int(item.degrees_of_freedom),
+                abs(log(float(item.lambda_value)) - log(self.initial_lambda)),
+                abs(int(item.n_clusters) - int(self.config.guide_n_clusters)),
                 float(item.lambda_value),
-                str(item.partition_signature),
             ),
         )
 
@@ -448,7 +268,7 @@ class OnlineLambdaController:
     ) -> bool:
         return bool(
             observation.selection_score_available
-            and isfinite(float(observation.partition_bic))
+            and isfinite(float(observation.partition_icl))
         )
 
     def _record_proposal(self, proposal: OnlineLambdaProposal) -> OnlineLambdaProposal:
@@ -459,93 +279,6 @@ class OnlineLambdaController:
         self._pending = proposal
         self._proposal_history.append(proposal)
         return proposal
-
-    def _progress_metrics(
-        self,
-    ) -> tuple[int, int, float, float, tuple[float, ...]]:
-        """Return deterministic search progress from certified observations.
-
-        The tuple records unique scored partitions, the controller's own event
-        signatures, best score/KKT values, and the descending vector of every
-        unresolved event width.  Using the full width vector recognizes a
-        bisection even when another equally wide event remains.
-        """
-
-        certified = sorted(
-            self._certified.values(), key=lambda item: float(item.lambda_value)
-        )
-        scored = [
-            item for item in certified if self._selection_score_is_available(item)
-        ]
-        unique_scored = len({str(item.partition_signature) for item in scored})
-        unique_events = len(
-            {self._event_signature(item) for item in certified}
-        )
-        best_score_upper = min(
-            (
-                float(item.partition_bic)
-                + max(float(item.score_numerical_uncertainty), 0.0)
-                for item in scored
-            ),
-            default=float("inf"),
-        )
-        best_kkt = min(
-            (float(item.kkt_residual) for item in certified),
-            default=float("inf"),
-        )
-        event_widths = tuple(
-            sorted(
-                (
-                    _log10_width(
-                        float(left.lambda_value), float(right.lambda_value)
-                    )
-                    for left, right in zip(
-                        certified[:-1], certified[1:], strict=True
-                    )
-                    if self._event_signature(left) != self._event_signature(right)
-                    and _log10_width(
-                        float(left.lambda_value), float(right.lambda_value)
-                    )
-                    > float(self.config.transition_log10_width_tolerance)
-                ),
-                reverse=True,
-            )
-        )
-        return (
-            unique_scored,
-            unique_events,
-            best_score_upper,
-            best_kkt,
-            event_widths,
-        )
-
-    def _progress_improved(
-        self,
-        before: tuple[int, int, float, float, tuple[float, ...]],
-        after: tuple[int, int, float, float, tuple[float, ...]],
-    ) -> bool:
-        if int(after[0]) > int(before[0]):
-            return True
-        if int(after[1]) > int(before[1]):
-            return True
-        before_score, after_score = float(before[2]), float(after[2])
-        if isfinite(after_score) and (
-            not isfinite(before_score)
-            or after_score
-            < before_score
-            - float(self.config.score_relative_tolerance)
-            * (1.0 + abs(before_score))
-        ):
-            return True
-        before_kkt, after_kkt = float(before[3]), float(after[3])
-        if isfinite(after_kkt) and (
-            not isfinite(before_kkt) or after_kkt < 0.95 * before_kkt
-        ):
-            return True
-        before_widths, after_widths = before[4], after[4]
-        if not before_widths:
-            return False
-        return bool(after_widths < before_widths)
 
     def observe(self, observation: OnlineLambdaObservation) -> None:
         """Consume the exact-fusion result for the outstanding proposal."""
@@ -560,8 +293,6 @@ class OnlineLambdaController:
             )
         if not 1 <= int(observation.n_clusters) <= int(self.config.num_mutations):
             raise ValueError("Observed n_clusters must lie in [1, num_mutations].")
-        pending_phase = str(self._pending.phase)
-        progress_before = self._progress_metrics()
         key = _lambda_key(observation.lambda_value)
         self._attempt_count[key] = int(self._attempt_count.get(key, 0) + 1)
         self._last_observation = observation
@@ -582,15 +313,6 @@ class OnlineLambdaController:
             ):
                 self._certified[key] = observation
             self._retry_key = None
-            progress_after = self._progress_metrics()
-            if self._progress_improved(progress_before, progress_after):
-                self._no_progress_streak = 0
-            elif _is_refinement_phase(pending_phase):
-                self._no_progress_streak += 1
-                if int(self._no_progress_streak) >= int(
-                    self.config.no_progress_patience
-                ):
-                    self._stop_reason = "online_lambda_no_meaningful_progress"
         else:
             self._retry_key = key
 
@@ -682,11 +404,18 @@ class OnlineLambdaController:
         original_stop_reason = self._stop_reason
         for direction in directions:
             self._stop_reason = None
-            proposal = self._event_outward_proposal(
-                points,
-                direction=direction,
-                reason="refinement_budget_exhausted_continue_union_exploration",
-            )
+            if bool(self.config.partition_event_mode):
+                proposal = self._event_outward_proposal(
+                    points,
+                    direction=direction,
+                    reason="refinement_budget_exhausted_continue_union_exploration",
+                )
+            else:
+                proposal = self._outward_proposal(
+                    points,
+                    direction=direction,
+                    reason="refinement_budget_exhausted_continue_path_exploration",
+                )
             if proposal is not None:
                 return proposal
         self._stop_reason = original_stop_reason
@@ -768,52 +497,86 @@ class OnlineLambdaController:
     ) -> OnlineLambdaProposal | None:
         """Return the next geometric lambda for raw-provenance bootstrap.
 
-        A higher lambda is tried first because its stronger fusion penalty is a
-        numerically simpler certification target. Distinct probes then
-        alternate around the initial value at offsets ``+1, -1, +2, -2, ...``
-        in log-lambda space. This keeps the nearest lower anchor from being
-        skipped and treats clipped boundary duplicates deterministically. The
-        runner evaluates each proposal at recovery effort with independent
-        guide, zero-penalty, and pooled starts.
+        A higher lambda is preferred because its stronger fusion penalty is a
+        numerically simpler certification target.  Successive failures move to
+        ``initial_lambda * exp(1)``, ``* exp(2)``, and so on.  The corresponding
+        lower anchors are deterministic boundary fallbacks.  The runner
+        evaluates each proposal at recovery effort with independent guide,
+        zero-penalty, and pooled starts.
         """
 
         if failed is None or len(self._bootstrap_anchor_keys) >= int(
             self.config.max_bootstrap_anchor_lambdas
         ):
             return None
-        for distance in range(
-            1,
-            int(self.config.max_bootstrap_anchor_lambdas) + 1,
-        ):
-            for direction in (1.0, -1.0):
-                candidate = float(
-                    min(
-                        max(
-                            float(self.initial_lambda)
-                            * exp(direction * float(distance)),
-                            float(self.config.lambda_min),
-                        ),
-                        float(self.config.lambda_max),
-                    )
+        anchor_index = int(len(self._bootstrap_anchor_keys) + 1)
+        for direction in (1.0, -1.0):
+            candidate = float(
+                min(
+                    max(
+                        float(self.initial_lambda)
+                        * exp(direction * float(anchor_index)),
+                        float(self.config.lambda_min),
+                    ),
+                    float(self.config.lambda_max),
                 )
-                key = _lambda_key(candidate)
-                if (
-                    key == _lambda_key(float(failed.lambda_value))
-                    or key in self._attempted_lambda
-                ):
-                    continue
-                return OnlineLambdaProposal(
-                    lambda_value=candidate,
-                    phase="bootstrap_certification_anchor",
-                    reason="initial_lambda_uncertified_probe_distinct_anchor",
-                    warm_start_lambda=None,
-                    retry_number=0,
-                )
+            )
+            key = _lambda_key(candidate)
+            if (
+                key == _lambda_key(float(failed.lambda_value))
+                or key in self._attempted_lambda
+            ):
+                continue
+            return OnlineLambdaProposal(
+                lambda_value=candidate,
+                phase="bootstrap_certification_anchor",
+                reason="initial_lambda_uncertified_probe_distinct_anchor",
+                warm_start_lambda=None,
+                retry_number=0,
+            )
         return None
 
     def _choose_from_certified_path(self) -> OnlineLambdaProposal | None:
         points = list(self.observations)
-        return self._choose_from_partition_events(points)
+
+        if bool(self.config.partition_event_mode):
+            return self._choose_from_partition_events(points)
+
+        inconsistency = self._unresolved_monotonicity_interval(points)
+        if inconsistency is not None:
+            left, right = inconsistency
+            if self._interval_resolved(left, right):
+                self._stop_reason = "online_lambda_nonmonotone_fusion_path"
+                return None
+            return self._midpoint_proposal(
+                left,
+                right,
+                phase="refine_inconsistency",
+                reason="cluster_count_increased_with_lambda",
+            )
+
+        guide_k = int(self.config.guide_n_clusters)
+        if not any(int(item.n_clusters) == guide_k for item in points):
+            crossing = self._guide_k_crossing(points)
+            if crossing is not None:
+                left, right = crossing
+                if not self._interval_resolved(left, right):
+                    return self._midpoint_proposal(
+                        left,
+                        right,
+                        phase="refine_target_transition",
+                        reason="guide_cluster_count_bracketed_but_skipped",
+                    )
+            elif all(int(item.n_clusters) > guide_k for item in points):
+                return self._outward_proposal(
+                    points, direction=1, reason="observed_k_above_guide_k"
+                )
+            elif all(int(item.n_clusters) < guide_k for item in points):
+                return self._outward_proposal(
+                    points, direction=-1, reason="observed_k_below_guide_k"
+                )
+
+        return self._score_basin_proposal(points)
 
     @staticmethod
     def _event_signature(observation: OnlineLambdaObservation) -> tuple[object, ...]:
@@ -955,6 +718,45 @@ class OnlineLambdaController:
             warm_start_lambda=float(frontier.lambda_value),
         )
 
+    def _unresolved_monotonicity_interval(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> tuple[OnlineLambdaObservation, OnlineLambdaObservation] | None:
+        violations = [
+            (left, right)
+            for left, right in zip(points[:-1], points[1:])
+            if int(right.n_clusters) > int(left.n_clusters)
+        ]
+        if not violations:
+            return None
+        return min(
+            violations,
+            key=lambda pair: (
+                _log10_width(pair[0].lambda_value, pair[1].lambda_value),
+                pair[0].lambda_value,
+            ),
+        )
+
+    def _guide_k_crossing(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> tuple[OnlineLambdaObservation, OnlineLambdaObservation] | None:
+        guide_k = int(self.config.guide_n_clusters)
+        crossings = [
+            (left, right)
+            for left, right in zip(points[:-1], points[1:])
+            if int(left.n_clusters) > guide_k > int(right.n_clusters)
+        ]
+        if not crossings:
+            return None
+        return min(
+            crossings,
+            key=lambda pair: (
+                _log10_width(pair[0].lambda_value, pair[1].lambda_value),
+                pair[0].lambda_value,
+            ),
+        )
+
     def _interval_resolved(
         self,
         left: OnlineLambdaObservation,
@@ -987,11 +789,273 @@ class OnlineLambdaController:
             bracket_right_lambda=float(right.lambda_value),
         )
 
+    def _outward_proposal(
+        self,
+        points: list[OnlineLambdaObservation],
+        *,
+        direction: int,
+        reason: str,
+        allow_opposite: bool = True,
+    ) -> OnlineLambdaProposal | None:
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or +1.")
+        frontier = points[-1] if direction > 0 else points[0]
+        neighbor = None
+        if len(points) > 1:
+            neighbor = points[-2] if direction > 0 else points[1]
+        if direction > 0 and int(frontier.n_clusters) == 1:
+            self._stop_reason = "online_lambda_upper_structural_boundary_reached"
+            return None
+        if direction < 0 and int(frontier.n_clusters) == int(self.config.num_mutations):
+            self._stop_reason = "online_lambda_lower_structural_boundary_reached"
+            return None
+
+        candidate = self._next_outward_lambda(frontier, neighbor, direction=direction)
+        if candidate is None:
+            self._stop_reason = (
+                "online_lambda_upper_search_bound_reached"
+                if direction > 0
+                else "online_lambda_lower_search_bound_reached"
+            )
+            return None
+        if _lambda_key(candidate) in self._uncertified_exhausted_keys:
+            if allow_opposite:
+                return self._outward_proposal(
+                    points,
+                    direction=-int(direction),
+                    reason=f"{reason}_opposite_of_uncertified_boundary",
+                    allow_opposite=False,
+                )
+            self._stop_reason = "online_lambda_uncertified_boundaries_exhausted"
+            return None
+        return OnlineLambdaProposal(
+            lambda_value=float(candidate),
+            phase="expand_upper" if direction > 0 else "expand_lower",
+            reason=str(reason),
+            warm_start_lambda=float(frontier.lambda_value),
+        )
+
+    def _next_outward_lambda(
+        self,
+        frontier: OnlineLambdaObservation,
+        neighbor: OnlineLambdaObservation | None,
+        *,
+        direction: int,
+    ) -> float | None:
+        x_frontier = log(float(frontier.lambda_value))
+        k_frontier = int(frontier.n_clusters)
+        guide_k = int(self.config.guide_n_clusters)
+        if direction > 0:
+            adjacent_k = max(k_frontier - 1, 1)
+        else:
+            adjacent_k = min(k_frontier + 1, int(self.config.num_mutations))
+        discrete_resolution = abs(log(float(adjacent_k)) - log(float(k_frontier)))
+        target_gap = abs(log(float(k_frontier)) - log(float(guide_k)))
+        observed_gap = max(discrete_resolution, target_gap, np.finfo(np.float64).eps)
+
+        proposed_x: float | None = None
+        previous_log_step = 0.0
+        if neighbor is not None:
+            x_neighbor = log(float(neighbor.lambda_value))
+            previous_log_step = abs(x_frontier - x_neighbor)
+            delta_x = x_frontier - x_neighbor
+            delta_log_k = log(float(k_frontier)) - log(float(neighbor.n_clusters))
+            if (
+                abs(delta_x) > np.finfo(np.float64).eps
+                and abs(delta_log_k) > np.finfo(np.float64).eps
+            ):
+                slope = delta_log_k / delta_x
+                if slope < 0.0:
+                    secant_x = (
+                        x_frontier
+                        + (log(float(guide_k)) - log(float(k_frontier))) / slope
+                    )
+                    if direction * (secant_x - x_frontier) > 0.0:
+                        proposed_x = x_frontier + direction * max(
+                            abs(secant_x - x_frontier),
+                            discrete_resolution,
+                        )
+        if proposed_x is None:
+            if neighbor is None:
+                log_step = observed_gap
+            elif (
+                frontier.partition_signature == neighbor.partition_signature
+                and previous_log_step > 0.0
+            ):
+                # Repeatedly observing the identical partition supplies direct
+                # evidence that the last log-step was too short to reach a
+                # transition. Expand that *observed* plateau geometrically in
+                # log-lambda space instead of crawling by one discrete K gap.
+                # This is state-dependent and does not prescribe a lambda list.
+                log_step = max(2.0 * previous_log_step, observed_gap)
+            else:
+                log_step = previous_log_step + observed_gap
+            proposed_x = x_frontier + direction * log_step
+
+        lower_x = log(float(self.config.lambda_min))
+        upper_x = log(float(self.config.lambda_max))
+        bounded_x = min(max(proposed_x, lower_x), upper_x)
+        candidate = exp(bounded_x)
+        if direction > 0 and candidate <= float(frontier.lambda_value) * (
+            1.0 + 8.0 * np.finfo(float).eps
+        ):
+            return None
+        if direction < 0 and candidate >= float(frontier.lambda_value) * (
+            1.0 - 8.0 * np.finfo(float).eps
+        ):
+            return None
+        return float(candidate)
+
+    def _score_basin_proposal(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> OnlineLambdaProposal | None:
+        best = self.best_observation
+        if best is None:
+            return self._unresolved_partition_proposal(points)
+        best_index = next(
+            idx
+            for idx, item in enumerate(points)
+            if _lambda_key(item.lambda_value) == _lambda_key(best.lambda_value)
+        )
+        run_left = best_index
+        while (
+            run_left > 0
+            and points[run_left - 1].partition_signature == best.partition_signature
+        ):
+            run_left -= 1
+        run_right = best_index
+        while (
+            run_right + 1 < len(points)
+            and points[run_right + 1].partition_signature == best.partition_signature
+        ):
+            run_right += 1
+
+        left_guard = points[run_left - 1] if run_left > 0 else None
+        right_guard = points[run_right + 1] if run_right + 1 < len(points) else None
+        left_terminal = left_guard is None and int(points[run_left].n_clusters) == int(
+            self.config.num_mutations
+        )
+        right_terminal = right_guard is None and int(points[run_right].n_clusters) == 1
+
+        missing_left = left_guard is None and not left_terminal
+        missing_right = right_guard is None and not right_terminal
+        if missing_left or missing_right:
+            if missing_left and missing_right:
+                lower_span = max(
+                    log(self.initial_lambda) - log(points[0].lambda_value), 0.0
+                )
+                upper_span = max(
+                    log(points[-1].lambda_value) - log(self.initial_lambda), 0.0
+                )
+                if lower_span < upper_span:
+                    direction = -1
+                elif upper_span < lower_span:
+                    direction = 1
+                else:
+                    guide_k = int(self.config.guide_n_clusters)
+                    if int(best.n_clusters) > guide_k:
+                        direction = 1
+                    elif int(best.n_clusters) < guide_k:
+                        direction = -1
+                    else:
+                        direction = 1
+            else:
+                direction = -1 if missing_left else 1
+            return self._outward_proposal(
+                points,
+                direction=direction,
+                reason="bracket_best_partition_icl_basin",
+            )
+
+        boundary_intervals: list[
+            tuple[
+                OnlineLambdaObservation,
+                OnlineLambdaObservation,
+                OnlineLambdaObservation,
+            ]
+        ] = []
+        if left_guard is not None:
+            boundary_intervals.append((left_guard, points[run_left], left_guard))
+        if right_guard is not None:
+            boundary_intervals.append((points[run_right], right_guard, right_guard))
+        unresolved = [
+            item
+            for item in boundary_intervals
+            if not self._interval_resolved(item[0], item[1])
+        ]
+        if unresolved:
+            left, right, guard = max(
+                unresolved,
+                key=lambda item: (
+                    _log10_width(item[0].lambda_value, item[1].lambda_value),
+                    -float(guard_score(item[2])),
+                ),
+            )
+            return self._midpoint_proposal(
+                left,
+                right,
+                phase="refine_score_basin",
+                reason="resolve_best_partition_signature_boundary",
+            )
+
+        if any(
+            not isfinite(float(guard.partition_icl))
+            for _, _, guard in boundary_intervals
+        ):
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+            return None
+        self._stop_reason = "online_lambda_score_basin_resolved"
+        return None
+
+    def _unresolved_partition_proposal(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> OnlineLambdaProposal | None:
+        """Search adjacent lambdas without retrying an already certified raw fit."""
+
+        if not points:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+            return None
+        left = points[0]
+        right = points[-1]
+        can_expand_lower = bool(
+            float(left.lambda_value) > float(self.config.lambda_min)
+            and int(left.n_clusters) < int(self.config.num_mutations)
+        )
+        can_expand_upper = bool(
+            float(right.lambda_value) < float(self.config.lambda_max)
+            and int(right.n_clusters) > 1
+        )
+        if not can_expand_lower and not can_expand_upper:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+            return None
+        if can_expand_lower and can_expand_upper:
+            lower_span = max(log(self.initial_lambda) - log(left.lambda_value), 0.0)
+            upper_span = max(log(right.lambda_value) - log(self.initial_lambda), 0.0)
+            direction = -1 if lower_span < upper_span else 1
+        else:
+            direction = -1 if can_expand_lower else 1
+        proposal = self._outward_proposal(
+            points,
+            direction=direction,
+            reason="raw_certified_partition_unresolved_search_neighbor",
+        )
+        if proposal is None and self._stop_reason is not None:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+        return proposal
+
+
+def guard_score(observation: OnlineLambdaObservation) -> float:
+    """Sort non-finite guard scores after finite scores."""
+
+    value = float(observation.partition_icl)
+    return value if isfinite(value) else float("inf")
+
+
 __all__ = [
-    "ONLINE_LAMBDA_STATE_VERSION",
     "OnlineLambdaConfig",
     "OnlineLambdaController",
     "OnlineLambdaObservation",
     "OnlineLambdaProposal",
-    "OnlineLambdaState",
 ]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 import csv
 from dataclasses import dataclass
 import gzip
@@ -10,23 +10,20 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
-from ..config import DEFAULT_DOSAGE_PRIOR_PENALTY
-from .data import EmissionPaths, ExclusionCode, TumorData
+from .data import CNFilterRecord, CNFilterReport, TumorData
+from .multiplicity import MAX_MAJOR_CN, build_clonal_integer_likelihood
 from .path_compiler import (
-    CompiledPathSet,
     LocalCopyNumberState,
-    PATH_CANDIDATE_GENERATOR_VERSION,
-    PATH_LIKELIHOOD_MODEL_ID,
-    PATH_LIKELIHOOD_MODEL_VERSION,
-    build_emission_paths,
-    compile_single_switch_paths,
-    dominant_copy_number_state,
-    path_prior_mode,
+    initialize_path_marginal_phi,
 )
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
+DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
+CN_FILTER_POLICY_ID = "clonal_cn_major_le6_whole_mutation_v1"
+SUBCLONAL_CN_REGION = "SUBCLONAL_CN_REGION"
+MAJOR_CN_GT_6 = "MAJOR_CN_GT_6"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 # The complete model-defining schema is the header of exampleTumor1.tsv.
 # Writers emit these first, followed by any inert provenance columns.
@@ -53,7 +50,7 @@ class TumorTxtError(ValueError):
 
 
 class UnsupportedTumorInputError(ValueError):
-    """Raised when a local state mixture is outside the single-switch model."""
+    """Raised when retained CN has no supported positive multiplicity."""
 
     def __init__(
         self,
@@ -69,6 +66,18 @@ class UnsupportedTumorInputError(ValueError):
         self.detail = str(detail)
         super().__init__(
             f"{self.reason}: {self.region_id}, segment {self.segment_id}: {self.detail}"
+        )
+
+
+class NoEligibleSNVsError(ValueError):
+    """All input mutations were excluded before likelihood construction."""
+
+    def __init__(self, report: CNFilterReport, *, tumor_id: str) -> None:
+        self.cn_filter_report = report
+        self.tumor_id = str(tumor_id)
+        super().__init__(
+            f"No eligible SNVs remain for {self.tumor_id!r}: excluded all "
+            f"{report.input_mutation_count} input mutations under {report.policy_id}."
         )
 
 
@@ -135,9 +144,7 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
     return validated
 
 
-def _read_text_table(
-    path: Path,
-) -> tuple[dict[str, str], tuple[dict[str, str], ...]]:
+def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
     if not path.is_file():
         raise FileNotFoundError(f"Tumor input file does not exist: {path}")
 
@@ -206,10 +213,8 @@ def _read_text_table(
         raise TumorTxtError(f"{path} is missing required columns: {missing_columns}.")
     # Extra columns are accepted as provenance but never enter normalization,
     # likelihood construction, or the objective identity.
-    return metadata, tuple(
-        {column: values[header.index(column)] for column in SCHEMA_COLUMNS}
-        for values in rows
-    )
+    table = pd.DataFrame(rows, columns=header, dtype=object)
+    return metadata, table.loc[:, SCHEMA_COLUMNS]
 
 
 def _identifier(value: object, *, name: str) -> str:
@@ -346,10 +351,11 @@ def _observation_fields_agree(
 
 def _validate_long_table(
     metadata: dict[str, str],
-    table: Iterable[Mapping[str, object]],
+    table: pd.DataFrame,
 ) -> _ValidatedLongTable:
     normalized = [
-        _normalize_row(row, row_number=index + 1) for index, row in enumerate(table)
+        _normalize_row(row, row_number=index + 1)
+        for index, row in enumerate(table.to_dict(orient="records"))
     ]
     rows_by_unit_mutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
     sample_purities: dict[str, list[float]] = {}
@@ -392,6 +398,9 @@ def _validate_long_table(
             raise TumorTxtError(f"purity must be constant across sample {sample_id!r}.")
         canonical_purity[sample_id] = float(min(purities))
     for row in normalized:
+        # Validate the entire file under the existing purity tolerance, but
+        # preserve its source value for canonicalization after CN exclusion.
+        row["_source_purity"] = row["purity"]
         row["purity"] = canonical_purity[row["sample_id"]]
 
     state_lookup: dict[tuple[str, str, str], LocalCopyNumberState] = {}
@@ -493,14 +502,76 @@ def _validate_long_table(
     )
 
 
+def _filter_snv_cn(
+    validated: _ValidatedLongTable,
+) -> tuple[_ValidatedLongTable, CNFilterReport]:
+    """Exclude whole SNVs using every sample's original validated CN states."""
+    records: list[CNFilterRecord] = []
+    excluded_ids: set[str] = set()
+    for (mutation_id, sample_id), rows in sorted(validated.rows_by_unit.items()):
+        segment_id = rows[0]["segment_id"]
+        states = validated.states_by_segment[(sample_id, segment_id)]
+        n_states = len(states)
+        max_major = max(state.allele_a_cn for state in states)
+        reasons = []
+        if n_states > 1:
+            reasons.append(SUBCLONAL_CN_REGION)
+        if max_major > MAX_MAJOR_CN:
+            reasons.append(MAJOR_CN_GT_6)
+        for reason in reasons:
+            excluded_ids.add(mutation_id)
+            records.append(CNFilterRecord(
+                mutation_id, sample_id, segment_id, reason, n_states, max_major
+            ))
+    retained_ids = tuple(
+        mutation_id for mutation_id in validated.mutation_ids
+        if mutation_id not in excluded_ids
+    )
+    report = CNFilterReport(
+        policy_id=CN_FILTER_POLICY_ID,
+        input_mutation_count=len(validated.mutation_ids),
+        retained_mutation_count=len(retained_ids),
+        excluded_mutation_ids=tuple(
+            mutation_id for mutation_id in validated.mutation_ids
+            if mutation_id in excluded_ids
+        ),
+        records=tuple(records),
+    )
+    if not retained_ids:
+        raise NoEligibleSNVsError(report, tumor_id=validated.metadata["tumor_id"])
+    retained_rows = {
+        unit: rows for unit, rows in validated.rows_by_unit.items()
+        if unit[0] not in excluded_ids
+    }
+    retained_purity: dict[str, float] = {}
+    for (_, sample_id), rows in retained_rows.items():
+        value = min(row["_source_purity"] for row in rows)
+        retained_purity[sample_id] = min(retained_purity.get(sample_id, value), value)
+    retained_rows = {
+        unit: tuple(dict(row, purity=retained_purity[unit[1]]) for row in rows)
+        for unit, rows in retained_rows.items()
+    }
+    used_segments = {
+        (sample_id, rows[0]["segment_id"])
+        for (_, sample_id), rows in retained_rows.items()
+    }
+    return _ValidatedLongTable(
+        metadata=validated.metadata,
+        mutation_ids=retained_ids,
+        sample_ids=validated.sample_ids,
+        rows_by_unit=retained_rows,
+        states_by_segment={
+            key: states for key, states in validated.states_by_segment.items()
+            if key in used_segments
+        },
+    ), report
+
+
 def _build_tumor_data(
     validated: _ValidatedLongTable,
     *,
-    unsupported_policy: str,
-    dosage_prior_penalty: float,
+    eps: float,
 ) -> TumorData:
-    # Local support and priors depend only on local CN, never other segments.
-    # Numerical fast paths are selected from the compiled observed model.
     mutation_ids = list(validated.mutation_ids)
     sample_ids = list(validated.sample_ids)
     mutation_index = {value: index for index, value in enumerate(mutation_ids)}
@@ -508,26 +579,20 @@ def _build_tumor_data(
     shape = (len(mutation_ids), len(sample_ids))
     alt_counts = np.zeros(shape, dtype=np.float64)
     total_counts = np.zeros(shape, dtype=np.float64)
-    count_available = np.zeros(shape, dtype=bool)
-    likelihood_supported = np.ones(shape, dtype=bool)
-    policy_included = np.ones(shape, dtype=bool)
+    count_observed = np.zeros(shape, dtype=bool)
     purity = np.empty(shape, dtype=np.float64)
     normal_cn = np.empty(shape, dtype=np.float64)
     major_cn = np.empty(shape, dtype=np.float64)
     minor_cn = np.empty(shape, dtype=np.float64)
+    has_cna = np.empty(shape, dtype=bool)
     mean_total_cn = np.empty(shape, dtype=np.float64)
-    exclusion_code = np.full(shape, int(ExclusionCode.INCLUDED), dtype=np.uint8)
-    compiled_units: list[list[CompiledPathSet]] = [
-        [CompiledPathSet((), ()) for _ in sample_ids] for _ in mutation_ids
-    ]
-    compiled_by_segment: dict[tuple[str, str], CompiledPathSet] = {}
 
     for unit, rows in validated.rows_by_unit.items():
         mutation_id, sample_id = unit
         i = mutation_index[mutation_id]
         j = sample_index[sample_id]
         row = rows[0]
-        count_available[i, j] = bool(row["count_observed"])
+        count_observed[i, j] = bool(row["count_observed"])
         if row["count_observed"]:
             assert row["alt_count"] is not None and row["ref_count"] is not None
             alt_counts[i, j] = float(row["alt_count"])
@@ -535,69 +600,37 @@ def _build_tumor_data(
         purity[i, j] = float(row["purity"])
         normal_cn[i, j] = float(row["normal_cn"])
         states = validated.states_by_segment[(sample_id, row["segment_id"])]
-        mean_total_cn[i, j] = sum(
-            state.fraction * (state.allele_a_cn + state.allele_b_cn) for state in states
-        )
-        dominant = dominant_copy_number_state(states)
-        major_cn[i, j] = float(max(dominant.allele_a_cn, dominant.allele_b_cn))
-        minor_cn[i, j] = float(min(dominant.allele_a_cn, dominant.allele_b_cn))
-        reason: str | None = None
-        if len(states) > 2:
-            reason = MORE_THAN_TWO_STATES
-            detail = f"observed {len(states)} distinct positive local CN states"
-            compiled = CompiledPathSet((), ())
-        elif not any(
-            state.allele_a_cn > 0 or state.allele_b_cn > 0 for state in states
-        ):
-            reason = NO_POSITIVE_PATH
-            detail = "no positive mutant-copy dosage path exists"
-            compiled = CompiledPathSet((), ())
-        else:
-            segment_key = (sample_id, row["segment_id"])
-            compiled = compiled_by_segment.get(segment_key)
-            if compiled is None:
-                compiled = compile_single_switch_paths(
-                    states,
-                    allele_mode="unphased",
-                    dosage_prior_penalty=dosage_prior_penalty,
-                )
-                compiled_by_segment[segment_key] = compiled
-            if not compiled.paths:
-                reason = NO_POSITIVE_PATH
-                detail = "no positive mutant-copy dosage path exists"
-        if reason is not None:
-            if unsupported_policy == "error":
-                raise UnsupportedTumorInputError(
-                    reason,
-                    region_id=sample_id,
-                    segment_id=row["segment_id"],
-                    detail=detail,
-                )
-            likelihood_supported[i, j] = False
-            exclusion_code[i, j] = int(ExclusionCode[reason])
-            compiled = CompiledPathSet(
-                paths=((1.0, 1.0, 1.0),),
-                log_prior=(0.0,),
+        if len(states) != 1:
+            raise AssertionError("Subclonal CN survived mutation-level filtering.")
+        state = states[0]
+        if state.allele_a_cn < 1:
+            raise UnsupportedTumorInputError(
+                NO_POSITIVE_PATH,
+                region_id=sample_id,
+                segment_id=row["segment_id"],
+                detail="retained (0, 0) CN has no positive integer multiplicity",
             )
-        compiled_units[i][j] = compiled
+        major_cn[i, j] = float(state.allele_a_cn)
+        minor_cn[i, j] = float(state.allele_b_cn)
+        mean_total_cn[i, j] = state.allele_a_cn + state.allele_b_cn
+        has_cna[i, j] = state.allele_a_cn != 1 or state.allele_b_cn != 1
 
+    alt_counts = np.where(count_observed, alt_counts, 0.0)
+    total_counts = np.where(count_observed, total_counts, 0.0)
     denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(
             "Every mutation/sample unit must have a positive normal-plus-tumor "
             "copy-number denominator."
         )
-    emission_paths: EmissionPaths = build_emission_paths(
-        compiled_units,
-        model_id=PATH_LIKELIHOOD_MODEL_ID,
-        model_version=PATH_LIKELIHOOD_MODEL_VERSION,
-        candidate_generator_version=PATH_CANDIDATE_GENERATOR_VERSION,
-        prior_mode=path_prior_mode(dosage_prior_penalty),
+    scaling = purity / denominator
+    path_likelihood = build_clonal_integer_likelihood(major_cn)
+    max_prob_scale = scaling * major_cn
+    phi_upper = np.minimum(
+        1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)
     )
-    exclusion_code[likelihood_supported & ~count_available] = int(
-        ExclusionCode.COUNT_UNAVAILABLE
-    )
-    return TumorData(
+    phi_upper = np.clip(phi_upper, eps, 1.0)
+    data = TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
         region_ids=sample_ids,
@@ -607,37 +640,50 @@ def _build_tumor_data(
         major_cn=major_cn,
         minor_cn=minor_cn,
         normal_cn=normal_cn,
-        tumor_total_cn=mean_total_cn,
-        count_available=count_available,
-        likelihood_supported=likelihood_supported,
-        policy_included=policy_included,
-        emission_paths=emission_paths,
-        exclusion_code=exclusion_code,
+        has_cna=has_cna,
+        scaling=scaling,
+        phi_upper=phi_upper,
+        phi_init=np.clip(np.full(shape, 0.5, dtype=np.float64), eps, phi_upper),
+        init_major_mask=np.zeros(shape, dtype=bool),
+        count_observed=count_observed,
+        path_likelihood=path_likelihood,
+        path_unsupported_reason=np.full(shape, None, dtype=object),
     )
+
+    data.phi_init = initialize_path_marginal_phi(data, eps=eps)
+    return data
 
 
 def load_tumor_txt(
     path: str | Path,
     *,
     unsupported_policy: str = "error",
-    dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
+    dosage_prior_penalty: float | None = None,
+    eps: float = 1e-6,
 ) -> TumorData:
-    """Load one ``clipp2.tumor.long.v1`` file directly into ``TumorData``."""
+    """Validate, filter whole SNVs, and compile uniform integer multiplicities."""
 
     policy = str(unsupported_policy).strip().lower()
-    if policy not in {"error", "mask"}:
-        raise ValueError("unsupported_policy must be 'error' or 'mask'.")
-    penalty = float(dosage_prior_penalty)
-    if not np.isfinite(penalty) or penalty < 0.0:
-        raise ValueError("dosage_prior_penalty must be finite and nonnegative.")
+    if policy != "error":
+        raise ValueError(
+            "unsupported_policy must be 'error'; masking cannot replace "
+            "whole-mutation CN filtering."
+        )
+    if dosage_prior_penalty is not None:
+        raise ValueError(
+            "dosage_prior_penalty is obsolete: integer multiplicities use a "
+            "fixed uniform prior; omit this option."
+        )
+    epsilon = float(eps)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
     input_path = Path(path).resolve()
     metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
-    return _build_tumor_data(
-        validated,
-        unsupported_policy=policy,
-        dosage_prior_penalty=penalty,
-    )
+    filtered, report = _filter_snv_cn(validated)
+    data = _build_tumor_data(filtered, eps=epsilon)
+    data.cn_filter_report = report
+    return data
 
 
 def _format_number(value: float) -> str:
@@ -665,7 +711,7 @@ def _canonical_text_value(value: object) -> str:
 
 def write_tumor_txt(
     path: str | Path,
-    table: object,
+    table: pd.DataFrame,
     metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Validate and write one canonical ``clipp2.tumor.long.v1`` file."""
@@ -688,26 +734,10 @@ def write_tumor_txt(
     destination = Path(path).resolve()
     validated_metadata = _validate_metadata(normalized_metadata, path=destination)
 
-    raw_columns = getattr(table, "columns", None)
-    row_iterator = getattr(table, "itertuples", None)
-    if raw_columns is not None and callable(row_iterator):
-        columns = list(raw_columns)
-        raw_rows = [
-            dict(zip(columns, values, strict=True))
-            for values in row_iterator(index=False, name=None)
-        ]
-    elif isinstance(table, Iterable) and not isinstance(table, (str, bytes, Mapping)):
-        raw_rows = [dict(row) for row in table]
-        columns = list(raw_rows[0]) if raw_rows else []
-        if any(list(row) != columns for row in raw_rows):
-            raise TumorTxtError("Long tumor table rows must share one column order.")
-    else:
-        raise TypeError(
-            "table must be a DataFrame-like object or iterable of mappings."
-        )
-    if len(columns) != len(set(columns)):
+    frame = pd.DataFrame(table).copy()
+    if not frame.columns.is_unique:
         raise TumorTxtError("Long tumor table columns must be unique.")
-    for column in columns:
+    for column in frame.columns:
         if (
             not isinstance(column, str)
             or not column
@@ -718,26 +748,22 @@ def write_tumor_txt(
                 "Long tumor table column names must be nonempty strings without "
                 "surrounding whitespace, tabs, or newlines."
             )
-    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(columns))
+    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(frame.columns))
     if missing_columns:
         raise TumorTxtError(
             f"Long tumor table is missing required columns: {missing_columns}."
         )
-    schema_columns = [column for column in SCHEMA_COLUMNS if column in columns]
-    extra_columns = [column for column in columns if column not in SCHEMA_COLUMNS]
+    schema_columns = [column for column in SCHEMA_COLUMNS if column in frame.columns]
+    extra_columns = [column for column in frame.columns if column not in SCHEMA_COLUMNS]
     ordered_columns = [*schema_columns, *extra_columns]
-    rows = [
-        {column: _canonical_text_value(row[column]) for column in ordered_columns}
-        for row in raw_rows
-    ]
-    if not rows:
-        raise TumorTxtError("Long tumor table may not be empty.")
-    if any(value == "" for row in rows for value in row.values()):
-        raise TumorTxtError("Missing values must be represented by '.'.")
-    _validate_long_table(
-        validated_metadata,
-        ({column: row[column] for column in SCHEMA_COLUMNS} for row in rows),
+    frame = frame.loc[:, ordered_columns].apply(
+        lambda column: column.map(_canonical_text_value)
     )
+    if frame.empty:
+        raise TumorTxtError("Long tumor table may not be empty.")
+    if bool((frame == "").to_numpy().any()):
+        raise TumorTxtError("Missing values must be represented by '.'.")
+    _validate_long_table(validated_metadata, frame.loc[:, SCHEMA_COLUMNS])
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata_order = sorted(normalized_metadata)
@@ -746,15 +772,20 @@ def write_tumor_txt(
             handle.write(f"##{key}={normalized_metadata[key]}\n")
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         writer.writerow(ordered_columns)
-        writer.writerows([row[column] for column in ordered_columns] for row in rows)
+        writer.writerows(frame.itertuples(index=False, name=None))
     return destination
 
 
 __all__ = [
+    "CN_FILTER_POLICY_ID",
     "DEFAULT_DOSAGE_PRIOR_PENALTY",
     "SCHEMA_COLUMNS",
+    "MAJOR_CN_GT_6",
+    "NoEligibleSNVsError",
+    "SUBCLONAL_CN_REGION",
     "TUMOR_TXT_SCHEMA",
     "TumorTxtError",
+    "UnsupportedTumorInputError",
     "load_tumor_txt",
     "write_tumor_txt",
 ]

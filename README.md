@@ -1,14 +1,8 @@
 # CliPP2
 
-CliPP2 estimates mutation cancer-cell fractions (CCFs), clusters SNVs with
-observed-data pairwise fusion, and reports mutant-copy/path posteriors for a
-single- or multi-region tumor.
-
-All supported copy-number inputs compile to one immutable piecewise-affine
-emission model. The production selection policy is fixed:
-`hybrid-ward-cem-bic-v1`. Certified raw-fusion partitions and deterministic
-Ward/CEM partitions receive the same immutable-label refit and are compared by
-fixed-partition BIC. There is no runtime score or policy switch.
+CliPP2 estimates mutation cancer-cell fractions (CCFs), clusters SNVs, and
+infers mutant-copy multiplicity from single- or multi-region tumor sequencing
+data with observed-data pairwise fusion.
 
 ## Install
 
@@ -16,23 +10,34 @@ fixed-partition BIC. There is no runtime score or policy switch.
 pip install .
 ```
 
-Pandas is not required for fitting or output. Development dependencies are
-available with `pip install '.[test]'`; simulation dependencies are available
-with `pip install '.[simulation]'`.
-
 ## Input
 
-The public input is one tab-delimited long table per tumor. The 12
-model-defining columns and a small runnable input are in
-[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv); see
-[`examples/README.md`](examples/README.md) for the column contract.
+The public input is one tab-delimited file per tumor. See [`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
 
-Every supported one- or two-state segment uses the same categorical
-positive-dosage compiler. One-state CN `(A,B)` includes dosages `1..A`, with
-homolog-alias weights and the endpoint-dosage penalty (default 3). Adding an
-unrelated subclonal segment cannot change a locus's support or prior.
+The loader validates the complete input, aggregates identical local CN states,
+then excludes an entire mutation across all samples if **any** sample has more
+than one distinct positive-fraction CN state or major CN greater than 6. It
+does not mask individual observations or change the input file. Different
+clonal states between samples are allowed; `(6,6)` is retained. A retained
+`(0,0)` state is unsupported. If all mutations are excluded, fitting stops
+with `NoEligibleSNVsError` and, when outputs are enabled, an exclusion audit.
+
+Each retained mutation–sample unit has the distinct multiplicities
+`1, …, major_cn`, each with equal prior probability. Fitting and fixed-label
+refitting retain the **marginalized** binomial likelihood (log-sum-exp over
+candidates), not hard multiplicity selection. The denominator remains
+`(1-purity)*normal_cn + purity*(major_cn+minor_cn)`. No anchor or CCF-one block
+is imposed; the fusion penalty and numerical admission thresholds are unchanged.
+
+The final integer call is the posterior mode **conditional on the reported
+fixed-partition CCF**. Exact ties choose the smallest candidate. Missing or
+zero-depth observations have no informative call: multi-candidate calls are
+missing, while a singleton is structurally fixed at one. Candidate expansion
+does not resolve every multiplicity/CCF ambiguity.
 
 ## Fit
+
+Fit on CUDA (the bundled mixed-CN example retains 101 of its 300 mutations):
 
 ```bash
 clipp2 fit \
@@ -40,106 +45,70 @@ clipp2 fit \
   --outdir exampleTumor1_results
 ```
 
-The `balanced` profile uses CUDA when available. Use `--device cpu` only for
-small smoke tests. The normal command-line surface is intentionally limited to:
 
-```text
---input-file  --outdir  --profile  --device  --failure-policy
---checkpoint  --resume  --config
-```
+Use `--device cpu` on a CPU-only machine. Run `clipp2 fit --help` for profile,
+solver, resource, selection-score, and partition-tolerance controls.
 
-Expert numerical controls belong in a versioned JSON file:
+The new integer workflow has fixed uniform priors. `--dosage-prior-penalty`
+and `--unsupported-policy mask` are rejected; nondefault `--major-prior` is
+also rejected. The fixed major-CN cutoff is not a runtime option. Public
+programmatic fits require data from `load_tumor_txt` with its CN-filter report;
+dominant-CN arrays alone cannot establish original CN eligibility.
 
-```json
-{
-  "schema_version": 1,
-  "fit": {
-    "computation_profile": "balanced",
-    "device": "cuda",
-    "dtype": "float32",
-    "max_tumor_edge_pass_equivalents": 200000
-  },
-  "run": {
-    "failure_policy": "best-effort",
-    "unsupported_policy": "error"
-  }
-}
-```
-
-Run it with `--config fit.json`. Explicit `--profile`, `--device`, and
-`--failure-policy` arguments override those JSON values. Unknown sections,
-fields, duplicate keys, and non-finite numbers fail closed.
-
-The default `best-effort` failure policy saves the highest valid typed outcome
-without weakening the raw KKT gate. Complete-graph work remains bounded by the
-resolved profile or expert configuration. A resource stop is unresolved, not
-convergence.
-
-## Checkpoint and resume
-
-```bash
-clipp2 fit \
-  --input-file examples/exampleTumor1.tsv \
-  --outdir exampleTumor1_results \
-  --checkpoint exampleTumor1.checkpoint
-
-clipp2 fit \
-  --input-file examples/exampleTumor1.tsv \
-  --outdir exampleTumor1_results \
-  --resume exampleTumor1.checkpoint
-```
-
-Checkpoints use an explicit search schema, content-addressed NumPy arrays,
-file locking, generation compare-and-swap, and atomic manifest replacement.
-Resume verifies input, objective, graph, configuration, numerical environment,
-software, and source-tree identity. Pickle is never used.
+This revision is based on v0.3.4 (`fa52ecf`) and changes the likelihood's
+candidate support and prior. Previous binary-mixture benchmark results must
+not be attributed to this revised estimator. The existing partition-selection
+score and its penalty settings are unchanged and need fresh calibration on
+simulation; expanded candidates are not counted as extra continuous parameters.
 
 ## Outputs
 
-Every primary, conditional, or diagnostic analysis writes exactly four files:
+A fit writes four tables into `--outdir`, prefixed with the tumor id (the input
+file stem unless a `##tumor_id` metadata line overrides it):
 
-| File | One row per | Purpose |
+| File | One row per | Main fields |
 | --- | --- | --- |
-| `{tumor_id}_analysis.json` | analysis | tier, identities, selection, work, masks, and failure provenance |
-| `{tumor_id}_clusters.tsv` | selected cluster x region | CCF estimates, intervals, ordering, and support |
-| `{tumor_id}_mutations.tsv` | mutation x region | observations, CN, CCF tier, intervals, and posterior summaries |
-| `{tumor_id}_attempts.tsv` | raw solver attempt | objectives, KKT diagnostics, limits, work, dtypes, and identities |
+| `{tumor_id}_mutation_clusters.tsv` | mutation | selected cluster and final fixed-partition CCF per region |
+| `{tumor_id}_cluster_centers.tsv` | selected cluster | size and final CCF per region |
+| `{tumor_id}_mutation_region_multiplicity.tsv` | retained mutation × region | final CCF, CN, integer MAP call and conditional candidate probabilities |
+| `{tumor_id}_excluded_mutations.tsv` | triggering mutation × sample × reason | segment, exclusion reason, distinct CN-state count, maximum major CN |
 
-`clusters.tsv` is header-only when no partition point claim exists;
-`mutations.tsv` always retains every input mutation-region coordinate.
+Integer output fields include `multiplicity_candidates`,
+`multiplicity_candidate_count`, nullable integer `multiplicity_call`,
+`multiplicity_call_probability`, `multiplicity_informative`, and
+`multiplicity_p1` through `multiplicity_p6` (invalid candidates have zero mass).
+Binary major/low and occupancy-switch summaries are not emitted for the new
+model. Exclusion reason counts can overlap; the schema-v4 stdout summary
+separately records unique input, retained, and excluded mutation counts plus
+the filtering policy, candidate generator, model ID, and prior mode.
 
-Output schema v4 includes `single_copy_probability`: posterior mass over all
-paths compatible with one mutant copy at the fitted CCF, including paths
-before an occupancy switch. It uses an absolute mutant-copy mass tolerance of
-`1e-8`. Single-copy, amplified, and effective-multiplicity summaries share
-`dosage_reportable`: all are blank for excluded/zero-depth observations,
-unidentified refits, or CCF within `1e-8` of the numerical lower bound.
-`dosage_status` names the reason; CCF reporting remains separate. Single-copy
-and amplified classes use one stable excess-copy mass and sum to one for
-reportable positive-dosage paths, including near the tolerance boundary.
-`single_copy_prior_probability` reports the corresponding prior mass at the
-same CCF: a high posterior can be prior-driven. Both condition on the selected
-partition's refit CCF, without integrating CCF or partition uncertainty.
-Single-copy and occupancy-switch probabilities do not identify mutation timing
-or the CN state of origin.
-Public TXT inputs use the generic effective-multiplicity columns; the legacy
-major-prior fields are blank. Summary schema v13 records the emission model,
-generator, prior, dosage policy/tolerances, valid-path count distribution, and
-scalar-pilot dispatch reason. The latter describes initialization, not a
-guaranteed runtime improvement or the complete ALM execution path.
+## Simulation
 
-`cluster_label` is the immutable selected partition. The derived
-`ccf_ordered_cluster_label` is presentation-only: cluster 0 is closest to CCF
-1 across statistically identified regions, and the rest follow by increasing
-distance. This ordering never changes selection, scores, labels, or refitted
-CCFs and is not a clonal-identifiability claim.
+Generate a matched, exact-size tumor:
 
-## Scientific boundary
+```bash
+clipp2 simulate --out-dir simulations --tumor-id simulatedTumor1 \
+  --mutation-count 300 --clone-count 3 --region-count 2 --seed 1
+```
 
-CliPP2 never forces a clonal anchor or CCF-one mutation. The graph, weights,
-row-group fusion norm, observed-data likelihood, box, and lambda define the raw
-estimator. Fixed-partition refits are secondary, and positive-lambda raw
-admission always requires the full-original-graph float64 terminal KKT audit at
-the unchanged `5 * tol` threshold.
+The simulator uses **clonal trunk gains**, inherited unchanged by every
+descendant clone, with major CN at most 6. Repeated gains are allowed; SNV
+acquisition timing and physical-copy inheritance determine integer truth
+multiplicity. Descendant SNVs arise after the shared gains and have multiplicity
+one. Evolutionary multiplicities are not sampled from the inference model's
+uniform candidate prior.
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the v0.4 breaking surface.
+All requested mutations must survive the loader's whole-mutation CN filter.
+Validation rejects exclusions or mismatched truth; it never silently drops
+truth rows. `--cna-event-rate` controls trunk gains; the obsolete two-state
+quota and descendant-CN controls are removed. The bundle includes canonical
+input, tree/CN/CCF truth, integer `truth_mutation_sample.tsv:multiplicity`, and
+a schema-6 manifest with generator/source identity, hashes and retained counts.
+`effective_multiplicity` remains as a truth cross-check and equals that integer.
+
+This is a narrower, matched benchmark—not a simulator of subclonal CN,
+deletions/LOH, or different clonal CN between regions. Those eligibility and
+boundary cases require separate tests. Generator v6 results must not be pooled
+with the former two-state v5 simulations. Evaluate multiplicity primarily on
+`major_cn != minor_cn` rows using pooled exact-class macro-F1, also reporting
+micro/weighted/per-class F1 and eligible row count.

@@ -1,83 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Literal, Union
 
 import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.partition_starts import PartitionCandidate
-from ..core.fusion.types import (
-    CertificateResult,
-    ConvergenceResult,
-    FitProvenance,
-    ObjectiveValue,
-    RawFit,
-    SolverState,
-    WorkCounters,
-)
-from ..core.scalar import PartitionFit
+from ..core.fusion.types import RawFit
 
 StartArray = np.ndarray | torch.Tensor
-PARTITION_REFIT_KEY_SCHEMA = "unanchored_profiled_partition_refit_v5"
-
-
-@dataclass(frozen=True, slots=True)
-class PartitionRefitKey:
-    """Complete identity of one cached fixed-partition refit."""
-
-    partition_signature: str
-    observed_model_hash: str
-    observed_likelihood_hash: str
-    reporting_model_hash: str
-    observed_box_hash: str
-    likelihood_eps_hex: str
-    refit_tolerance_hex: str
-    refit_max_iter: int
-    refit_mode: str
-    refit_grid_points: int
-    refit_local_steps: int
-
-
-DirectProposalStage = Literal["pilot", "final_phi"]
-
-
-@dataclass(frozen=True, slots=True)
-class DirectProposal:
-    """One deterministic direct-partition proposal and its raw parent."""
-
-    candidate: PartitionCandidate
-    stage: DirectProposalStage
-    parent_raw_candidate_id: int | None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.candidate, PartitionCandidate):
-            raise TypeError("Direct proposal candidate must be a PartitionCandidate.")
-        if self.stage not in {"pilot", "final_phi"}:
-            raise ValueError("Direct proposal stage must be pilot or final_phi.")
-        parent_id = self.parent_raw_candidate_id
-        if parent_id is not None and (
-            isinstance(parent_id, bool) or not isinstance(parent_id, int) or parent_id < 0
-        ):
-            raise ValueError("Direct proposal parent candidate ID must be nonnegative.")
-        if (self.stage == "pilot") != (parent_id is None):
-            raise ValueError("Only final-Phi proposals may identify a raw parent.")
-
-
-@dataclass(frozen=True, slots=True)
-class SolveOutcome:
-    """A durable scalar fit paired with transient continuation state."""
-
-    fit: RawFit
-    state: SolverState | None
-
-    def __post_init__(self) -> None:
-        if getattr(self.fit, "state", None) is not None:
-            raise ValueError("SolveOutcome.fit must not retain SolverState.")
-        certificate = getattr(self.fit, "certificate", None)
-        if getattr(certificate, "witness", None) is not None:
-            raise ValueError("SolveOutcome.fit must not retain a certificate witness.")
 
 
 def _immutable_array(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
@@ -95,6 +27,7 @@ class FusionPartition:
         "solver_quotient",
         "verified_primal_equalities",
         "tolerance_defined_primal",
+        "legacy_connected_components",
     ]
     certification_failure_reason: str = "none"
     mutation_ids: tuple[str, ...] = ()
@@ -117,16 +50,53 @@ class FusionPartition:
 
 
 @dataclass(frozen=True)
-class RawFusionCandidate:
-    """Raw-fusion partition with an authoritative fixed-label refit and score."""
+class PartitionRefitSummary:
+    labels: np.ndarray
+    partition_signature: str
+    phi: np.ndarray
+    cluster_centers: np.ndarray
+    loglik: float
+    finite_candidate_found: bool
+    global_optimum_certified: bool
+    refit_numerically_resolved: bool = False
+    global_lower_bound: float = float("-inf")
+    global_optimality_gap: float = float("inf")
+    global_certificate_method: str = "none"
+    refit_mode: str = "interval_certified"
 
+    def __post_init__(self) -> None:
+        if self.global_optimum_certified and (
+            not np.isfinite(float(self.global_lower_bound))
+            or not np.isfinite(float(self.global_optimality_gap))
+            or float(self.global_optimality_gap) < 0.0
+            or str(self.global_certificate_method) == "none"
+        ):
+            raise ValueError("A global refit claim requires a finite certificate.")
+        object.__setattr__(
+            self,
+            "labels",
+            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
+        )
+        object.__setattr__(
+            self,
+            "phi",
+            _immutable_array(self.phi, dtype=np.dtype(np.float64)),
+        )
+        object.__setattr__(
+            self,
+            "cluster_centers",
+            _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
+        )
+
+
+@dataclass(frozen=True)
+class RawFusionCandidate:
     raw_fit: RawFit
     partition: FusionPartition
-    refit: PartitionFit
+    refit: PartitionRefitSummary
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
-    work: WorkCounters = WorkCounters()
 
     @property
     def raw_objective_certified(self) -> bool:
@@ -139,48 +109,16 @@ class RawFusionCandidate:
 
 
 @dataclass(frozen=True)
-class UnscoredRawFusionCandidate:
-    """Raw optimizer result retained before fixed-partition evaluation.
-
-    A raw fit that fails the exact-fusion admission contract cannot become a
-    selectable partition candidate.  Retaining that attempt as a distinct
-    type preserves its partition and numerical diagnostics without inventing
-    a fixed-label refit or score that downstream selection must ignore.
-    """
-
-    raw_fit: RawFit
-    partition: FusionPartition
-    ineligibility_reason: str
-    refit: None = field(default=None, init=False, repr=False)
-    score: None = field(default=None, init=False, repr=False)
-    eligible_for_selection: Literal[False] = field(default=False, init=False)
-    work: WorkCounters = WorkCounters()
-
-    def __post_init__(self) -> None:
-        reason = str(self.ineligibility_reason).strip()
-        if not reason or reason == "none":
-            raise ValueError(
-                "An unscored raw-fusion candidate requires an ineligibility reason."
-            )
-        object.__setattr__(self, "ineligibility_reason", reason)
-
-    @property
-    def raw_objective_certified(self) -> bool:
-        # Construction and identity validation require failure of the full
-        # exact-fusion admission contract, which is stricter than the solver's
-        # local ``certified``/``admissible`` booleans alone.
-        return False
-
-
-@dataclass(frozen=True)
 class DirectPartition:
     labels: np.ndarray
     signature: str
     source: Literal[
         "pilot_hessian_ward",
         "pilot_hessian_ward_cem",
+        "pilot_hessian_ward_cem_component_death",
         "final_phi_hessian_ward",
         "final_phi_hessian_ward_cem",
+        "final_phi_hessian_ward_cem_component_death",
     ]
     mutation_ids: tuple[str, ...]
     parent_raw_candidate_id: int | None = None
@@ -215,25 +153,22 @@ class DirectPartition:
 @dataclass(frozen=True)
 class DirectPartitionCandidate:
     partition: DirectPartition
-    refit: PartitionFit
+    refit: PartitionRefitSummary
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
-    work: WorkCounters = WorkCounters()
 
 
-RawFusionArtifact = Union[RawFusionCandidate, UnscoredRawFusionCandidate]
 SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidate]
-SearchArtifact = Union[SelectablePartitionCandidate, UnscoredRawFusionCandidate]
 CandidateFamily = Literal["raw_fusion", "direct_partition"]
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateRecord:
-    """Typed search artifact and its compact provenance."""
+    """Typed selection unit and its compact search provenance."""
 
     candidate_id: int
-    candidate: SearchArtifact
+    candidate: SelectablePartitionCandidate
     trace: CandidateTrace = field(default_factory=lambda: CandidateTrace())
 
     def __post_init__(self) -> None:
@@ -241,7 +176,7 @@ class CandidateRecord:
             raise ValueError("candidate_id must be nonnegative.")
 
     @property
-    def score(self) -> SelectionScore | None:
+    def score(self) -> SelectionScore:
         return self.candidate.score
 
     @property
@@ -252,10 +187,7 @@ class CandidateRecord:
     def family(self) -> CandidateFamily:
         return (
             "raw_fusion"
-            if isinstance(
-                self.candidate,
-                (RawFusionCandidate, UnscoredRawFusionCandidate),
-            )
+            if isinstance(self.candidate, RawFusionCandidate)
             else "direct_partition"
         )
 
@@ -265,10 +197,7 @@ class CandidateRecord:
 
     @property
     def lambda_value(self) -> float | None:
-        if isinstance(
-            self.candidate,
-            (RawFusionCandidate, UnscoredRawFusionCandidate),
-        ):
+        if isinstance(self.candidate, RawFusionCandidate):
             return float(self.candidate.raw_fit.provenance.lambda_value)
         return None
 
@@ -278,96 +207,30 @@ class CandidateRecord:
 
     @property
     def penalized_objective(self) -> float | None:
-        if isinstance(
-            self.candidate,
-            (RawFusionCandidate, UnscoredRawFusionCandidate),
-        ):
+        if isinstance(self.candidate, RawFusionCandidate):
             return float(self.candidate.raw_fit.objective.total)
         return None
 
     @property
     def mm_consistency_violations(self) -> int:
-        if isinstance(
-            self.candidate,
-            (RawFusionCandidate, UnscoredRawFusionCandidate),
-        ):
+        if isinstance(self.candidate, RawFusionCandidate):
             return int(self.candidate.raw_fit.convergence.mm_consistency_violations)
         return 0
 
 
 @dataclass(frozen=True, slots=True)
-class AttemptLimits:
-    """Configured iteration limits for one authorized raw solve."""
+class RawAttemptTrace:
+    """Failure-relevant provenance for one authorized raw optimizer start."""
 
-    outer_max_iter: int
-    inner_max_iter: int
-    certificate_max_iter: int
-
-
-@dataclass(frozen=True, slots=True)
-class FitAuditSummary:
-    """A raw fit without fitted arrays, continuation state, or dual witness."""
-
-    objective: ObjectiveValue
-    certificate: CertificateResult
-    convergence: ConvergenceResult
-    work: WorkCounters
-    provenance: FitProvenance
-
-    def __post_init__(self) -> None:
-        if self.certificate.witness is not None:
-            raise ValueError("FitAuditSummary cannot retain a certificate witness.")
-
-    @classmethod
-    def from_fit(cls, fit: RawFit) -> "FitAuditSummary":
-        return cls(
-            objective=fit.objective,
-            certificate=replace(fit.certificate, witness=None),
-            convergence=fit.convergence,
-            work=fit.work,
-            provenance=fit.provenance,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class RawAttemptSummary:
-    """One start plus the tensor-free audit of its raw optimizer result."""
-
+    fit: RawFit
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
     mathematically_certified: bool
-    limits: AttemptLimits
-    fit: FitAuditSummary
+    outer_max_iter: int
+    inner_max_iter: int
+    certificate_max_iter: int
     promotion_status: str = "not_recorded"
-
-    @classmethod
-    def from_fit(
-        cls,
-        fit: RawFit,
-        *,
-        source: str,
-        start_value: float,
-        breakpoint_escape_changed_count: int,
-        mathematically_certified: bool,
-        outer_max_iter: int,
-        inner_max_iter: int,
-        certificate_max_iter: int,
-        promotion_status: str = "not_recorded",
-    ) -> "RawAttemptSummary":
-        return cls(
-            source=str(source),
-            start_value=float(start_value),
-            breakpoint_escape_changed_count=int(breakpoint_escape_changed_count),
-            mathematically_certified=bool(mathematically_certified),
-            limits=AttemptLimits(
-                outer_max_iter=int(outer_max_iter),
-                inner_max_iter=int(inner_max_iter),
-                certificate_max_iter=int(certificate_max_iter),
-            ),
-            fit=FitAuditSummary.from_fit(fit),
-            promotion_status=str(promotion_status),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,7 +242,27 @@ class CandidateTrace:
     start_source: str = "not_applicable"
     start_value: float | None = None
     breakpoint_escape_changed_count: int = 0
-    raw_attempts: tuple[RawAttemptSummary, ...] = ()
+    raw_attempts: tuple[RawAttemptTrace, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SearchCandidate:
+    """One immutable candidate plus selection-decision annotations."""
+
+    record: CandidateRecord
+    selected: bool
+
+    @property
+    def candidate_id(self) -> int:
+        return int(self.record.candidate_id)
+
+    @property
+    def candidate(self) -> SelectablePartitionCandidate:
+        return self.record.candidate
+
+    @property
+    def trace(self) -> CandidateTrace:
+        return self.record.trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,183 +344,19 @@ class SelectedModel:
 
 
 @dataclass(frozen=True, slots=True)
-class SearchReport:
-    """Common immutable search evidence shared by every outcome tier."""
-
-    records: tuple[CandidateRecord, ...]
-    selected_id: int | None
+class BICSelectionResult:
+    selected_model: SelectedModel
+    search: tuple[SearchCandidate, ...]
     selection_method: str
+    selection_hits_lower_boundary: bool
+    selection_hits_upper_boundary: bool
+    selection_boundary_unresolved: bool
+    selection_optimum_resolved: bool
     adaptive_search_stop_reason: str
+    num_candidates: int
     num_candidates_certified: int
-    selection_hits_lower_boundary: bool = False
-    selection_hits_upper_boundary: bool = False
-    selection_boundary_unresolved: bool = True
-    selection_optimum_resolved: bool = False
+    selected_kkt_residual: float | None
+    selected_lambda_representative: float | None
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
-    search_work: WorkCounters = WorkCounters()
-    mandatory_guide_work: WorkCounters = WorkCounters()
-    cumulative_search_active_seconds: float = 0.0
-    resumed_from_checkpoint: bool = False
-    selection_pool_stop_reason: str = "none"
-
-    def __post_init__(self) -> None:
-        ids = tuple(int(record.candidate_id) for record in self.records)
-        if len(ids) != len(set(ids)):
-            raise ValueError("Selection outcome candidate IDs must be unique.")
-        if self.selected_id is not None and int(self.selected_id) not in ids:
-            raise ValueError("Selected candidate ID is absent from search records.")
-
-    @property
-    def num_candidates(self) -> int:
-        return len(self.records)
-
-    @property
-    def selected_record(self) -> CandidateRecord | None:
-        if self.selected_id is None:
-            return None
-        return next(
-            record
-            for record in self.records
-            if int(record.candidate_id) == int(self.selected_id)
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class BICSelectionResult:
-    selected_model: SelectedModel
-    report: SearchReport
-
-    def __post_init__(self) -> None:
-        selected = self.report.selected_record
-        if selected is None or selected.candidate is not self.selected_model.partition_candidate:
-            raise ValueError("Search report does not own the selected model.")
-
-    @property
-    def primary_estimator_available(self) -> bool:
-        return True
-
-    @property
-    def selected_lambda_representative(self) -> float | None:
-        return self.selected_model.selected_lambda
-
-    @property
-    def selected_kkt_residual(self) -> float | None:
-        candidate = self.selected_model.partition_candidate
-        if not isinstance(candidate, RawFusionCandidate):
-            return None
-        residual = float(candidate.raw_fit.certificate.components.residual)
-        return residual if np.isfinite(residual) else None
-
-
-def _validate_best_raw_attempt(
-    best_raw_attempt: RawFit | None,
-    records: tuple[CandidateRecord, ...],
-) -> None:
-    if best_raw_attempt is None:
-        return
-    if not any(
-        isinstance(
-            item.candidate,
-            (RawFusionCandidate, UnscoredRawFusionCandidate),
-        )
-        and item.candidate.raw_fit is best_raw_attempt
-        for item in records
-    ):
-        raise ValueError("best_raw_attempt must come from the retained raw candidates.")
-
-
-@dataclass(frozen=True, slots=True)
-class SecondaryFallbackResult:
-    """A scored direct partition without a certified raw-fusion reference.
-
-    This is deliberately not a ``SelectedModel``.  Its fixed-label refit is a
-    useful conditional estimate, but it carries no primary-estimator or raw-KKT
-    claim and therefore cannot be serialized under the primary compatibility
-    filenames.
-    """
-
-    selected_partition: DirectPartitionCandidate
-    best_raw_attempt: RawFit | None
-    reason: str
-    report: SearchReport
-    primary_estimator_available: bool = field(default=False, init=False)
-
-    def __post_init__(self) -> None:
-        candidate = self.selected_partition
-        if not isinstance(candidate, DirectPartitionCandidate):
-            raise TypeError("A secondary fallback requires a direct partition.")
-        if not candidate.eligible_for_selection:
-            raise ValueError("A secondary fallback partition must be eligible.")
-        if not candidate.refit.finite_candidate_found or not np.isfinite(
-            float(candidate.score.value)
-        ):
-            raise ValueError("A secondary fallback requires a finite refit and score.")
-        if not str(self.reason).strip():
-            raise ValueError("A secondary fallback requires an explicit reason.")
-        selected = self.report.selected_record
-        if selected is None or selected.candidate is not candidate:
-            raise ValueError(
-                "The selected search record must own the fallback partition."
-            )
-        _validate_best_raw_attempt(self.best_raw_attempt, self.report.records)
-        if int(self.report.num_candidates_certified) < 0:
-            raise ValueError("num_candidates_certified must be nonnegative.")
-
-    @property
-    def selected_candidate(self) -> DirectPartitionCandidate:
-        return self.selected_partition
-
-    @property
-    def selected_candidate_id(self) -> int:
-        selected = self.report.selected_record
-        if selected is None:  # pragma: no cover - guarded in __post_init__
-            raise AssertionError("Secondary fallback lost its selected record.")
-        return int(selected.candidate_id)
-
-    @property
-    def selected_lambda_representative(self) -> None:
-        return None
-
-    @property
-    def selected_kkt_residual(self) -> None:
-        return None
-
-
-@dataclass(frozen=True, slots=True)
-class DiagnosticOnlyResult:
-    """A retained search with no defensible selected partition point claim."""
-
-    best_raw_attempt: RawFit | None
-    reason: str
-    report: SearchReport
-    primary_estimator_available: bool = field(default=False, init=False)
-
-    def __post_init__(self) -> None:
-        if not str(self.reason).strip():
-            raise ValueError("A diagnostic-only outcome requires an explicit reason.")
-        if self.report.selected_id is not None:
-            raise ValueError("A diagnostic-only outcome cannot select a candidate.")
-        _validate_best_raw_attempt(self.best_raw_attempt, self.report.records)
-        if int(self.report.num_candidates_certified) != 0:
-            raise ValueError("A diagnostic-only outcome cannot claim a selected model.")
-
-    @property
-    def selected_candidate(self) -> None:
-        return None
-
-    @property
-    def selected_lambda_representative(self) -> None:
-        return None
-
-    @property
-    def selected_kkt_residual(self) -> None:
-        return None
-
-
-TumorSelectionOutcome = Union[
-    BICSelectionResult,
-    SecondaryFallbackResult,
-    DiagnosticOnlyResult,
-]

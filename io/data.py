@@ -2,19 +2,35 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 
-if TYPE_CHECKING:
-    from .multiplicity import IntegerMultiplicitySpec
+from .multiplicity import (
+    CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_MODEL_ID,
+    CLONAL_INTEGER_PRIOR_MODE,
+)
 
 
 def readonly_array(value: object, *, dtype=None) -> np.ndarray:
     """Copy into an immutable bytes-backed array, not a reversible write flag."""
     array = np.asarray(value, dtype=dtype, order="C")
     return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+
+
+def restore_immutable_record(cls, inputs):
+    """Re-run validation/freezing rather than restoring NumPy's writable state."""
+    return cls(**inputs)
+
+
+class ImmutableArrayRecord:
+    """Copy/pickle immutable dataclasses through their authoritative constructors."""
+    __slots__ = ()
+
+    def __reduce__(self):
+        return restore_immutable_record, (type(self), {
+            item.name: getattr(self, item.name) for item in fields(self) if item.init
+        })
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +53,7 @@ class CNFilterReport:
 
 
 @dataclass(frozen=True)
-class TumorData:
+class TumorData(ImmutableArrayRecord):
     tumor_id: str
     mutation_ids: tuple[str, ...]
     region_ids: tuple[str, ...]
@@ -51,9 +67,9 @@ class TumorData:
     phi_upper: np.ndarray
     phi_init: np.ndarray
     count_observed: np.ndarray | None = None
-    path_likelihood: IntegerMultiplicitySpec | None = None
     cn_filter_report: CNFilterReport | None = None
     _compiled_models: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("mutation_ids", "region_ids"):
@@ -65,6 +81,7 @@ class TumorData:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
+        object.__setattr__(self, "_fingerprint", _retained_data_fingerprint(self))
 
     @property
     def num_mutations(self) -> int:
@@ -89,9 +106,9 @@ def _hash_array(digest, name: str, values: np.ndarray) -> None:
     digest.update(array.tobytes())
 
 
-def tumor_data_fingerprint(data: TumorData) -> str:
+def _retained_data_fingerprint(data: TumorData) -> str:
     """Identify the retained numerical source, excluding eligibility-only audit."""
-    digest = hashlib.sha256(b"clipp2.retained-integer-input.v2")
+    digest = hashlib.sha256(b"clipp2.retained-integer-input.v3")
     _hash_text(digest, data.tumor_id)
     for ids in (data.mutation_ids, data.region_ids):
         digest.update(len(ids).to_bytes(8, "little"))
@@ -104,13 +121,15 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         _hash_array(digest, name, getattr(data, name))
     _hash_array(digest, "count_observed", np.ones_like(data.alt_counts, dtype=bool)
                 if data.count_observed is None else data.count_observed)
-    spec = data.path_likelihood
-    if spec is not None:
-        for name in ("model_id", "model_version", "candidate_generator_version", "prior_mode"):
-            _hash_text(digest, getattr(spec, name))
-        for name in ("copies", "valid", "log_prior"):
-            _hash_array(digest, name, getattr(spec, name))
+    for value in (CLONAL_INTEGER_MODEL_ID, "1", CLONAL_INTEGER_GENERATOR_VERSION,
+                  CLONAL_INTEGER_PRIOR_MODE):
+        _hash_text(digest, value)
     return digest.hexdigest()
+
+
+def tumor_data_fingerprint(data: TumorData) -> str:
+    """Return the once-computed identity of this immutable retained input."""
+    return data._fingerprint
 
 
 __all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "tumor_data_fingerprint"]

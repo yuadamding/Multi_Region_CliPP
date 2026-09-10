@@ -273,11 +273,12 @@ def escape_path_breakpoint_retry_state(
     return escape_path_breakpoint_solver_state(state, context=context, tol=tol)
 
 
-def solver_recovery_fit_options(
+def solver_retry_fit_options(
     data: TumorData,
     fit_options: FitConfig,
     *,
-    retry_number: int | None = None,
+    retry_number: int,
+    certification_recovery: bool,
 ) -> FitConfig:
     """Increase solver effort without changing the fixed objective family.
 
@@ -288,9 +289,16 @@ def solver_recovery_fit_options(
     state one final correctness-preserving attempt at the unchanged tolerance.
     """
 
-    del retry_number
-    effort_factor = 6
     solver = fit_options.solver
+    if not certification_recovery:
+        if retry_number <= 0:
+            return fit_options
+        factor = int(retry_number) + 1
+        return replace(fit_options, solver=replace(solver,
+            outer_max_iter=max(int(solver.outer_max_iter) * factor, int(solver.outer_max_iter)),
+            inner_max_iter=max(int(solver.inner_max_iter) * factor, int(solver.inner_max_iter)),
+        ))
+    effort_factor = 6
     certificate = solver.certificate
     return replace(
         fit_options,
@@ -402,23 +410,16 @@ def build_guided_initialization_with_resource_policy(
                 else np.asarray(guide_labels)
             )
             cpu_context = prepare_torch_problem_with_resource_policy(
-                data,
+                data, fit_options,
                 dense_fallback_policy="device_only",
                 inherited_resource_fallback="dense_cpu",
                 eps=float(solver_context.problem.eps),
-                tol=float(fit_options.solver.tolerance),
                 graph=solver_context.graph_spec,
-                inner_max_iter=max(int(fit_options.solver.inner_max_iter), 16),
-                adaptive_weight_gamma=float(fit_options.graph.adaptive_weight_gamma),
-                adaptive_weight_floor=float(fit_options.graph.adaptive_weight_floor),
-                adaptive_weight_baseline=float(fit_options.graph.adaptive_weight_baseline),
                 exact_pilot=cpu_start(solver_context.exact_pilot),
                 pooled_start=cpu_start(solver_context.pooled_start),
                 scalar_well_starts=solver_context.scalar_well_starts,
                 device="cpu",
                 dtype=dtype_name(solver_context.runtime.dtype),
-                objective_shape=str(fit_options.solver.objective_shape),
-                verbose=bool(fit_options.runtime.verbose),
             )
             cpu_context = transfer_scalar_pilot_certificates(solver_context, cpu_context)
             guided = build(
@@ -593,5 +594,5 @@ __all__ = [
     "pilot_matrix_hash",
     "rescore_partition_candidates",
     "select_raw_start_attempt",
-    "solver_recovery_fit_options",
+    "solver_retry_fit_options",
 ]

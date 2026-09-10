@@ -9,6 +9,7 @@ import pytest
 from CliPP2.io.data import tumor_data_fingerprint
 from CliPP2.io.multiplicity import CLONAL_INTEGER_MODEL_ID
 from CliPP2.io import tumor_txt
+from CliPP2.core.objective import compile_observed_model
 
 
 def _unit(mutation, sample, states, *, observed=True, purity=0.8):
@@ -36,7 +37,7 @@ def cheap_initializer(monkeypatch):
     """Filtering tests isolate eligibility from numerical minimization."""
     monkeypatch.setattr(
         "CliPP2.core.fusion.starts.initialize_marginal_phi",
-        lambda data, *, eps: np.asarray(data.phi_init).copy(),
+        lambda model, *, eps: np.clip(np.full(model.shape, 0.5), eps, model.upper),
     )
 
 
@@ -78,7 +79,7 @@ def test_duplicate_cn_pairs_aggregate_but_between_sample_states_may_differ(
     np.testing.assert_array_equal(data.minor_cn, [[2, 0]])
     np.testing.assert_array_equal(data.total_counts, [[100, 100]])
     assert not data.cn_filter_report.records
-    assert data.path_likelihood.model_id == CLONAL_INTEGER_MODEL_ID
+    assert compile_observed_model(data, eps=1e-6).model_id == CLONAL_INTEGER_MODEL_ID
 
 
 def test_major_six_is_not_total_copy_six_and_no_fraction_threshold(
@@ -166,7 +167,32 @@ def test_malformed_original_input_fails_before_filtering(tmp_path):
 
 def test_real_initializer_is_categorical_and_respects_configured_bounds(tmp_path):
     data = _load(tmp_path, _unit("m", "R1", [(1.0, 4, 0)], purity=1.0), eps=0.02)
-    assert data.path_likelihood.model_id == CLONAL_INTEGER_MODEL_ID
+    assert compile_observed_model(data, eps=0.02).model_id == CLONAL_INTEGER_MODEL_ID
     np.testing.assert_allclose(data.phi_upper, [[0.98]])
     assert np.all(data.phi_init >= 0.02)
     assert np.all(data.phi_init <= data.phi_upper)
+
+
+def test_loader_freezes_once_and_keeps_the_initializing_model(tmp_path, monkeypatch):
+    from CliPP2.core.fusion import starts
+
+    initialized_models = []
+    frozen_inputs = []
+    initialize = starts.initialize_marginal_phi
+    freeze = tumor_txt.TumorData
+
+    def record_initializer(model, *, eps):
+        initialized_models.append(model)
+        return initialize(model, eps=eps)
+
+    def record_freeze(**kwargs):
+        assert kwargs["cn_filter_report"] is not None
+        frozen_inputs.append(kwargs)
+        return freeze(**kwargs)
+
+    monkeypatch.setattr(starts, "initialize_marginal_phi", record_initializer)
+    monkeypatch.setattr(tumor_txt, "TumorData", record_freeze)
+    data = _load(tmp_path, _unit("m", "R1", [(1.0, 4, 1)]))
+    assert len(frozen_inputs) == len(initialized_models) == 1
+    assert compile_observed_model(data, eps=1e-6) is initialized_models[0]
+    np.testing.assert_array_equal(data.phi_init, frozen_inputs[0]["phi_init"])

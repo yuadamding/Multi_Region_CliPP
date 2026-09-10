@@ -97,3 +97,26 @@ def test_rounding_at_a_derivative_sign_threshold_declines_proof():
 def test_missing_source_or_invalid_clipping_cannot_prove_convexity(epsilon):
     assert not has_proven_convex_observed_loss(None, eps=EPS)
     assert not has_proven_convex_observed_loss(_model(), eps=epsilon)
+
+
+def test_convexity_cache_is_per_immutable_model_and_epsilon(monkeypatch):
+    from CliPP2.core import objective
+
+    model = _model()
+    qualify = objective._qualify_clipped_convexity
+    calls = []
+
+    def record(source, epsilon):
+        calls.append((source, epsilon))
+        return qualify(source, epsilon)
+
+    monkeypatch.setattr(objective, "_qualify_clipped_convexity", record)
+    assert not has_proven_convex_observed_loss(model, eps=EPS)
+    assert not has_proven_convex_observed_loss(model, eps=EPS)
+    assert len(calls) == 1
+    has_proven_convex_observed_loss(model, eps=0.1)
+    assert len(calls) == 2
+    changed = replace(model, alt=np.zeros((1, 1)))
+    assert not changed._convexity
+    assert has_proven_convex_observed_loss(changed, eps=EPS)
+    assert len(calls) == 3

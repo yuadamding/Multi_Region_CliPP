@@ -72,7 +72,7 @@ def test_pipeline_filters_and_resolves_eps_before_search(tmp_path, monkeypatch):
 def test_filter_summary_counts_overlap_without_double_counting(tmp_path):
     data = load_tumor_txt(_write(tmp_path / 'summary.tsv'))
     summary = input_model_summary(data)
-    assert SUMMARY_SCHEMA_VERSION == 4
+    assert SUMMARY_SCHEMA_VERSION == 5
     assert summary['input_mutation_count'] == 3
     assert summary['retained_mutation_count'] == 2
     assert summary['excluded_mutation_count'] == 1
@@ -97,9 +97,10 @@ def test_public_fit_rejects_unvalidated_or_legacy_objects(tmp_path, monkeypatch)
     config = resolve_fit_config(device='cpu')
     monkeypatch.setattr('CliPP2.api.fit_prepared',
                         lambda **kw: pytest.fail('must reject before solver'))
-    for invalid in [replace(data, cn_filter_report=None), replace(data, path_likelihood=None)]:
-        with pytest.raises(ValueError, match='legacy or unvalidated'):
-            fit_fixed_objective(invalid, config)
+    with pytest.raises(ValueError, match='legacy or unvalidated'):
+        fit_fixed_objective(replace(data, cn_filter_report=None), config)
+    with pytest.raises(TypeError, match='path_likelihood'):
+        replace(data, path_likelihood=None)
     with pytest.raises(ValueError, match='inconsistent'):
         fit_fixed_objective(replace(data, cn_filter_report=replace(
             data.cn_filter_report, retained_mutation_count=12)), config)

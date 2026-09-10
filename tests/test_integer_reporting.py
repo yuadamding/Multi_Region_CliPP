@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from CliPP2.core.fusion.multiplicity import infer_integer_multiplicity_posterior_numpy
-from CliPP2.core.objective import compile_observed_model, observed_terms_numpy
-from CliPP2.io.data import CNFilterRecord, CNFilterReport, TumorData
-from CliPP2.io.multiplicity import build_clonal_integer_likelihood
+from CliPP2.core.objective import compile_observed_model, observed_terms_numpy, make_base_objective_key, make_lambda_objective_key
+from CliPP2.core.fusion.types import (
+    RawFit, ObjectiveValue, KKTComponents, CertificateResult, ConvergenceResult,
+    FitProvenance, WorkCounters,
+)
+from CliPP2.io.data import CNFilterRecord, CNFilterReport, TumorData, tumor_data_fingerprint
 from CliPP2.model_selection.partitions import _partition_signature
 from CliPP2.model_selection.types import FusionPartition, PartitionRefitSummary
 from CliPP2.reporting import (
     cn_filter_output_table,
-    mutation_region_output_table,
+    AnalysisSerialization, _mutation_region_output_table,
     write_cn_filter_output,
     write_fit_outputs,
 )
@@ -43,7 +45,6 @@ def _data(major=(4,), minor=(1,), alt=(45,), total=(100,)) -> TumorData:
         scaling=scaling,
         phi_upper=upper,
         phi_init=np.minimum(0.5, upper),
-        path_likelihood=build_clonal_integer_likelihood(major),
     )
 
 
@@ -66,12 +67,35 @@ def _selection(data: TumorData, phi: float = 0.75):
         loglik=-10.0,
         finite_candidate_found=True,
         global_optimum_certified=False,
+        source_data_hash=tumor_data_fingerprint(data),
+        likelihood_eps=EPS,
     )
-    raw = SimpleNamespace(
-        phi=np.full(data.alt_counts.shape, 0.25),
-        provenance=SimpleNamespace(likelihood_eps=EPS),
+    raw_phi = np.full(data.alt_counts.shape, 0.25)
+    model = compile_observed_model(data, eps=EPS)
+    raw = RawFit(
+        phi=raw_phi, objective=ObjectiveValue(float(observed_terms_numpy(model, raw_phi, eps=EPS).loss.sum())),
+        certificate=CertificateResult(
+            components=KKTComponents(1, 0, 0, 0), certified=False, admissible=False,
+            global_optimum=False, status="fixture_unqualified", tolerance=.004,
+            scope="full_original_graph", gradient_scope="observed_objective",
+            directional_admissible=False, witness=None, working_residual=1,
+            working_dtype="float64", audit_dtype="float64", precision_polished=False,
+            precision_polish_delta=0, residual_method="fixture", fallback_reason="none",
+        ), convergence=ConvergenceResult(False, 0), work=WorkCounters(), state=None,
+        provenance=FitProvenance(
+            objective_key=make_lambda_objective_key(
+                make_base_objective_key(model, graph_hash="fixture-graph", eps=EPS), lambda_value=.1),
+            source_data_hash=tumor_data_fingerprint(data), device="cpu", dtype="float64",
+            inner_solver="fixture", global_optimality_basis="not_certified", likelihood_eps=EPS,
+        ),
     )
     return raw, partition, refit
+
+
+def mutation_region_output_table(data, raw_fit, partition, refit, *, eps=None):
+    return _mutation_region_output_table(AnalysisSerialization(
+        data, raw_fit=raw_fit, partition=partition, refit=refit, eps=eps,
+    ))
 
 
 def test_intermediate_map_uses_full_posterior_not_endpoints_or_mean():
@@ -149,13 +173,10 @@ def test_posterior_rejects_invalid_phi(phi):
         infer_integer_multiplicity_posterior_numpy(_data(), phi, eps=EPS)
 
 
-def test_posterior_rejects_above_clonal_box_and_wrong_model():
+def test_posterior_rejects_above_clonal_box():
     data = _data(major=(6,), minor=(0,))
     with pytest.raises(ValueError, match="bounds"):
         infer_integer_multiplicity_posterior_numpy(data, np.ones((1, 1)), eps=EPS)
-    data = replace(data, path_likelihood=None)
-    with pytest.raises(ValueError, match="integer multiplicity model"):
-        infer_integer_multiplicity_posterior_numpy(data, np.full((1, 1), 0.75), eps=EPS)
 
 
 @pytest.mark.parametrize("eps", [0.0, 0.5, float("nan")])
@@ -170,12 +191,11 @@ def test_output_rejects_eps_mismatch():
         mutation_region_output_table(data, *_selection(data), eps=EPS * 2)
 
 
-def test_reporting_rejects_retired_legacy_families():
+def test_reporting_rejects_untyped_raw_evidence():
     data = _data()
-    for spec in (None, SimpleNamespace(model_id="legacy_path_fixture")):
-        retired = replace(data, path_likelihood=spec)
-        with pytest.raises(ValueError, match="only the clonal integer"):
-            mutation_region_output_table(retired, *_selection(retired))
+    _, partition, refit = _selection(data)
+    with pytest.raises(TypeError, match="typed RawFit"):
+        mutation_region_output_table(data, object(), partition, refit)
 
 
 def test_exclusion_output_preserves_both_reasons_and_empty_header(tmp_path):

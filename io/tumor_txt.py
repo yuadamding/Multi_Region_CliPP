@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import gzip
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
-from .multiplicity import MAX_MAJOR_CN, build_clonal_integer_likelihood
+from .multiplicity import MAX_MAJOR_CN
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "clonal_cn_major_le6_whole_mutation_v1"
@@ -574,6 +574,7 @@ def _filter_snv_cn(
 def _build_tumor_data(
     validated: _ValidatedLongTable,
     *,
+    report: CNFilterReport,
     eps: float,
 ) -> TumorData:
     mutation_ids = list(validated.mutation_ids)
@@ -626,12 +627,19 @@ def _build_tumor_data(
             "copy-number denominator."
         )
     scaling = purity / denominator
-    path_likelihood = build_clonal_integer_likelihood(major_cn)
     max_prob_scale = scaling * major_cn
     phi_upper = np.minimum(
         1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)
     )
     phi_upper = np.clip(phi_upper, eps, 1.0)
+    from ..core.objective import compile_integer_observations
+    from ..core.fusion.starts import initialize_marginal_phi
+
+    model = compile_integer_observations(
+        alt_counts=alt_counts, total_counts=total_counts,
+        count_observed=count_observed, phi_upper=phi_upper,
+        major_cn=major_cn, scaling=scaling, eps=eps,
+    )
     data = TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
@@ -644,14 +652,14 @@ def _build_tumor_data(
         normal_cn=normal_cn,
         scaling=scaling,
         phi_upper=phi_upper,
-        phi_init=np.clip(np.full(shape, 0.5, dtype=np.float64), eps, phi_upper),
+        phi_init=initialize_marginal_phi(model, eps=eps),
         count_observed=count_observed,
-        path_likelihood=path_likelihood,
+        cn_filter_report=report,
     )
-
-    from ..core.fusion.starts import initialize_marginal_phi
-
-    return replace(data, phi_init=initialize_marginal_phi(data, eps=eps))
+    # This private construction owns the exact arrays used by both objects.
+    # Retain the already compiled immutable model; replacements start uncached.
+    data._compiled_models[float(eps)] = model
+    return data
 
 
 def load_tumor_txt(
@@ -668,8 +676,7 @@ def load_tumor_txt(
     metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
     filtered, report = _filter_snv_cn(validated)
-    data = _build_tumor_data(filtered, eps=epsilon)
-    return replace(data, cn_filter_report=report)
+    return _build_tumor_data(filtered, report=report, eps=epsilon)
 
 
 def _format_number(value: float) -> str:

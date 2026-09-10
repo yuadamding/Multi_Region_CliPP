@@ -7,12 +7,12 @@ import heapq
 
 import numpy as np
 
-from ..io.data import TumorData, readonly_array
-from .objective import ObservedModel, compile_observed_model
+from ..io.data import ImmutableArrayRecord, TumorData, readonly_array
+from .objective import ObservedModel, candidate_terms_numpy, compile_observed_model
 
 
 @dataclass(frozen=True, slots=True)
-class ScalarProblem:
+class ScalarProblem(ImmutableArrayRecord):
     """One cluster-region slice of a canonical observed model."""
 
     alt: np.ndarray
@@ -148,11 +148,15 @@ def _scalar_terms(
         mass = candidate_slope * candidate
         probability = np.clip(mass, problem.eps, 1.0 - problem.eps)
         valid = problem.valid[active, None, :]
-        joint = (
-            problem.alt[active, None, None] * np.log(probability)
-            + problem.nonalt[active, None, None] * np.log1p(-probability)
-            + problem.log_prior[active, None, :]
+        slope = np.where(
+            (mass > problem.eps) & (mass < 1.0 - problem.eps), candidate_slope, 0.0,
+        ) if with_gradient else None
+        log_kernel, state_score, _ = candidate_terms_numpy(
+            problem.alt[active, None, None], problem.nonalt[active, None, None],
+            probability, slope, derivative_order=int(with_gradient),
         )
+        joint = log_kernel + problem.log_prior[active, None, :]
+        del log_kernel
         joint = np.where(valid, joint, -np.inf)
         log_normalizer = np.logaddexp.reduce(joint, axis=-1)
         loss = -np.sum(log_normalizer, axis=0, dtype=np.float64)
@@ -162,15 +166,6 @@ def _scalar_terms(
                 valid,
                 np.exp(joint - log_normalizer[..., None]),
                 0.0,
-            )
-            slope = np.where(
-                (mass > problem.eps) & (mass < 1.0 - problem.eps),
-                candidate_slope,
-                0.0,
-            )
-            state_score = slope * (
-                problem.alt[active, None, None] / probability
-                - problem.nonalt[active, None, None] / (1.0 - probability)
             )
             gradient = -np.sum(
                 posterior * state_score,
@@ -688,7 +683,7 @@ def partition_constrained_observed_refit(
                 max_iter=max_iter,
                 grid_points=scalar_grid_points,
                 local_steps=scalar_local_steps,
-                include_breakpoints=data.path_likelihood is not None,
+                include_breakpoints=True,
             )
             centers[cluster, region] = coordinate.beta
             coordinate_lower[cluster, region] = coordinate.global_lower_bound
@@ -733,7 +728,7 @@ def partition_constrained_observed_refit(
         if mode == "interval_certified"
         else "_grid_local_approximate"
     )
-    path_suffix = "_path" if data.path_likelihood is not None else ""
+    path_suffix = "_path"
     return PartitionRefitResult(
         phi=np.clip(phi, epsilon, upper_matrix).astype(np.float64, copy=False),
         cluster_centers=centers,

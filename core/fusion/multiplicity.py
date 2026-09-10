@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from ...io.data import TumorData
-from ...io.multiplicity import CLONAL_INTEGER_MODEL_ID
 from ..objective import compile_observed_model, observed_terms_numpy
 
 
@@ -33,9 +32,6 @@ def infer_integer_multiplicity_posterior_numpy(
 ) -> IntegerMultiplicityPosterior:
     """Evaluate the fitted integer mixture without replacing marginalization."""
 
-    spec = data.path_likelihood
-    if spec is None or spec.model_id != CLONAL_INTEGER_MODEL_ID:
-        raise ValueError("Expected the clonal integer multiplicity model.")
     phi_array = np.asarray(phi, dtype=np.float64)
     expected_shape = np.asarray(data.alt_counts).shape
     if phi_array.shape != expected_shape:
@@ -55,18 +51,15 @@ def infer_integer_multiplicity_posterior_numpy(
     )
     # The compiler validates the complete, increasingly ordered integer range.
     # np.argmax therefore selects the lowest candidate on an exact tie.
-    map_index = np.argmax(np.where(spec.valid, posterior, -np.inf), axis=-1)
-    calls = np.take_along_axis(
-        spec.copies, map_index[..., None], axis=-1
-    )[..., 0].astype(np.int64)
+    map_index = np.argmax(np.where(model.valid, posterior, -np.inf), axis=-1)
     probability = np.take_along_axis(
         posterior, map_index[..., None], axis=-1
     )[..., 0]
     return IntegerMultiplicityPosterior(
         posterior=posterior,
-        multiplicity_call=calls,
+        multiplicity_call=map_index.astype(np.int64) + 1,
         map_probability=probability,
-        candidate_count=np.sum(spec.valid, axis=-1).astype(np.int64),
+        candidate_count=np.sum(model.valid, axis=-1).astype(np.int64),
         informative=model.observed & ((model.alt + model.nonalt) > 0.0),
     )
 

@@ -19,15 +19,16 @@ from CliPP2.io.multiplicity import (
     CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_PRIOR_MODE,
 )
 from CliPP2.api import process_tumor
+from test_integer_likelihood import independent_candidates
 
 
 def _enumerated_loss(data, phi, eps):
-    spec = data.path_likelihood
+    copies, log_prior = independent_candidates(data)
     probability = np.clip(
-        data.scaling[..., None] * spec.copies * phi[..., None], eps, 1.0 - eps,
+        data.scaling[..., None] * copies * phi[..., None], eps, 1.0 - eps,
     )
     joint = (
-        spec.log_prior + data.alt_counts[..., None] * np.log(probability)
+        log_prior + data.alt_counts[..., None] * np.log(probability)
         + (data.total_counts - data.alt_counts)[..., None] * np.log1p(-probability)
     )
     return -logsumexp(joint, axis=-1)
@@ -168,10 +169,10 @@ def test_full_pipeline_identical_units_certifies_and_writes_filtered_outputs(tmp
         summary = process_tumor(input_path, outdir, fit_config=config)
     finally:
         torch.set_num_threads(original_threads)
-    assert summary["summary_schema_version"] == 4
+    assert summary["summary_schema_version"] == 5
     assert summary["raw_reference_objective_certified"]
     assert summary["selected_n_clusters"] == 1
-    assert summary["selected_full_kkt_tolerance"] == 0.004
+    assert summary["raw_reference_kkt_tolerance"] == 0.004
     assert summary["input_mutation_count"] == 4
     assert summary["retained_mutation_count"] == 3
     assert summary["excluded_mutation_count"] == 1

@@ -26,7 +26,6 @@ from CliPP2.core.fusion.torch_backend import (
     validate_torch_tumor_data,
 )
 from CliPP2.io.data import TumorData, tumor_data_fingerprint
-from CliPP2.io.multiplicity import build_clonal_integer_likelihood
 
 
 EPS = 1e-6
@@ -51,22 +50,29 @@ def integer_data(major=((1, 2), (4, 6)), *, observed=None, purity=0.7):
         scaling=scaling,
         phi_upper=upper, phi_init=np.full_like(major, 0.5),
         count_observed=observed,
-        path_likelihood=build_clonal_integer_likelihood(major),
+    )
+
+
+def independent_candidates(data):
+    candidates = np.arange(1, int(np.max(data.major_cn)) + 1)
+    valid = candidates <= data.major_cn[..., None]
+    return np.where(valid, candidates, 0), np.where(
+        valid, -np.log(data.major_cn)[..., None], -np.inf,
     )
 
 
 def enumeration(data, phi):
-    spec = data.path_likelihood
-    p = np.clip(data.scaling[..., None] * spec.copies * phi[..., None],
+    copies, log_prior = independent_candidates(data)
+    p = np.clip(data.scaling[..., None] * copies * phi[..., None],
                 EPS, 1.0 - EPS)
-    joint = spec.log_prior + data.alt_counts[..., None] * np.log(p)
+    joint = log_prior + data.alt_counts[..., None] * np.log(p)
     joint += (data.total_counts - data.alt_counts)[..., None] * np.log1p(-p)
     loss = -logsumexp(joint, axis=-1)
     posterior = np.exp(joint + loss[..., None])
     if data.count_observed is not None:
         loss = np.where(data.count_observed, loss, 0.0)
         posterior = np.where(data.count_observed[..., None], posterior,
-                             np.exp(spec.log_prior))
+                             np.exp(log_prior))
     return loss, posterior
 
 
@@ -121,9 +127,10 @@ def test_marginalized_loss_is_not_a_hard_maximum():
                    total_counts=np.full(data.total_counts.shape, 5.0))
     phi = np.array([[0.6]])
     model = compile_observed_model(data, eps=EPS)
-    probability = np.clip(data.scaling[..., None] * data.path_likelihood.copies
+    copies, log_prior = independent_candidates(data)
+    probability = np.clip(data.scaling[..., None] * copies
                           * phi[..., None], EPS, 1 - EPS)
-    joint = data.path_likelihood.log_prior + 2 * np.log(probability)
+    joint = log_prior + 2 * np.log(probability)
     joint += 3 * np.log1p(-probability)
     marginal = observed_terms_numpy(model, phi, eps=EPS).loss
     assert np.all(-np.max(joint, axis=-1) - marginal > 0.5)
@@ -160,24 +167,19 @@ def test_clonal_box_allowed_and_obsolete_model_families_are_rejected():
                    phi_upper=np.full((1, 1), 1 - EPS))
     model = compile_observed_model(data, eps=EPS)
     np.testing.assert_array_equal(model.upper, data.phi_upper)
-    with pytest.raises(ValueError, match="Unsupported integer"):
-        replace(data.path_likelihood, model_id="other-occupancy-model")
-    with pytest.raises(ValueError, match="supported clonal integer"):
-        compile_observed_model(replace(data, path_likelihood=None), eps=EPS)
+    assert not hasattr(data, "path_likelihood")
+    with pytest.raises(TypeError, match="path_likelihood"):
+        replace(data, path_likelihood=None)
 
 
-def test_compiler_rejects_stale_incomplete_and_nonuniform_specifications():
+def test_compiler_rebuilds_candidates_after_cn_replacement():
     data = integer_data(((4,),))
-    original = data.path_likelihood
-    for updates in [
-        {"copies": original.copies * 2},
-        {"log_prior": np.log(np.array([[[0.1, 0.2, 0.3, 0.4]]]))},
-    ]:
-        with pytest.raises(ValueError, match="distinct integers and fixed uniform"):
-            replace(original, **updates)
-    with pytest.raises(ValueError, match="complete ordered"):
-        compile_observed_model(replace(data, major_cn=np.array([[3.0]])),
-                               eps=EPS)
+    original = compile_observed_model(data, eps=EPS)
+    changed = compile_observed_model(replace(data, major_cn=np.array([[3.0]])), eps=EPS)
+    assert original.path_shape == (1, 1, 4)
+    assert changed.path_shape == (1, 1, 3)
+    np.testing.assert_array_equal(changed.valid, np.ones((1, 1, 3), dtype=bool))
+    np.testing.assert_array_equal(changed.log_prior, np.full((1, 1, 3), -np.log(3.0)))
 
 
 def test_candidate_model_identity_invalidates_tensor_and_refit_cache():

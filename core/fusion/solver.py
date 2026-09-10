@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -10,9 +11,7 @@ from ...io.data import (
     tumor_data_fingerprint,
 )
 from ...io.multiplicity import CLONAL_INTEGER_MODEL_ID
-from ..scalar import ScalarGlobalMinimumCertificate
 from ..objective import (
-    BaseObjectiveKey,
     compile_observed_model,
     has_proven_convex_observed_loss,
     make_base_objective_key,
@@ -20,8 +19,11 @@ from ..objective import (
     model_to_torch,
     observed_internal_breakpoints_torch,
     observed_one_sided_gradients_torch,
+    observed_em_terms_torch,
+    observed_terms_torch,
 )
 from ...config import (
+    FitConfig,
     SolverConfig,
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
@@ -57,9 +59,7 @@ from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
     copy_torch_tumor_data,
-    mutation_region_terms_torch,
     dtype_name,
-    em_surrogate_terms_torch,
     graph_adjoint_edges_in_dtype,
     graph_fusion_kkt_residual_from_grad_torch,
     pairwise_penalty_torch,
@@ -101,8 +101,14 @@ class _Float64AuditContext:
     runtime: TorchRuntime
     torch_data: TorchTumorData
     graph: TensorFusionGraph
-    lower: torch.Tensor
-    upper: torch.Tensor
+
+    @property
+    def lower(self) -> torch.Tensor:
+        return self.torch_data.observed_model.lower
+
+    @property
+    def upper(self) -> torch.Tensor:
+        return self.torch_data.observed_model.upper
 
 
 def _float64_audit_context(
@@ -142,16 +148,6 @@ def _float64_audit_context(
             runtime,
             num_nodes=int(source_model.shape[0]),
         ),
-        lower=torch.as_tensor(
-            np.array(source_model.lower, copy=True),
-            dtype=torch.float64,
-            device=device,
-        ),
-        upper=torch.as_tensor(
-            np.array(source_model.upper, copy=True),
-            dtype=torch.float64,
-            device=device,
-        ),
     )
     if cache is not None:
         cache[key] = context
@@ -184,8 +180,8 @@ def _terminal_backward_error_audit_float64(
     lower64 = audit.lower
     upper64 = audit.upper
     phi64 = phi.to(dtype=torch.float64, device=audit.runtime.device)
-    terms64 = mutation_region_terms_torch(
-        data64,
+    terms64 = observed_terms_torch(
+        data64.observed_model,
         phi64,
         eps=float(eps),
     )
@@ -830,16 +826,6 @@ def promote_solver_context_dtype(
         scalar_pilot_certificates=(
             context.scalar_pilot_certificates if override is None else ()
         ),
-        lower=torch.as_tensor(
-            np.array(source_model.lower, copy=True),
-            dtype=dtype,
-            device=target_device,
-        ),
-        upper=torch.as_tensor(
-            np.array(source_model.upper, copy=True),
-            dtype=dtype,
-            device=target_device,
-        ),
         runtime=runtime,
     )
 
@@ -1259,16 +1245,6 @@ def prepare_torch_problem(
     else:
         scalar_well_starts_seq = list(scalar_well_starts)
 
-    lower = torch.as_tensor(
-        np.array(source_model.lower, copy=True),
-        dtype=effective_runtime.dtype,
-        device=effective_runtime.device,
-    )
-    upper = torch.as_tensor(
-        np.array(source_model.upper, copy=True),
-        dtype=effective_runtime.dtype,
-        device=effective_runtime.device,
-    )
     graph_hash = effective_graph.fingerprint
     base_objective_key = make_base_objective_key(
         source_model,
@@ -1277,8 +1253,6 @@ def prepare_torch_problem(
         lower=source_model.lower,
         upper=source_model.upper,
     )
-    base_fusion_objective_hash = base_objective_key.fingerprint
-    objective_spec_hash = base_fusion_objective_hash
     return PreparedProblem(
         source_data=data,
         problem=effective_torch_data,
@@ -1290,13 +1264,8 @@ def prepare_torch_problem(
             as_runtime_tensor(start, effective_runtime)
             for start in scalar_well_starts_seq
         ),
-        lower=lower,
-        upper=upper,
         runtime=effective_runtime,
         data_fingerprint=data_fingerprint,
-        graph_hash=graph_hash,
-        objective_spec_hash=objective_spec_hash,
-        base_fusion_objective_hash=base_fusion_objective_hash,
         base_objective_key=base_objective_key,
         verbose=bool(verbose),
         scalar_pilot_certificates=tuple(pilot_certificates or ()),
@@ -1310,19 +1279,33 @@ def prepare_torch_problem(
 
 def prepare_torch_problem_with_resource_policy(
     data: TumorData,
+    options: FitConfig,
     *,
-    dense_fallback_policy: str,
     inherited_resource_fallback: str | None = None,
-    **prepare_kwargs,
+    **prepare_overrides,
 ) -> PreparedProblem:
     """Prepare an immutable context under the same typed fallback policy as fits."""
-    normalized_policy = normalize_dense_fallback_policy(dense_fallback_policy)
-    kwargs = dict(prepare_kwargs)
+    kwargs = dict(
+        eps=float(options.eps),
+        tol=float(options.solver.tolerance),
+        inner_max_iter=max(int(options.solver.inner_max_iter), 16),
+        graph=options.graph.graph,
+        adaptive_weight_gamma=float(options.graph.adaptive_weight_gamma),
+        adaptive_weight_floor=float(options.graph.adaptive_weight_floor),
+        adaptive_weight_baseline=float(options.graph.adaptive_weight_baseline),
+        device=options.runtime.device,
+        dtype=options.runtime.dtype,
+        dense_fallback_policy=options.runtime.fallback,
+        objective_shape=options.solver.objective_shape,
+        verbose=options.runtime.verbose,
+    )
+    kwargs.update(prepare_overrides)
+    normalized_policy = normalize_dense_fallback_policy(kwargs.pop("dense_fallback_policy"))
     supplied_prebuilt_tensor_graph = kwargs.pop("prebuilt_tensor_graph", None)
     supplied_runtime = kwargs.pop("runtime", None)
     supplied_torch_data = kwargs.pop("torch_data", None)
-    requested_device = kwargs.pop("device", "cuda")
-    requested_dtype = kwargs.pop("dtype", "float64")
+    requested_device = kwargs.pop("device")
+    requested_dtype = kwargs.pop("dtype")
     resolved_by_cpu_fallback = False
     requested_runtime = supplied_runtime
     try:
@@ -1592,68 +1575,58 @@ def _solve_inner_subproblem(
     )
 
 
-def _fit_from_start(
-    data: TumorData,
-    *,
-    torch_data,
-    runtime,
-    graph: PairwiseFusionGraph,
-    tensor_graph: TensorFusionGraph,
-    graph_hash: str,
-    base_objective_key: BaseObjectiveKey,
-    objective_spec_hash: str,
-    lambda_value: float,
+@lru_cache(maxsize=32)
+def _certificate_options(options: SolverConfig, dtype: torch.dtype) -> CertificateOptions:
+    """Resolve one immutable certificate configuration per solve config/dtype."""
+    cert_tol = _validate_solver_tolerance(
+        options.tolerance if options.certification_tolerance is None
+        else options.certification_tolerance
+    )
+    resources, certificate = options.resources, options.certificate
+    return CertificateOptions(
+        max_iter=max(int(certificate.max_iter), 1),
+        refinement_rounds=max(int(certificate.refinement_rounds), 0),
+        max_expansions=max(int(resources.workset_max_expansions), 1),
+        add_batch=max(int(resources.workset_add_batch), 1),
+        mapping_tolerance=max(0.1 * cert_tol, float(torch.finfo(dtype).eps)),
+        column_tolerance=max(
+            float(certificate.column_tolerance_scale) * cert_tol,
+            float(torch.finfo(dtype).eps),
+        ),
+        memory=WorksetMemoryOptions(
+            max_workset_bytes=int(resources.workset_max_bytes),
+            max_compressed_cache_bytes=int(resources.compressed_cache_max_bytes),
+        ),
+    )
 
-    eps: float,
-    outer_max_iter: int,
-    inner_max_iter: int,
-    tol: float,
-    certification_tol: float,
-    use_backward_error_progress: bool,
-    phi_start: np.ndarray | torch.Tensor,
-    solver_state: SolverState | None,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    objective_shape: str,
-    workset_max_bytes: int,
-    compressed_cache_max_bytes: int,
-    workset_add_batch: int,
-    workset_max_expansions: int,
-    certificate_max_iter: int,
-    certificate_refinement_rounds: int,
-    certificate_column_tol_scale: float,
-    verbose: bool,
-    audit_context_cache: dict[tuple[str, str, str], object] | None = None,
-    scalar_pilot_certificates: tuple[ScalarGlobalMinimumCertificate, ...] = (),
+
+def _fit_from_start(
+    problem: PreparedProblem,
+    lambda_value: float,
+    options: SolverConfig,
+    attempt: _StartAttempt,
 ) -> RawFit:
-    tol = _validate_solver_tolerance(tol)
-    cert_tol = _validate_solver_tolerance(certification_tol)
-    if base_objective_key.fingerprint != str(objective_spec_hash):
-        raise ValueError("Base objective key does not match objective_spec_hash.")
+    data, torch_data, runtime = problem.source_data, problem.problem, problem.runtime
+    graph, tensor_graph = problem.graph_spec, problem.graph
+    lower, upper = problem.lower, problem.upper
+    graph_hash, objective_spec_hash = problem.graph_hash, problem.objective_spec_hash
+    base_objective_key = problem.base_objective_key
+    eps, verbose = float(torch_data.eps), bool(problem.verbose)
+    phi_start, solver_state = attempt.phi, attempt.warm_state
+    tol = _validate_solver_tolerance(options.tolerance)
+    cert_tol = _validate_solver_tolerance(
+        tol if options.certification_tolerance is None else options.certification_tolerance
+    )
+    outer_max_iter = max(int(options.outer_max_iter), 1)
+    inner_max_iter = max(int(options.inner_max_iter), 16)
     if (
         solver_state is not None
         and str(solver_state.objective_spec_hash)
-        and str(solver_state.objective_spec_hash) != str(objective_spec_hash)
+        and str(solver_state.objective_spec_hash) != objective_spec_hash
     ):
-        raise ValueError(
-            "Solver warm state belongs to a different raw objective."
-        )
-    objective_shape = objective_shape_for_data(data, objective_shape)
-    certificate_options = CertificateOptions(
-        max_iter=max(int(certificate_max_iter), 1),
-        refinement_rounds=max(int(certificate_refinement_rounds), 0),
-        max_expansions=max(int(workset_max_expansions), 1),
-        add_batch=max(int(workset_add_batch), 1),
-        mapping_tolerance=max(0.1 * float(cert_tol), float(torch.finfo(runtime.dtype).eps)),
-        column_tolerance=max(
-            float(certificate_column_tol_scale) * float(cert_tol),
-            float(torch.finfo(runtime.dtype).eps),
-        ),
-        memory=WorksetMemoryOptions(
-            max_workset_bytes=int(workset_max_bytes),
-            max_compressed_cache_bytes=int(compressed_cache_max_bytes),
-        ),
-    )
+        raise ValueError("Solver warm state belongs to a different raw objective.")
+    objective_shape = objective_shape_for_data(data, options.objective_shape)
+    certificate_options = _certificate_options(options, runtime.dtype)
     certificate_problem = CertificateProblem(
         graph=tensor_graph,
         graph_hash=str(graph_hash),
@@ -1667,7 +1640,7 @@ def _fit_from_start(
         objective_shape == "unimodal_full_step_backtracking"
     )
     use_backward_error_progress = _uses_backward_error_progress(
-        requested=use_backward_error_progress,
+        requested=bool(options.use_backward_error_progress),
         runtime_dtype=runtime.dtype,
     )
     use_alm = bool(
@@ -1759,8 +1732,8 @@ def _fit_from_start(
     )
     full_step_curvature_multiplier = torch.ones_like(phi)
 
-    current_mutation_region_terms = mutation_region_terms_torch(
-        torch_data, phi, eps=eps
+    current_mutation_region_terms = observed_terms_torch(
+        torch_data.observed_model, phi, eps=eps
     )
     fit_loss, penalty, objective = (
         _objective_value_from_mutation_region_terms_torch(
@@ -1783,8 +1756,8 @@ def _fit_from_start(
             responsibilities = current_mutation_region_terms.posterior
             if responsibilities is None:
                 raise AssertionError("Observed terms lack path responsibilities.")
-            surrogate_terms = em_surrogate_terms_torch(
-                torch_data,
+            surrogate_terms = observed_em_terms_torch(
+                torch_data.observed_model,
                 phi,
                 responsibilities=responsibilities,
                 eps=eps,
@@ -1967,8 +1940,8 @@ def _fit_from_start(
                 inner_dual_start = dual_kkt_trial if use_alm else dual_trial
                 inner_dual_start_is_actual = bool(use_alm)
             delta = phi_trial - phi
-            trial_mutation_region_terms = mutation_region_terms_torch(
-                torch_data, phi_trial, eps=eps
+            trial_mutation_region_terms = observed_terms_torch(
+                torch_data.observed_model, phi_trial, eps=eps
             )
             trial_fit_loss, _, trial_objective = (
                 _objective_value_from_mutation_region_terms_torch(
@@ -2012,8 +1985,8 @@ def _fit_from_start(
                     surrogate_gap = float(trial_fit_loss - majorizer_rhs)
                     em_envelope_gap = 0.0
                 else:
-                    trial_surrogate_terms = em_surrogate_terms_torch(
-                        torch_data,
+                    trial_surrogate_terms = observed_em_terms_torch(
+                        torch_data.observed_model,
                         phi_trial,
                         responsibilities=responsibilities,
                         eps=eps,
@@ -2188,8 +2161,8 @@ def _fit_from_start(
             damped_accepted = False
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
-                theta_mutation_region_terms = mutation_region_terms_torch(
-                    torch_data, phi_theta, eps=eps
+                theta_mutation_region_terms = observed_terms_torch(
+                    torch_data.observed_model, phi_theta, eps=eps
                 )
                 theta_fit_loss, _, theta_objective = (
                     _objective_value_from_mutation_region_terms_torch(
@@ -2471,7 +2444,7 @@ def _fit_from_start(
             lambda_value=lambda_value,
             eps=eps,
             tol=cert_tol,
-            audit_context_cache=audit_context_cache,
+            audit_context_cache=problem.audit_context_cache,
         )
         certificate_audit_dtype = "float64"
         gradient_scope = audit_gradient_scope
@@ -2624,12 +2597,13 @@ def _fit_from_start(
                 base_objective_key,
                 lambda_value=float(lambda_value),
             ),
+            source_data_hash=problem.data_fingerprint,
             device=runtime.device_name,
             dtype=dtype_name(runtime.dtype),
             inner_solver=str(inner_solver),
             global_optimality_basis=str(global_optimality_basis),
             likelihood_eps=float(eps),
-            scalar_pilot_certificates=scalar_pilot_certificates,
+            scalar_pilot_certificates=problem.scalar_pilot_certificates,
         ),
     )
 
@@ -2654,11 +2628,7 @@ def _validate_prepared_problem(context: PreparedProblem) -> None:
         source, graph_hash=context.graph_hash, eps=context.problem.eps,
         lower=source.lower, upper=source.upper,
     )
-    if (
-        context.base_objective_key != key
-        or context.objective_spec_hash != key.fingerprint
-        or context.base_fusion_objective_hash != key.fingerprint
-    ):
+    if context.base_objective_key != key:
         raise ValueError("Prepared problem objective identity is inconsistent.")
 
 
@@ -2677,35 +2647,14 @@ def fit_prepared(
     likelihood, adaptive graph, epsilon, or float64 source authority.
     """
     _validate_prepared_problem(problem)
-    solver_context = problem
     data = problem.source_data
-    eps = float(problem.problem.eps)
-    tol = _validate_solver_tolerance(solver_options.tolerance)
-    certification_tol = _validate_solver_tolerance(
-        tol if solver_options.certification_tolerance is None
-        else solver_options.certification_tolerance
-    )
+    _validate_solver_tolerance(solver_options.tolerance)
+    _certificate_options(solver_options, problem.runtime.dtype)
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = objective_shape_for_data(data, solver_options.objective_shape)
-    outer_max_iter = max(int(solver_options.outer_max_iter), 1)
-    inner_max_iter = max(int(solver_options.inner_max_iter), 16)
-    use_backward_error_progress = bool(solver_options.use_backward_error_progress)
-    resources = solver_options.resources
-    workset_max_bytes = int(resources.workset_max_bytes)
-    compressed_cache_max_bytes = int(resources.compressed_cache_max_bytes)
-    workset_add_batch = int(resources.workset_add_batch)
-    workset_max_expansions = int(resources.workset_max_expansions)
-    certificate = solver_options.certificate
-    certificate_max_iter = int(certificate.max_iter)
-    certificate_refinement_rounds = int(certificate.refinement_rounds)
-    certificate_column_tol_scale = float(certificate.column_tolerance_scale)
-    verbose = bool(problem.verbose)
     normalized_fallback_policy = normalize_dense_fallback_policy(problem.fallback_policy)
     context_prepared_by_cpu_fallback = problem.resource_fallback == "dense_cpu"
     effective_runtime = problem.runtime
-    effective_exact_pilot = problem.exact_pilot
-    effective_pooled_start = problem.pooled_start
-    effective_scalar_well_starts = problem.scalar_well_starts
 
     attempts: list[_StartAttempt] = []
     if warm_state is not None:
@@ -2718,11 +2667,11 @@ def fit_prepared(
     if include_default_starts:
         if singleton_route:
             if not attempts:
-                attempts.append(_StartAttempt(effective_exact_pilot, None, "scalar_pilot"))
+                attempts.append(_StartAttempt(problem.exact_pilot, None, "scalar_pilot"))
         else:
             attempts.extend(_StartAttempt(start, None, "scalar_well")
-                            for start in effective_scalar_well_starts)
-            attempts.append(_StartAttempt(effective_pooled_start, None, "pooled"))
+                            for start in problem.scalar_well_starts)
+            attempts.append(_StartAttempt(problem.pooled_start, None, "pooled"))
     attempts = _deduplicate_start_attempts(
         attempts, runtime=effective_runtime, shape=tuple(problem.lower.shape),
     )
@@ -2732,50 +2681,8 @@ def fit_prepared(
         # This mandatory safeguard compares feasible points of the same frozen
         # objective. It does not move the box or turn local KKT into a global proof.
         attempts = _deduplicate_start_attempts(
-            [*attempts, _StartAttempt(effective_exact_pilot, None, "clipping_escape_pilot")],
+            [*attempts, _StartAttempt(problem.exact_pilot, None, "clipping_escape_pilot")],
             runtime=effective_runtime, shape=tuple(problem.lower.shape), atol=0.0,
-        )
-
-    def solve_start_once(
-        *,
-        context: PreparedProblem,
-        start: np.ndarray | torch.Tensor,
-        state: SolverState | None,
-        polish: bool = False,
-    ) -> RawFit:
-        if context.base_objective_key is None:
-            raise ValueError("PreparedProblem lacks a typed base-objective key.")
-        return _fit_from_start(
-            data,
-            torch_data=context.problem,
-            runtime=context.runtime,
-            graph=context.graph_spec,
-            tensor_graph=context.graph,
-            graph_hash=str(context.graph_hash),
-            base_objective_key=context.base_objective_key,
-            objective_spec_hash=str(context.objective_spec_hash),
-            lambda_value=lambda_value,
-            eps=eps,
-            outer_max_iter=1 if polish else outer_max_iter,
-            inner_max_iter=inner_max_iter,
-            tol=tol,
-            certification_tol=certification_tol,
-            use_backward_error_progress=use_backward_error_progress,
-            phi_start=start,
-            solver_state=state,
-            lower=context.lower,
-            upper=context.upper,
-            objective_shape=objective_shape,
-            workset_max_bytes=workset_max_bytes,
-            compressed_cache_max_bytes=compressed_cache_max_bytes,
-            workset_add_batch=workset_add_batch,
-            workset_max_expansions=workset_max_expansions,
-            certificate_max_iter=certificate_max_iter,
-            certificate_refinement_rounds=certificate_refinement_rounds,
-            certificate_column_tol_scale=certificate_column_tol_scale,
-            verbose=verbose,
-            audit_context_cache=context.audit_context_cache,
-            scalar_pilot_certificates=context.scalar_pilot_certificates,
         )
 
     cpu_fallback_context: PreparedProblem | None = None
@@ -2784,12 +2691,10 @@ def fit_prepared(
     start_artifacts: list[RawFit] = []
     start_contexts: list[PreparedProblem] = []
     for start_attempt in attempts:
-        start, state_for_start = start_attempt.phi, start_attempt.warm_state
-        cpu_seed = start
+        cpu_seed = start_attempt.phi
         attempted_artifacts: RawFit | None = None
-        attempt_context = solver_context
-        attempt_start = start
-        attempt_state = state_for_start
+        attempt_context = problem
+        current_attempt = start_attempt
         fallback_reason = ""
         fallback_backend: str | None = None
         policy_state = PolicyState(
@@ -2802,10 +2707,8 @@ def fit_prepared(
             match action:
                 case NextAction.RETRY_SAME_RUNTIME:
                     try:
-                        artifacts = solve_start_once(
-                            context=attempt_context,
-                            start=attempt_start,
-                            state=attempt_state,
+                        artifacts = _fit_from_start(
+                            attempt_context, lambda_value, solver_options, current_attempt,
                         )
                     except (MemoryError, torch.OutOfMemoryError) as exc:
                         policy_state.result = None
@@ -2827,8 +2730,7 @@ def fit_prepared(
                         if attempted_artifacts.state is not None
                         else attempted_artifacts.phi
                     )
-                    attempt_start = cpu_seed
-                    attempt_state = None
+                    current_attempt = _StartAttempt(cpu_seed, None, "dense_retry")
                     fallback_reason = (
                         "dense_current_device_after_compressed_not_certified"
                     )
@@ -2852,7 +2754,7 @@ def fit_prepared(
                         )
                         try:
                             cpu_fallback_context = promote_solver_context_dtype(
-                                solver_context,
+                                problem,
                                 dtype=cpu_runtime.dtype,
                                 device=cpu_runtime.device,
                                 start_override=cpu_seed,
@@ -2871,8 +2773,7 @@ def fit_prepared(
                             else np.asarray(cpu_seed)
                         )
                     attempt_context = cpu_fallback_context
-                    attempt_start = cpu_start
-                    attempt_state = None
+                    current_attempt = _StartAttempt(cpu_start, None, "cpu_fallback")
                     fallback_reason = "dense_cpu_after_solver_resource_limit"
                     fallback_backend = "admm_complete_graph_cpu_fallback"
                     policy_state.result = None
@@ -2923,6 +2824,7 @@ def fit_prepared(
         raise AssertionError("Best multistart fit lacks a source context.")
     selected_start_context = start_contexts[best_artifacts_index]
     working_artifacts = best_artifacts
+    polish_options = replace(solver_options, outer_max_iter=1)
     precision_context: PreparedProblem | None = None
     precision_on_cpu = False
     policy_state = PolicyState(
@@ -2950,15 +2852,17 @@ def fit_prepared(
                 if precision_context is None:
                     raise AssertionError("Precision retry lacks a promoted context.")
                 try:
-                    polished = solve_start_once(
-                        context=precision_context,
-                        start=torch.tensor(
-                            working_artifacts.phi,
-                            dtype=torch.float64,
-                            device=precision_context.runtime.device,
+                    polished = _fit_from_start(
+                        precision_context, lambda_value, polish_options,
+                        _StartAttempt(
+                            torch.tensor(
+                                working_artifacts.phi,
+                                dtype=torch.float64,
+                                device=precision_context.runtime.device,
+                            ),
+                            working_artifacts.state,
+                            "precision_polish",
                         ),
-                        state=working_artifacts.state,
-                        polish=True,
                     )
                 except (MemoryError, torch.OutOfMemoryError) as polish_exc:
                     policy_state.result = None

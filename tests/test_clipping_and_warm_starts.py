@@ -104,9 +104,9 @@ def test_nearby_pilot_across_clipping_threshold_is_not_deduplicated(tmp_path, mo
     assert 0 < float(torch.max(problem.exact_pilot - plateau)) < 1e-8
     starts = []
     original = solver._fit_from_start
-    def recording(*args, **kwargs):
-        starts.append(kwargs["phi_start"])
-        return original(*args, **kwargs)
+    def recording(problem, lambda_value, options, attempt):
+        starts.append(attempt.phi)
+        return original(problem, lambda_value, options, attempt)
     monkeypatch.setattr(solver, "_fit_from_start", recording)
     solver.fit_prepared(problem, .1, config.solver, phi_start=plateau,
                         include_default_starts=False)
@@ -142,9 +142,9 @@ def test_explicit_start_does_not_silently_inherit_warm_primal(tmp_path, monkeypa
     explicit = previous.state.phi.clone() if equal_phi else torch.full_like(previous.state.phi, .7)
     actual = []
     original = solver._fit_from_start
-    def recording(*args, **kwargs):
-        actual.append((kwargs["phi_start"], kwargs["solver_state"]))
-        return original(*args, **kwargs)
+    def recording(problem, lambda_value, options, attempt):
+        actual.append((attempt.phi, attempt.warm_state))
+        return original(problem, lambda_value, options, attempt)
     monkeypatch.setattr(solver, "_fit_from_start", recording)
     solver.fit_prepared(problem, .2, config.solver, warm_state=previous.state,
                         phi_start=explicit, include_default_starts=False)

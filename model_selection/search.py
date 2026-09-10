@@ -58,7 +58,7 @@ from ..model_selection.proposals import (
     pilot_matrix_hash as _pilot_matrix_hash,
     rescore_partition_candidates as _rescore_partition_candidates,
     select_raw_start_attempt as _select_raw_start_attempt,
-    solver_recovery_fit_options as _solver_recovery_fit_options,
+    solver_retry_fit_options,
 )
 from ..model_selection.scoring import (
     _canonical_lambda,
@@ -612,19 +612,7 @@ def _partition_guided_admm_selection(
             "positive pairwise penalty is solved by ADMM."
         )
     pilot_context = prepare_torch_problem_with_resource_policy(
-        data,
-        dense_fallback_policy=str(fit_options.runtime.fallback),
-        eps=float(fit_options.eps),
-        tol=float(fit_options.solver.tolerance),
-        defer_graph=True,
-        inner_max_iter=max(int(fit_options.solver.inner_max_iter), 16),
-        adaptive_weight_gamma=float(fit_options.graph.adaptive_weight_gamma),
-        adaptive_weight_floor=float(fit_options.graph.adaptive_weight_floor),
-        adaptive_weight_baseline=float(fit_options.graph.adaptive_weight_baseline),
-        device=fit_options.runtime.device,
-        dtype=fit_options.runtime.dtype,
-        objective_shape=str(fit_options.solver.objective_shape),
-        verbose=bool(fit_options.runtime.verbose),
+        data, fit_options, defer_graph=True, graph=None,
     )
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
@@ -679,11 +667,8 @@ def _partition_guided_admm_selection(
         selection_graph = fit_options.graph.graph
         prebuilt_tensor_graph = None
     base_solver_context = prepare_torch_problem_with_resource_policy(
-        data,
-        dense_fallback_policy=str(fit_options.runtime.fallback),
+        data, fit_options,
         inherited_resource_fallback=pilot_context.resource_fallback,
-        eps=float(fit_options.eps),
-        tol=float(fit_options.solver.tolerance),
         # The guide initializes adaptive weights, but observed curvature and a
         # mild degree correction set a finite data-derived distance floor. This
         # prevents the fixed 1e-6 floor from making the proposed blocks
@@ -691,22 +676,14 @@ def _partition_guided_admm_selection(
         # requested initializer.
         graph=selection_graph,
         prebuilt_tensor_graph=prebuilt_tensor_graph,
-        inner_max_iter=max(int(fit_options.solver.inner_max_iter), 16),
-        adaptive_weight_gamma=float(fit_options.graph.adaptive_weight_gamma),
-        adaptive_weight_floor=float(fit_options.graph.adaptive_weight_floor),
-        adaptive_weight_baseline=float(fit_options.graph.adaptive_weight_baseline),
         # Preserve the independent likelihood starts.  The previous flow
         # replaced both with the Ward guide, so nominal "cold" retries were
         # merely duplicates of the same non-convex basin.
         exact_pilot=pilot_context.exact_pilot,
         pooled_start=pilot_context.pooled_start,
         scalar_well_starts=pilot_context.scalar_well_starts,
-        device=fit_options.runtime.device,
-        dtype=fit_options.runtime.dtype,
         runtime=pilot_runtime,
         torch_data=pilot_torch_data,
-        objective_shape=str(fit_options.solver.objective_shape),
-        verbose=bool(fit_options.runtime.verbose),
     )
     base_solver_context = transfer_scalar_pilot_certificates(
         pilot_context, base_solver_context
@@ -791,36 +768,10 @@ def _partition_guided_admm_selection(
         for attempt_key in list(attempts_by_lambda):
             if float(attempt_key) != float(lambda_key):
                 del attempts_by_lambda[attempt_key]
-        candidate_fit_options = effective_fit_options
-        if proposal.phase in {
-            "solver_recovery",
-            "bootstrap_certification_anchor",
-        }:
-            candidate_fit_options = _solver_recovery_fit_options(
-                data,
-                effective_fit_options,
-                retry_number=int(proposal.retry_number),
-            )
-        elif proposal.retry_number > 0:
-            effort_factor = int(proposal.retry_number) + 1
-            base_solver = effective_fit_options.solver
-            candidate_fit_options = replace(
-                effective_fit_options,
-                solver=replace(
-                    base_solver,
-                    outer_max_iter=max(
-                        int(base_solver.outer_max_iter) * effort_factor,
-                        int(base_solver.outer_max_iter),
-                    ),
-                    inner_max_iter=max(
-                        int(base_solver.inner_max_iter) * effort_factor,
-                        int(base_solver.inner_max_iter),
-                    ),
-                    # Retry effort changes iteration budgets, not the model's
-                    # numerical admission contract.
-                    tolerance=float(base_solver.tolerance),
-                ),
-            )
+        candidate_fit_options = solver_retry_fit_options(
+            data, effective_fit_options, retry_number=int(proposal.retry_number),
+            certification_recovery=proposal.phase in {"solver_recovery", "bootstrap_certification_anchor"},
+        )
 
         def solve_raw_path() -> tuple[
             RawFit,
@@ -1082,16 +1033,7 @@ def _partition_guided_admm_selection(
                     # the dtype boundary, and the float64 solve refines fresh
                     # duals before certification.
                     solver_state_start, changed_count = None, 0
-                    phi_start = _clone_start(
-                        original_state.phi
-                        if original_state is not None
-                        and original_state.phi is not None
-                        else (
-                            explicit_phi_start
-                            if explicit_phi_start is not None
-                            else raw_guide_phi
-                        )
-                    )
+                    cold_state = original_state
                 else:
                     solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
                         original_state,
@@ -1101,21 +1043,19 @@ def _partition_guided_admm_selection(
                         context=context,
                         tol=float(candidate_fit_options.solver.tolerance),
                     )
-                    phi_start = _clone_start(
-                        solver_state_start.phi
-                        if solver_state_start is not None
-                        and solver_state_start.phi is not None
-                        else (
-                            explicit_phi_start
-                            if explicit_phi_start is not None
-                            else raw_guide_phi
-                        )
-                    )
+                    cold_state = solver_state_start
+                # A warm attempt already owns its primal. Only cold/promoted
+                # attempts need a detached copy; never build and discard a
+                # competing clone of the warm state's matrix.
+                phi_start = None if solver_state_start is not None else _clone_start(
+                    cold_state.phi if cold_state is not None and cold_state.phi is not None
+                    else explicit_phi_start if explicit_phi_start is not None else raw_guide_phi
+                )
                 seed_fit = fit_prepared(
                     context,
                     float(proposal.lambda_value),
                     candidate_fit_options.solver,
-                    phi_start=None if solver_state_start is not None else phi_start,
+                    phi_start=phi_start,
                     include_default_starts=False,
                     warm_state=solver_state_start,
                 )

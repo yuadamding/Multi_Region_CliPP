@@ -30,8 +30,8 @@ from ..core.fusion.graph_ops import (
 )
 from ..core.fusion.torch_backend import (
     graph_fusion_kkt_residual_from_grad_torch,
-    mutation_region_terms_torch,
 )
+from ..core.objective import observed_terms_torch
 from ..core.fusion.types import (
     ExactSolverResourceLimit,
     PreparedProblem,
@@ -629,8 +629,8 @@ def build_guided_fusion_initialization(
         partition_tolerance=float(partition_tolerance),
     )
 
-    terms = mutation_region_terms_torch(
-        solver_context.problem,
+    terms = observed_terms_torch(
+        solver_context.problem.observed_model,
         phi,
         eps=float(solver_context.problem.eps),
     )

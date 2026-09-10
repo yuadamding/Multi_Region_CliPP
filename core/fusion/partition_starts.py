@@ -8,7 +8,10 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from ..objective import ObservedModel, compile_observed_model, observed_terms_numpy
+from ..objective import (
+    ObservedModel, compile_observed_model, observed_terms_numpy,
+    observed_loss_grid_torch,
+)
 from ..bic import (
     PARTITION_DIRICHLET_SCORE_WEIGHT,
     bic_degrees_of_freedom,
@@ -26,8 +29,6 @@ from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
     copy_torch_tumor_data,
-    mutation_region_loss_grid_torch,
-    mutation_region_terms_torch,
     resolve_runtime,
     to_torch_tumor_data,
 )
@@ -159,26 +160,6 @@ def _resolve_partition_runtime(
     )
 
 
-def _as_torch(
-    array: np.ndarray | torch.Tensor | object, *, runtime: TorchRuntime
-) -> torch.Tensor:
-    return as_runtime_tensor(array, runtime)
-
-
-def _mutation_region_loss_matrix_torch(
-    torch_data: TorchTumorData,
-    beta: torch.Tensor,
-    *,
-
-    eps: float,
-) -> torch.Tensor:
-    return mutation_region_terms_torch(
-        torch_data,
-        beta,
-        eps=float(eps),
-    ).loss
-
-
 @torch.no_grad()
 def observed_curvature_at_pilot_torch(
     data: TumorData,
@@ -202,7 +183,7 @@ def observed_curvature_at_pilot_torch(
         dtype=dtype,
         eps=eps,
     )
-    phi0 = _as_torch(exact_pilot, runtime=runtime)
+    phi0 = as_runtime_tensor(exact_pilot, runtime)
     upper = torch_data.phi_upper
     lower_value = float(eps)
     lower = torch.full_like(phi0, lower_value)
@@ -219,14 +200,14 @@ def observed_curvature_at_pilot_torch(
     h_right = right - x0
     valid = (h_left > 1e-12) & (h_right > 1e-12)
 
-    f_left = _mutation_region_loss_matrix_torch(
-        torch_data, left, eps=eps
+    f_left = observed_loss_grid_torch(
+        torch_data.observed_model, left, eps=eps
     )
-    f0 = _mutation_region_loss_matrix_torch(
-        torch_data, x0, eps=eps
+    f0 = observed_loss_grid_torch(
+        torch_data.observed_model, x0, eps=eps
     )
-    f_right = _mutation_region_loss_matrix_torch(
-        torch_data, right, eps=eps
+    f_right = observed_loss_grid_torch(
+        torch_data.observed_model, right, eps=eps
     )
     denom = h_left * h_right * (h_left + h_right)
     curvature = (
@@ -281,8 +262,8 @@ def hessian_weighted_ward_label_sets_torch(
         device_name=_torch_device_name(runtime_device),
         dtype=runtime_dtype,
     )
-    phi0 = _as_torch(exact_pilot, runtime=runtime)
-    h = _as_torch(curvature, runtime=runtime)
+    phi0 = as_runtime_tensor(exact_pilot, runtime)
+    h = as_runtime_tensor(curvature, runtime)
     if tuple(phi0.shape) != tuple(h.shape):
         raise ValueError("exact_pilot and curvature must have the same shape.")
     num_mutations = int(phi0.shape[0])
@@ -554,10 +535,10 @@ def _loss_to_centers_torch(
         dtype=dtype,
         eps=eps,
     )
-    centers_t = _as_torch(centers, runtime=runtime)
+    centers_t = as_runtime_tensor(centers, runtime)
     beta = centers_t.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
-    loss = mutation_region_loss_grid_torch(
-        torch_data,
+    loss = observed_loss_grid_torch(
+        torch_data.observed_model,
         beta,
         eps=float(eps),
     )
@@ -916,8 +897,8 @@ def partition_constrained_observed_refit_torch(
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
         assigned_beta = beta_ks.index_select(0, labels_t)
-        assigned_loss = mutation_region_loss_grid_torch(
-            torch_data,
+        assigned_loss = observed_loss_grid_torch(
+            torch_data.observed_model,
             assigned_beta,
             eps=float(eps),
         )
@@ -973,7 +954,7 @@ def partition_constrained_observed_refit_torch(
     midpoint = 0.5 * (left + right)
     candidates = [midpoint, left, right, lower, upper]
     if hint_phi is not None:
-        hint_t = _as_torch(hint_phi, runtime=runtime)
+        hint_t = as_runtime_tensor(hint_phi, runtime)
         hint_centers = torch.empty(
             (n_clusters, n_regions), dtype=runtime.dtype, device=runtime.device
         )
@@ -1229,7 +1210,7 @@ def generate_likelihood_partition_starts(
             eps=eps,
         )
     phi0 = (
-        _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()
+        as_runtime_tensor(exact_pilot, runtime).detach().cpu().numpy()
         if use_torch_runtime and runtime is not None
         else _as_numpy(exact_pilot)
     )

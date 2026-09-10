@@ -61,6 +61,10 @@ Release 0.5.0 retires binary/occupancy likelihood families and their options:
 runtime tuning option. Public fits require immutable validated `TumorData` from
 `load_tumor_txt`; reconstruction must preserve biological/scaling consistency.
 The public API is in `CliPP2.api`, reporting in `CliPP2.reporting`.
+Candidates now compile directly from validated CN into the observed model;
+`IntegerMultiplicitySpec` and `TumorData.path_likelihood` are removed. The loader
+freezes one final input object, reuses its initialization model, and caches the
+retained-input identity once. Reconstructing an input computes a fresh identity.
 
 Use `fit_fixed_objective(data, config)` for one lambda. For deliberate reuse:
 
@@ -86,6 +90,10 @@ separate cold attempt, not an override of the warm primal. Disabling defaults
 without either start is a configuration error. A singleton start on a clipping
 plateau with feasible downhill likelihood also retains the existing scalar
 pilot, even with defaults disabled; that comparison is not a global proof.
+Returned `RawFit.phi`, partition labels, and fixed-refit arrays use immutable
+buffers, preserving raw dtype. Copies and pickle roundtrips rerun their normal
+constructors to restore validation and immutability; cached identities and
+qualification are rebuilt. `SolverState` remains mutable numerical work state.
 
 ## Outputs and integrity
 
@@ -125,6 +133,22 @@ unavailable facts are null. `analysis` is null before a qualified fit is ready;
 it can remain available after a later publication failure. Publication
 `status="complete"` never means global or resolved inference. Older manifests
 without `analysis` provide no persisted numerical qualification.
+
+All tables now consume one validated `AnalysisSerialization`. Standalone
+`write_fit_outputs` uses that same boundary: ordered mutation/region identities,
+counts, CN, purity, observation masks, epsilon, and bounds must match the fitted
+source. Raw fits and fixed refits carry their own required source identity.
+Old identity-free result objects are rejected, not silently repaired. Final-Phi
+direct partitions also require their exact parent provenance; standalone writing
+must receive that raw parent, while a full selection keeps parent and reference
+separate. Table builders are private; use the two supported output writers.
+
+Stdout summary schema **5** and the manifest share one immutable qualification
+record. `raw_reference_*` fields describe the reference; `selected_raw_*` fields
+describe an actual raw selection and are null for a direct selection. Ambiguous
+`selected_full_kkt_*`, `selected_working_dtype`, and similar raw-reference aliases
+are removed. `configured_raw_solver_primal_tol` is configuration metadata;
+`raw_reference_solve_tolerance` records the actual solve's tolerance.
 
 ## Matched simulation
 
@@ -179,7 +203,51 @@ conventions, refits, scores, and integer posteriors require paired validation.
 CUDA and representative cohort/release-panel qualification remain necessary;
 passing CPU tests alone is not evidence of improved benchmark accuracy.
 
-### Unreleased corrections to 0.5.0 — 2026-09-09
+### Unreleased integrity and simplification pass — 2026-09-09
+
+Following the review of `5ca5a1914cffc929949c4d1e22b44432a99c3b9f`, this pass
+closes writable-result, mismatched-reporting-input, and selected/raw-reference
+summary gaps. It also removes duplicated prepared bounds/hashes and solver
+argument forwarding, consolidates preparation/retry configuration, freezes data
+once, removes the stored multiplicity specification, and shares NumPy/Torch
+candidate arithmetic across scalar, observed, grid, and EM evaluation. The
+statistical reductions remain separate. Likelihood-only grids do not compute
+posterior derivatives, and warm continuations no longer allocate discarded
+copies of their primals. No graph backend or hybrid candidate family is removed.
+
+A pinned comparison captured five tiny CPU-float64 fixtures (CN1, CN2, CN6,
+equal CN6, and an independently generated two-region count fixture). The
+captured numerical records match **byte for byte**: retained numerical inputs,
+candidate support/priors, initialization, pilot, graph weights/hashes, objective
+keys, loss/gradient/curvature, raw and warm CCFs/objectives, certificates/stop
+reasons, and three hybrid selections' labels/refit CCFs/scores/posteriors/four
+TSVs. The two-region fixture's CNA-only multiplicity macro/micro-F1 also matches
+(10 eligible rows; a parity check, not a cohort accuracy estimate). Capture
+SHA-256: `ce8e7fc88e46e00cbacd9161ad3ecf0eb3133f96029e09741092c84891e5748d`.
+These checks do not establish bitwise equivalence on other inputs or devices.
+
+In `ml1`, **437 tests passed** in 26.37 seconds, including the isolated installed
+wheel and new result/reporting/copy-integrity regressions. Ruff and
+`git diff --check` passed. Validation command:
+
+```bash
+env -u PYTHONPATH PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  conda run -n ml1 python -m pytest -q -p no:cacheprovider
+```
+
+Inference source remains 37 Python files and decreases from **772,924 to
+767,700 bytes** (5,224 fewer bytes, about 0.7%), excluding setup, tests, tools,
+and documentation. The principal simplification is fewer independently stored
+quantities and forwarding paths, not fewer module files; new integrity checks
+and regression tests are retained.
+
+Retained-input fingerprint schema changes from v2 to **v3** because the stored
+candidate specification is gone; numerical model, likelihood, box, graph, and
+objective-key schemas remain unchanged. Do not reuse cross-revision input
+caches or identity-free saved results. Package version remains **0.5.0**, with
+no new release tag. CUDA and representative cohort qualification are pending.
+
+### Correction qualification (`5ca5a19`) — 2026-09-09
 
 The correction-only patch following `1a0893d` addresses clipped-likelihood
 global certification, explicit warm/start pairing, portable source hashing,
@@ -196,9 +264,9 @@ pipeline checks, independent numerical formulas, portable-path hash checks,
 and isolated installed-wheel CPU fit. Ruff and `git diff --check` passed.
 Native Windows execution and production CUDA were not tested in this patch.
 
-The larger prepared-state, data-ownership, and arithmetic/policy contractions
-(review items P1–P7) remain separate work. CUDA and cohort qualification are
-still pending; these corrections alone make no benchmark-accuracy claim.
+At this reference commit the prepared-state, data-ownership, and arithmetic
+contractions remained separate work. Its corrections alone made no
+benchmark-accuracy claim.
 
 ### Release 0.5.0 qualification (`1a0893d`) — 2026-09-09
 

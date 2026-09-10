@@ -11,7 +11,7 @@ from CliPP2.core.fusion.torch_backend import (
     resolve_runtime, to_torch_tumor_data, validate_torch_tumor_data,
 )
 from CliPP2.core.objective import compile_observed_model
-from CliPP2.io.data import CNFilterRecord, CNFilterReport
+from CliPP2.io.data import CNFilterRecord, CNFilterReport, tumor_data_fingerprint
 from CliPP2.model_selection import candidates
 from CliPP2.model_selection.partitions import _partition_signature
 from test_integer_likelihood import integer_data
@@ -38,14 +38,39 @@ def test_numeric_changes_invalidate_same_family_refit_cache(change):
         changed = replace(original, count_observed=np.zeros_like(original.alt_counts, dtype=bool))
     else:
         changed = replace(original, phi_upper=original.phi_upper * 0.9)
-    assert original.path_likelihood.model_id == changed.path_likelihood.model_id
+    assert compile_observed_model(original, eps=1e-6).model_id == compile_observed_model(changed, eps=1e-6).model_id
     assert _key(original) != _key(changed)
 
 
-def test_changed_integer_prior_is_rejected_before_it_can_enter_a_cache():
+def test_removed_integer_specification_cannot_enter_a_cache():
     data = integer_data(((4,),))
-    with pytest.raises(ValueError, match="fixed uniform priors"):
-        replace(data.path_likelihood, log_prior=np.log(np.array([[[0.1, 0.2, 0.3, 0.4]]])))
+    with pytest.raises(TypeError, match="path_likelihood"):
+        replace(data, path_likelihood=object())
+
+
+def test_fingerprint_is_computed_once_and_replacements_start_fresh(monkeypatch):
+    from CliPP2.io import data as data_module
+
+    original = integer_data(((4,),))
+    model = compile_observed_model(original, eps=1e-6)
+    original_hash = tumor_data_fingerprint(original)
+    compute = data_module._retained_data_fingerprint
+    calls = []
+
+    def record(data):
+        calls.append(data)
+        return compute(data)
+
+    monkeypatch.setattr(data_module, "_retained_data_fingerprint", record)
+    assert tumor_data_fingerprint(original) == original_hash
+    assert tumor_data_fingerprint(original) == original_hash
+    assert not calls
+    changed = replace(original, alt_counts=original.alt_counts + 1)
+    assert len(calls) == 1 and calls[0] is changed
+    assert not changed._compiled_models
+    assert tumor_data_fingerprint(changed) != original_hash
+    assert compile_observed_model(original, eps=1e-6) is model
+    assert compile_observed_model(changed, eps=1e-6) is not model
 
 
 @pytest.mark.parametrize("change", ["reads", "bounds", "eps"])

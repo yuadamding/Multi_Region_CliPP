@@ -8,12 +8,8 @@ import torch
 from ...io.data import TumorData, tumor_data_fingerprint
 from ..objective import (
     ObservedModel,
-    TorchObservedTerms,
     compile_observed_model,
     model_to_torch,
-    observed_em_terms_torch,
-    observed_loss_grid_torch,
-    observed_terms_torch,
 )
 from ...config import DEFAULT_DTYPE
 from .graph_ops import (
@@ -377,11 +373,9 @@ def validate_torch_tumor_data(
         ):
             raise ValueError(f"{label} must be on runtime device {runtime.device_name}.")
 
-    host_path = getattr(data, "path_likelihood", None)
+    expected_model = compile_observed_model(data, eps=float(eps))
     observed_model = tensor_data.observed_model
-    if host_path is None:
-        raise ValueError("An integer multiplicity specification is required.")
-    expected_model_shape = (*expected_shape, int(host_path.copies.shape[-1]))
+    expected_model_shape = expected_model.path_shape
 
     for name in ("alt", "nonalt", "lower", "upper"):
         validate_tensor(
@@ -411,12 +405,10 @@ def validate_torch_tumor_data(
     )
     if not observed_model.source_fingerprint:
         raise ValueError("TorchObservedModel.source_fingerprint must be nonempty.")
-    expected_model_id = host_path.model_id
-    if observed_model.model_id != expected_model_id:
+    if observed_model.model_id != expected_model.model_id:
         raise ValueError("TorchObservedModel model_id does not match TumorData.")
 
     source_model = tensor_data.source_model
-    expected_model = compile_observed_model(data, eps=float(eps))
     if source_model is None or source_model.fingerprint != expected_model.fingerprint:
         raise ValueError("ObservedModel source does not match the requested TumorData/eps objective.")
     if source_model.fingerprint != observed_model.source_fingerprint:
@@ -433,38 +425,6 @@ def downward_kink_mask_torch(
     """Return breakpoints whose derivative jump admits one-sided descent."""
 
     return at_breakpoint & (gradient_left > gradient_right + max(float(tol), 1e-12))
-
-
-def mutation_region_loss_grid_torch(
-    data: TorchTumorData,
-    beta_grid: torch.Tensor,
-    *,
-    eps: float,
-    respect_observed: bool = True,
-) -> torch.Tensor:
-    """Evaluate canonical loss for ``(M, S, *grid)`` candidate CCFs."""
-
-    return observed_loss_grid_torch(
-        data.observed_model,
-        beta_grid,
-        eps=eps,
-        respect_observed=respect_observed,
-    )
-
-
-def mutation_region_terms_torch(
-    data: TorchTumorData, phi: torch.Tensor, *, eps: float,
-) -> TorchObservedTerms:
-    return observed_terms_torch(data.observed_model, phi, eps=eps)
-
-
-def em_surrogate_terms_torch(
-    data: TorchTumorData, phi: torch.Tensor, *,
-    responsibilities: torch.Tensor, eps: float,
-) -> TorchObservedTerms:
-    return observed_em_terms_torch(
-        data.observed_model, phi, responsibilities=responsibilities, eps=eps,
-    )
 
 
 def pairwise_penalty_torch(

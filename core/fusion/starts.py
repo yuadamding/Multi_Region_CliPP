@@ -26,12 +26,13 @@ from .torch_backend import (
 _ROOT_SCAN_POINTS = 65
 
 
-def initialize_marginal_phi(data: TumorData, *, eps: float) -> np.ndarray:
+def initialize_marginal_phi(model: ObservedModel, *, eps: float) -> np.ndarray:
     """Canonical marginalized scalar initializer; never a hard component fit."""
-    primary, _secondary, _valid = compute_scalar_mutation_region_wells(
-        data, eps=eps, tol=1e-10, max_iter=256,
+    primary, _secondary, _valid = _scalar_wells_from_model(
+        model, phi_init=np.clip(np.full(model.shape, 0.5, dtype=np.float64), eps, model.upper),
+        eps=eps, tol=1e-10, max_iter=256,
     )
-    return np.clip(np.asarray(primary, dtype=np.float64), eps, data.phi_upper)
+    return np.clip(np.asarray(primary, dtype=np.float64), eps, model.upper)
 
 
 def _source_observed_model(torch_data: TorchTumorData) -> ObservedModel:

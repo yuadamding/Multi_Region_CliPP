@@ -80,13 +80,27 @@ def test_direct_selection_does_not_inherit_raw_certification(analysis, tmp_path)
     result = replace(analysis.selection_result, selected_model=SelectedModel(
         raw_reference=analysis.raw_reference, partition_candidate=direct,
     ), selected_lambda_representative=None, selected_kkt_residual=None)
-    reporting.write_analysis_outputs(replace(analysis, selection_result=result), outdir=tmp_path)
+    direct_analysis = replace(analysis, selection_result=result)
+    reporting.write_analysis_outputs(direct_analysis, outdir=tmp_path)
     qualification = _read(tmp_path)["analysis"]
     assert qualification["selected_partition"]["family"] == "direct_partition"
     assert not qualification["selected_partition"]["raw_partition_certified"]
     assert qualification["selected_raw_fit"] is None
     assert qualification["raw_reference"]["kkt_certified"]
     assert qualification["raw_reference"]["admissible"]
+    summary = reporting.analysis_summary(direct_analysis, elapsed_seconds=0)
+    assert summary["summary_schema_version"] == 5
+    assert all(value is None for key, value in summary.items() if key.startswith("selected_raw_"))
+    assert summary["raw_reference_penalized_objective"] == qualification["raw_reference"]["objective"]
+    assert summary["raw_reference_kkt_residual"] == qualification["raw_reference"]["kkt_residual"]
+    assert summary["raw_reference_kkt_tolerance"] == qualification["raw_reference"]["kkt_tolerance"]
+    assert summary["raw_reference_working_dtype"] == qualification["raw_reference"]["working_dtype"]
+    assert summary["raw_reference_solve_tolerance"] == qualification["raw_reference"]["solve_tolerance"]
+    assert summary["configured_raw_solver_primal_tol"] == direct_analysis.fit_config.solver.tolerance
+    for key in ("selected_full_kkt_tolerance", "selected_working_dtype",
+                "selected_certificate_audit_dtype", "selected_base_fusion_objective_hash",
+                "selected_kkt_residual"):
+        assert key not in summary
 
 
 def test_standalone_writer_does_not_invent_search_qualification(analysis, tmp_path):
@@ -149,3 +163,56 @@ def test_invalid_partition_never_acquires_qualification(analysis, tmp_path):
                                     partition=analysis.partition, refit=bad)
     assert _read(tmp_path)["status"] == "failed"
     assert _read(tmp_path)["analysis"] is None
+
+
+@pytest.mark.parametrize("field", ["value", "loglik", "penalty", "assignment_log_evidence"])
+def test_analysis_boundary_rejects_corrupted_candidate_score(analysis, field):
+    selected = analysis.selected_candidate
+    score = replace(selected.score, **{field: getattr(selected.score, field) + 10})
+    changed = replace(selected, score=score)
+    result = replace(analysis.selection_result, selected_model=SelectedModel(
+        raw_reference=analysis.raw_reference, partition_candidate=changed,
+    ))
+    with pytest.raises(AssertionError):
+        replace(analysis, selection_result=result)
+
+
+def test_summary_and_publication_use_one_validated_record(analysis, tmp_path, monkeypatch):
+    monkeypatch.setattr(reporting, "validate_candidate_identity",
+                        lambda *args: pytest.fail("candidate already validated"))
+    summary = reporting.analysis_summary(analysis, elapsed_seconds=0)
+    reporting.write_analysis_outputs(analysis, outdir=tmp_path)
+    qualification = _read(tmp_path)["analysis"]
+    assert summary["selected_raw_penalized_objective"] == qualification["selected_raw_fit"]["objective"]
+    assert summary["selected_raw_solve_tolerance"] == qualification["selected_raw_fit"]["solve_tolerance"]
+    assert summary["selected_refit_numerically_resolved"] == qualification["refit"]["numerically_resolved"]
+
+
+@pytest.mark.parametrize("field,value", [("n_eff", 0), ("degrees_of_freedom", 2)])
+def test_analysis_binds_mathematically_reconstructible_score_dimensions(analysis, field, value):
+    # log(max(n_eff, 1)) is zero here: both altered scores still reconstruct,
+    # but neither describes the one-mutation, one-region source dataset.
+    selected = replace(analysis.selected_candidate,
+                       score=replace(analysis.score, **{field: value}))
+    result = replace(analysis.selection_result, selected_model=SelectedModel(
+        raw_reference=analysis.raw_reference, partition_candidate=selected,
+    ))
+    with pytest.raises(ValueError, match="score dimensions"):
+        replace(analysis, selection_result=result)
+
+
+def test_analysis_rejects_candidates_from_different_frozen_graphs(analysis):
+    raw = analysis.raw_fit
+    altered_key = replace(raw.provenance.objective_key,
+                          base=replace(raw.provenance.objective_key.base, graph_hash="other-graph"))
+    other = replace(raw, provenance=replace(raw.provenance, objective_key=altered_key))
+    # Keep the singleton witness coherent with its changed graph; this would
+    # otherwise remain a mathematically admissible standalone candidate.
+    other = replace(other, certificate=replace(other.certificate,
+                    witness=replace(other.certificate.witness, graph_hash="other-graph")))
+    selected = replace(analysis.selected_candidate, raw_fit=other)
+    result = replace(analysis.selection_result, selected_model=SelectedModel(
+        raw_reference=analysis.raw_reference, partition_candidate=selected,
+    ))
+    with pytest.raises(ValueError, match="frozen base objective"):
+        replace(analysis, selection_result=result)

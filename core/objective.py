@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from ..io.data import readonly_array as _readonly_array
+from ..io.data import ImmutableArrayRecord, readonly_array as _readonly_array
 from ..io.multiplicity import (
+    CLONAL_INTEGER_GENERATOR_VERSION,
     CLONAL_INTEGER_MODEL_ID,
-    build_clonal_integer_likelihood,
+    CLONAL_INTEGER_PRIOR_MODE,
+    MAX_MAJOR_CN,
 )
 
 if TYPE_CHECKING:
@@ -138,7 +140,7 @@ class LambdaObjectiveKey:
 
 
 @dataclass(frozen=True, slots=True)
-class ObservedModel:
+class ObservedModel(ImmutableArrayRecord):
     """Immutable float64 source model for observed mutation counts.
 
     Candidate arrays have shape ``(mutation, region, candidate)``. A
@@ -157,6 +159,7 @@ class ObservedModel:
     model_id: str
     fingerprint: str = field(init=False)
     likelihood_fingerprint: str = field(init=False)
+    _convexity: dict[float, bool] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         observation_arrays = {
@@ -257,6 +260,18 @@ class ObservedModel:
     def path_shape(self) -> tuple[int, int, int]:
         return tuple(int(value) for value in self.slope.shape)
 
+    @property
+    def model_version(self) -> str:
+        return "1"
+
+    @property
+    def candidate_generator_version(self) -> str:
+        return CLONAL_INTEGER_GENERATOR_VERSION
+
+    @property
+    def prior_mode(self) -> str:
+        return CLONAL_INTEGER_PRIOR_MODE
+
 
 def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) -> bool:
     """Conservative convexity/endpoint-gradient qualification on the actual box.
@@ -277,6 +292,12 @@ def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) 
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         return False
+    if epsilon not in model._convexity:
+        model._convexity[epsilon] = _qualify_clipped_convexity(model, epsilon)
+    return model._convexity[epsilon]
+
+
+def _qualify_clipped_convexity(model: ObservedModel, epsilon: float) -> bool:
     active = model.observed & ((model.alt > 0.0) | (model.nonalt > 0.0))
     active &= model.lower < model.upper
     if np.any(active & (np.sum(model.valid, axis=-1) != 1)):
@@ -366,29 +387,46 @@ class _TorchPathKernel:
     slope: torch.Tensor
 
 
-def _compile_integer_candidates(data: "TumorData") -> dict[str, object]:
-    spec = data.path_likelihood
-    if spec is None or spec.model_id != CLONAL_INTEGER_MODEL_ID:
-        raise ValueError("TumorData must contain the supported clonal integer likelihood.")
-    shape = tuple(int(value) for value in np.asarray(data.alt_counts).shape)
-    spec.validate_observation_shape(shape)
-    expected = build_clonal_integer_likelihood(data.major_cn)
-    # A model ID cannot authorize stale candidates or changed priors.
-    for name in ("copies", "log_prior", "valid"):
-        supplied = np.asarray(getattr(spec, name))
-        required = np.asarray(getattr(expected, name))
-        if supplied.shape != required.shape or not np.array_equal(supplied, required):
-            raise ValueError(
-                "Clonal integer likelihood requires complete ordered 1..major_cn "
-                "linear candidates and fixed uniform priors."
-            )
-    scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
+def _compile_integer_candidates(major_cn: np.ndarray, scaling: np.ndarray) -> dict[str, object]:
+    """Compile complete ordered 1..major_cn support with fixed uniform priors."""
+    major = np.asarray(major_cn, dtype=np.float64)
+    scale = np.asarray(scaling, dtype=np.float64)
+    if major.ndim != 2 or 0 in major.shape or scale.shape != major.shape:
+        raise ValueError("major_cn and scaling must have nonempty shape (M, S).")
+    if not np.all(np.isfinite(major)) or not np.allclose(major, np.rint(major), rtol=0.0, atol=1e-8):
+        raise ValueError("Retained major_cn must contain finite integers.")
+    major = np.rint(major)
+    if np.any((major < 1) | (major > MAX_MAJOR_CN)):
+        raise ValueError("Retained major_cn must lie in [1, 6]; apply CN filtering first.")
+    candidates = np.arange(1, int(major.max()) + 1, dtype=np.float64)
+    valid = candidates <= major[..., None]
     return {
-        "slope": scale * np.asarray(spec.copies, dtype=np.float64),
-        "log_prior": np.asarray(spec.log_prior, dtype=np.float64),
-        "valid": np.asarray(spec.valid, dtype=bool),
-        "model_id": spec.model_id,
+        "slope": scale[..., None] * np.where(valid, candidates, 0.0),
+        "log_prior": np.where(valid, -np.log(major)[..., None], -np.inf),
+        "valid": valid,
+        "model_id": CLONAL_INTEGER_MODEL_ID,
     }
+
+
+def compile_integer_observations(
+    *, alt_counts: np.ndarray, total_counts: np.ndarray,
+    count_observed: np.ndarray | None, phi_upper: np.ndarray,
+    major_cn: np.ndarray, scaling: np.ndarray, eps: float,
+) -> ObservedModel:
+    """Compile canonical arrays before the final immutable input is constructed."""
+    epsilon = float(eps)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    alt = np.asarray(alt_counts, dtype=np.float64)
+    total = np.asarray(total_counts, dtype=np.float64)
+    if alt.shape != total.shape:
+        raise ValueError("TumorData alt_counts and total_counts must have one shape.")
+    return ObservedModel(
+        alt=alt, nonalt=total - alt,
+        observed=np.ones(alt.shape, dtype=bool) if count_observed is None else count_observed,
+        lower=np.full(alt.shape, epsilon, dtype=np.float64), upper=phi_upper,
+        **_compile_integer_candidates(major_cn, scaling),
+    )
 
 
 def compile_observed_model(
@@ -404,23 +442,10 @@ def compile_observed_model(
     cached = data._compiled_models.get(epsilon)
     if cached is not None:
         return cached
-    alt = np.asarray(data.alt_counts, dtype=np.float64)
-    total = np.asarray(data.total_counts, dtype=np.float64)
-    if alt.shape != total.shape:
-        raise ValueError("TumorData alt_counts and total_counts must have one shape.")
-    observed_value = getattr(data, "count_observed", None)
-    observed = (
-        np.ones(alt.shape, dtype=bool)
-        if observed_value is None
-        else np.asarray(observed_value, dtype=bool)
-    )
-    model = ObservedModel(
-        alt=alt,
-        nonalt=total - alt,
-        observed=observed,
-        lower=np.full(alt.shape, epsilon, dtype=np.float64),
-        upper=np.asarray(data.phi_upper, dtype=np.float64),
-        **_compile_integer_candidates(data),
+    model = compile_integer_observations(
+        alt_counts=data.alt_counts, total_counts=data.total_counts,
+        count_observed=data.count_observed, phi_upper=data.phi_upper,
+        major_cn=data.major_cn, scaling=data.scaling, eps=epsilon,
     )
     return data._compiled_models.setdefault(epsilon, model)
 
@@ -532,6 +557,37 @@ def _path_kernel_numpy(
     return _NumpyPathKernel(mass=mass, probability=probability, slope=slope)
 
 
+def candidate_terms_numpy(alt, nonalt, probability, slope, *, derivative_order=2):
+    """Binomial candidate log-kernel and optional score/curvature terms.
+
+    Inputs broadcast over candidates and grids; probability and slope already
+    obey the clipping rule. Derivative order controls numerical work only,
+    never marginalization or EM responsibilities.
+    """
+    log_kernel = alt * np.log(probability) + nonalt * np.log1p(-probability)
+    score = curvature = None
+    if derivative_order >= 1:
+        score = slope * (alt / probability - nonalt / (1.0 - probability))
+    if derivative_order >= 2:
+        curvature = np.square(slope) * (
+            alt / np.square(probability) + nonalt / np.square(1.0 - probability)
+        )
+    return log_kernel, score, curvature
+
+
+def _candidate_terms_torch(alt, nonalt, probability, slope, *, derivative_order=2):
+    """Torch candidate arithmetic; observed and fixed-weight reductions stay separate."""
+    log_kernel = alt * torch.log(probability) + nonalt * torch.log1p(-probability)
+    score = curvature = None
+    if derivative_order >= 1:
+        score = slope * (alt / probability - nonalt / (1.0 - probability))
+    if derivative_order >= 2:
+        curvature = torch.square(slope) * (
+            alt / torch.square(probability) + nonalt / torch.square(1.0 - probability)
+        )
+    return log_kernel, score, curvature
+
+
 def _path_kernel_torch(
     model: TorchObservedModel,
     phi: torch.Tensor,
@@ -580,28 +636,20 @@ def observed_terms_numpy(
     """Evaluate loss, left-gradient, curvature majorant, and path posterior."""
 
     kernel = _path_kernel_numpy(model, phi, eps=eps)
-    probability = kernel.probability
-    slope = kernel.slope
+    log_kernel, state_gradient, state_curvature = candidate_terms_numpy(
+        model.alt[..., None], model.nonalt[..., None], kernel.probability, kernel.slope,
+    )
     joint = np.where(
         model.valid,
-        model.alt[..., None] * np.log(probability)
-        + model.nonalt[..., None] * np.log1p(-probability)
-        + model.log_prior,
+        log_kernel + model.log_prior,
         -np.inf,
     )
+    del log_kernel
     maximum = np.max(joint, axis=-1, keepdims=True)
     unnormalized = np.where(model.valid, np.exp(joint - maximum), 0.0)
     denominator = np.sum(unnormalized, axis=-1, keepdims=True)
     posterior = unnormalized / denominator
     log_normalizer = np.squeeze(maximum + np.log(denominator), axis=-1)
-    state_gradient = slope * (
-        model.alt[..., None] / probability
-        - model.nonalt[..., None] / (1.0 - probability)
-    )
-    state_curvature = np.square(slope) * (
-        model.alt[..., None] / np.square(probability)
-        + model.nonalt[..., None] / np.square(1.0 - probability)
-    )
     loss = -log_normalizer
     gradient = -np.sum(posterior * state_gradient, axis=-1)
     hessian_upper = np.sum(posterior * state_curvature, axis=-1)
@@ -631,23 +679,13 @@ def observed_terms_torch(
     if tuple(phi.shape) != tuple(model.alt.shape):
         raise ValueError(f"phi must have shape {tuple(model.alt.shape)}.")
     kernel = _path_kernel_torch(model, phi, eps=eps)
-    probability = kernel.probability
-    slope = kernel.slope
-    joint = (
-        model.alt.unsqueeze(-1) * torch.log(probability)
-        + model.nonalt.unsqueeze(-1) * torch.log1p(-probability)
-        + model.log_prior
-    ).masked_fill(~model.valid, -torch.inf)
+    log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
+        model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
+    )
+    joint = (log_kernel + model.log_prior).masked_fill(~model.valid, -torch.inf)
+    del log_kernel
     log_normalizer = torch.logsumexp(joint, dim=-1)
     posterior = torch.softmax(joint, dim=-1)
-    state_gradient = slope * (
-        model.alt.unsqueeze(-1) / probability
-        - model.nonalt.unsqueeze(-1) / (1.0 - probability)
-    )
-    state_curvature = torch.square(slope) * (
-        model.alt.unsqueeze(-1) / torch.square(probability)
-        + model.nonalt.unsqueeze(-1) / torch.square(1.0 - probability)
-    )
     loss = -log_normalizer
     gradient = -torch.sum(posterior * state_gradient, dim=-1)
     hessian_upper = torch.sum(posterior * state_curvature, dim=-1)
@@ -693,12 +731,12 @@ def observed_loss_grid_torch(
     def path_view(value: torch.Tensor) -> torch.Tensor:
         return value.reshape(path_shape)
 
-    joint = (
-        observation_view(model.alt).unsqueeze(-1) * torch.log(kernel.probability)
-        + observation_view(model.nonalt).unsqueeze(-1)
-        * torch.log1p(-kernel.probability)
-        + path_view(model.log_prior)
-    ).masked_fill(~path_view(model.valid), -torch.inf)
+    log_kernel, _, _ = _candidate_terms_torch(
+        observation_view(model.alt).unsqueeze(-1), observation_view(model.nonalt).unsqueeze(-1),
+        kernel.probability, kernel.slope, derivative_order=0,
+    )
+    joint = (log_kernel + path_view(model.log_prior)).masked_fill(~path_view(model.valid), -torch.inf)
+    del log_kernel
     loss = -torch.logsumexp(joint, dim=-1)
     if not bool(respect_observed):
         return loss
@@ -742,29 +780,21 @@ def observed_em_terms_torch(
         raise ValueError("responsibilities must assign mass to a valid path.")
     weights = weights / normalizer
     kernel = _path_kernel_torch(model, phi, eps=eps)
-    log_kernel = (
-        model.alt.unsqueeze(-1) * torch.log(kernel.probability)
-        + model.nonalt.unsqueeze(-1) * torch.log1p(-kernel.probability)
+    log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
+        model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
     )
     complete_loss = torch.where(
         model.valid,
         -(log_kernel + model.log_prior),
         torch.zeros_like(log_kernel),
     )
+    del log_kernel
     entropy = torch.where(
         weights > 0.0,
         weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
         torch.zeros_like(weights),
     )
     loss = torch.sum(weights * complete_loss + entropy, dim=-1)
-    state_gradient = kernel.slope * (
-        model.alt.unsqueeze(-1) / kernel.probability
-        - model.nonalt.unsqueeze(-1) / (1.0 - kernel.probability)
-    )
-    state_curvature = torch.square(kernel.slope) * (
-        model.alt.unsqueeze(-1) / torch.square(kernel.probability)
-        + model.nonalt.unsqueeze(-1) / torch.square(1.0 - kernel.probability)
-    )
     gradient = -torch.sum(weights * state_gradient, dim=-1)
     hessian_upper = torch.sum(weights * state_curvature, dim=-1)
     prior = torch.exp(model.log_prior).masked_fill(~model.valid, 0.0)

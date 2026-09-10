@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -21,9 +21,15 @@ from ._version import __version__
 from ._source import source_fingerprint
 from .config import FitConfig
 from .core.fusion.types import RawFit
-from .io.data import CNFilterReport, TumorData
-from .io.multiplicity import CLONAL_INTEGER_MODEL_ID, MAX_MAJOR_CN
-from .model_selection.partitions import _partition_signature
+from .core.bic import effective_bic_mutation_region_count
+from .core.objective import compile_observed_model, make_base_objective_key
+from .io.data import CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record
+from .io.multiplicity import (
+    CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION,
+    CLONAL_INTEGER_PRIOR_MODE, MAX_MAJOR_CN,
+)
+from .model_selection.candidates import validate_candidate_identity, validate_partition_identity
+from .model_selection.proposals import pilot_matrix_hash
 from .model_selection.types import (
     BICSelectionResult,
     RawFusionCandidate,
@@ -237,37 +243,9 @@ def _validated_profile(
     return profile
 
 
-def _validate_identity(
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-) -> np.ndarray:
-    raw_phi = np.asarray(raw_fit.phi, dtype=np.float64)
-    labels = np.asarray(partition.labels, dtype=np.int64)
-    if labels.shape != (raw_phi.shape[0],):
-        raise AssertionError("Selected partition does not match raw fit mutations.")
-    if not np.array_equal(labels, np.asarray(refit.labels, dtype=np.int64)):
-        raise AssertionError("Selected partition and fixed refit labels differ.")
-    if partition.signature != _partition_signature(
-        labels,
-        partition.mutation_ids if partition.mutation_ids else None,
-    ):
-        raise AssertionError("Selected partition signature does not match its labels.")
-    if partition.signature != refit.partition_signature:
-        raise AssertionError("Selected partition and fixed refit signatures differ.")
-    if isinstance(partition, FusionPartition) and not partition.certified:
-        raise AssertionError("Refusing to serialize an uncertified raw partition.")
-    return labels
-
-
-def mutation_output_table(
-    data: TumorData,
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-) -> pd.DataFrame:
-    labels = _validate_identity(raw_fit, partition, refit)
-    refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
+def _mutation_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
+    data, partition, refit = analysis.data, analysis.partition, analysis.refit
+    labels, refit_phi = partition.labels, refit.phi
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
@@ -284,17 +262,9 @@ def mutation_output_table(
     return table
 
 
-def cluster_output_table(
-    data: TumorData,
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-) -> pd.DataFrame:
-    labels = _validate_identity(raw_fit, partition, refit)
-    centers = np.asarray(refit.cluster_centers, dtype=np.float64)
-    expected = (int(partition.n_clusters), int(data.num_regions))
-    if centers.shape != expected or not np.all(np.isfinite(centers)):
-        raise ValueError(f"refit.cluster_centers must have shape {expected}.")
+def _cluster_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
+    data, partition, refit = analysis.data, analysis.partition, analysis.refit
+    labels, centers = partition.labels, refit.cluster_centers
     sizes = np.bincount(labels, minlength=int(partition.n_clusters))
     table = pd.DataFrame(
         {
@@ -337,16 +307,9 @@ def _add_integer_multiplicity(
         )
 
 
-def mutation_region_output_table(
-    data: TumorData,
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-    *,
-    eps: float | None = None,
-) -> pd.DataFrame:
-    labels = _validate_identity(raw_fit, partition, refit)
-    refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
+def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
+    data, partition, refit = analysis.data, analysis.partition, analysis.refit
+    labels, refit_phi = partition.labels, refit.phi
     mutation_ids = np.repeat(
         np.asarray(data.mutation_ids, dtype=object), data.num_regions
     )
@@ -365,14 +328,8 @@ def mutation_region_output_table(
             "minor_cn": data.minor_cn.reshape(-1),
         }
     )
-    likelihood_eps = float(raw_fit.provenance.likelihood_eps)
-    if eps is not None and float(eps) != likelihood_eps:
-        raise ValueError("Reporting eps must match the fitted likelihood provenance.")
-    eps = likelihood_eps
-    spec = data.path_likelihood
-    if spec is None or spec.model_id != CLONAL_INTEGER_MODEL_ID:
-        raise ValueError("Reporting supports only the clonal integer multiplicity model.")
-    _add_integer_multiplicity(table, data=data, phi=refit_phi, eps=eps)
+    _add_integer_multiplicity(table, data=data, phi=refit_phi,
+                              eps=analysis.raw_fit.provenance.likelihood_eps)
     return table
 
 
@@ -432,44 +389,33 @@ def write_fit_outputs(
     if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != data.tumor_id:
         raise ValueError("Publication does not belong to this tumor and output directory.")
     try:
-        _write_fit_tables(data, raw_fit, partition, refit, eps, publication)
+        analysis = AnalysisSerialization(data, raw_fit=raw_fit, partition=partition,
+                                         refit=refit, eps=eps)
+        _write_fit_tables(analysis, publication)
     except BaseException as error:
         if own_publication:
             publication.fail(error)
         raise
 
 
-def _write_fit_tables(
-    data: TumorData, raw_fit: RawFit, partition: SelectedPartition,
-    refit: PartitionRefitSummary, eps: float | None, publication: RunPublication,
-    *, selection_result: BICSelectionResult | None = None,
-) -> None:
+def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublication) -> None:
     tables = {
-        "mutation_clusters": mutation_output_table(data, raw_fit, partition, refit),
-        "cluster_centers": cluster_output_table(data, raw_fit, partition, refit),
-        "mutation_region_multiplicity": mutation_region_output_table(
-            data,
-            raw_fit,
-            partition,
-            refit,
-            eps=eps,
-        ),
+        "mutation_clusters": _mutation_output_table(analysis),
+        "cluster_centers": _cluster_output_table(analysis),
+        "mutation_region_multiplicity": _mutation_region_output_table(analysis),
         "excluded_mutations": cn_filter_output_table(
-            data.tumor_id, data.cn_filter_report
+            analysis.data.tumor_id, analysis.data.cn_filter_report
         ),
     }
-    publication.publish(tables, analysis=_manifest_qualification(
-        raw_fit, partition, refit, selection_result=selection_result,
-    ))
+    publication.publish(tables, analysis=analysis.qualification)
 
 
-SUMMARY_SCHEMA_VERSION = 4
+SUMMARY_SCHEMA_VERSION = 5
 
 
 def input_model_summary(data: TumorData) -> dict[str, object]:
     """Separate eligibility provenance from the retained numerical model."""
     report = data.cn_filter_report
-    spec = data.path_likelihood
     records = () if report is None else report.records
     return {
         "input_mutation_count": data.num_mutations if report is None else report.input_mutation_count,
@@ -482,9 +428,9 @@ def input_model_summary(data: TumorData) -> dict[str, object]:
             record.mutation_id for record in records if record.reason == "MAJOR_CN_GT_6"
         }),
         "cn_filter_policy_id": None if report is None else report.policy_id,
-        "multiplicity_model_id": None if spec is None else spec.model_id,
-        "multiplicity_candidate_generator_version": None if spec is None else spec.candidate_generator_version,
-        "multiplicity_prior_mode": None if spec is None else spec.prior_mode,
+        "multiplicity_model_id": CLONAL_INTEGER_MODEL_ID,
+        "multiplicity_candidate_generator_version": CLONAL_INTEGER_GENERATOR_VERSION,
+        "multiplicity_prior_mode": CLONAL_INTEGER_PRIOR_MODE,
     }
 
 
@@ -501,10 +447,8 @@ def _finite_number(value: float) -> float | None:
     return float(value) if np.isfinite(value) else None
 
 
-def _raw_qualification(fit: RawFit) -> dict[str, object] | None:
-    """Persist raw evidence; missing typed evidence is explicitly unknown."""
-    if not isinstance(fit, RawFit):
-        return None
+def _raw_qualification(fit: RawFit) -> dict[str, object]:
+    """Record the authoritative, immutable raw result's own evidence."""
     certificate, provenance = fit.certificate, fit.provenance
     return {
         "kkt_certified": bool(certificate.certified),
@@ -515,38 +459,35 @@ def _raw_qualification(fit: RawFit) -> dict[str, object] | None:
         "certificate_schema_version": int(certificate.schema_version),
         "kkt_residual": _finite_number(certificate.components.residual),
         "kkt_tolerance": _finite_number(certificate.tolerance),
+        "solve_tolerance": _finite_number(fit.convergence.solve_tolerance),
         "residual_method": str(certificate.residual_method),
         "audit_dtype": str(certificate.audit_dtype),
+        "working_dtype": str(certificate.working_dtype),
+        "working_precision_kkt_residual": _finite_number(certificate.working_residual),
+        "precision_polish_applied": bool(certificate.precision_polished),
+        "precision_polish_max_abs_phi_delta": _finite_number(certificate.precision_polish_delta),
         "objective": _finite_number(fit.objective.total),
         "lambda": _finite_number(provenance.lambda_value),
         "objective_hash": str(provenance.certificate_problem_hash),
         "base_objective_hash": str(provenance.base_fusion_objective_hash),
         "graph_hash": str(provenance.original_graph_hash),
+        "source_data_hash": str(provenance.source_data_hash),
         "phi_hash": _array_fingerprint(fit.phi, dtype=np.dtype(np.float64)),
     }
 
 
-def _manifest_qualification(
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-    *, selection_result: BICSelectionResult | None,
-) -> dict[str, object]:
+def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
     """Keep publication, raw admission, fixed-label refit, and search distinct."""
-    _validate_identity(raw_fit, partition, refit)
+    raw_fit, partition, refit = analysis.raw_fit, analysis.partition, analysis.refit
+    selection_result = analysis.selection_result
     selected_raw = raw_fit if isinstance(partition, FusionPartition) else None
     selected_score = None
     if selection_result is not None:
-        from .model_selection.candidates import validate_candidate_identity
-
         selected = selection_result.selected_model.partition_candidate
-        reference = selection_result.selected_model.raw_reference
-        validate_candidate_identity(selected)
-        validate_candidate_identity(reference)
-        if selected.partition is not partition or selected.refit is not refit or reference.raw_fit is not raw_fit:
-            raise ValueError("Manifest qualification does not match the serialized selection.")
         selected_raw = selected.raw_fit if isinstance(selected, RawFusionCandidate) else None
-        selected_score = {"name": str(selected.score.name), "value": _finite_number(selected.score.value)}
+        selected_score = {**asdict(selected.score), "assignment_penalty": selected.score.assignment_penalty}
+        selected_score = {key: _finite_number(value) if isinstance(value, float) else value
+                          for key, value in selected_score.items()}
     direct = isinstance(partition, DirectPartition)
     return {
         "raw_reference": _raw_qualification(raw_fit),
@@ -573,6 +514,9 @@ def _manifest_qualification(
             "global_optimality_gap": _finite_number(refit.global_optimality_gap),
             "loglik": _finite_number(refit.loglik),
             "phi_hash": _array_fingerprint(refit.phi, dtype=np.dtype(np.float64)),
+            "centers_hash": _array_fingerprint(refit.cluster_centers, dtype=np.dtype(np.float64)),
+            "source_data_hash": refit.source_data_hash,
+            "likelihood_eps": refit.likelihood_eps,
         },
         "selection": {
             "status": ("not_provided" if selection_result is None else
@@ -588,17 +532,108 @@ def _manifest_qualification(
     }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AnalysisSerialization:
-    """One normalized, output-ready view of a completed selection result.
-
-    Everything downstream consumes this normalized typed boundary.
-    """
+    """One immutable validation boundary shared by all reporting consumers."""
 
     data: TumorData
-    input_file: Path
-    fit_config: FitConfig
-    selection_result: BICSelectionResult
+    input_file: Path | None = None
+    fit_config: FitConfig | None = None
+    selection_result: BICSelectionResult | None = None
+    raw_fit: RawFit = field(init=False)
+    partition: SelectedPartition = field(init=False)
+    refit: PartitionRefitSummary = field(init=False)
+    _qualification_json: bytes = field(init=False, repr=False)
+
+    def __init__(
+        self, data: TumorData, input_file: Path | None = None,
+        fit_config: FitConfig | None = None,
+        selection_result: BICSelectionResult | None = None, *,
+        raw_fit: RawFit | None = None, partition: SelectedPartition | None = None,
+        refit: PartitionRefitSummary | None = None, eps: float | None = None,
+    ) -> None:
+        if selection_result is not None:
+            if any(value is not None for value in (raw_fit, partition, refit)):
+                raise ValueError("Supply a selection result or a standalone fit, not both.")
+            model = selection_result.selected_model
+            raw_fit = model.raw_reference.raw_fit
+            partition, refit = model.partition_candidate.partition, model.partition_candidate.refit
+        if not isinstance(raw_fit, RawFit) or not isinstance(refit, PartitionRefitSummary):
+            raise TypeError("Reporting requires typed RawFit and PartitionRefitSummary evidence.")
+        if not isinstance(partition, (FusionPartition, DirectPartition)):
+            raise TypeError("Reporting requires a typed selected partition.")
+        epsilon = raw_fit.provenance.likelihood_eps
+        if ((eps is not None and float(eps) != epsilon)
+            or (fit_config is not None and fit_config.eps != epsilon)):
+            raise ValueError("Reporting eps must match the fitted likelihood provenance.")
+        source_hash = tumor_data_fingerprint(data)
+        source_model = compile_observed_model(data, eps=epsilon)
+
+        def bind(partition, refit, raw=None):
+            if tuple(partition.mutation_ids) != tuple(data.mutation_ids):
+                raise ValueError("Reporting data do not match the fitted mutation ordering.")
+            if refit.source_data_hash != source_hash or refit.likelihood_eps != epsilon:
+                raise ValueError("Reporting data or epsilon do not match the fixed refit source identity.")
+            _validated_profile(data, refit.phi, name="refit.phi")
+            if isinstance(partition, FusionPartition) and not partition.certified:
+                raise AssertionError("Refusing to serialize an uncertified raw partition.")
+            if raw is not None:
+                _validated_profile(data, raw.phi, name="raw_fit.phi")
+                provenance = raw.provenance
+                if provenance.source_data_hash != source_hash:
+                    raise ValueError("Reporting data do not match the fitted source data identity.")
+                expected = make_base_objective_key(source_model,
+                    graph_hash=provenance.original_graph_hash, eps=epsilon)
+                if provenance.likelihood_eps != epsilon or provenance.objective_key.base != expected:
+                    raise ValueError("Reporting likelihood, box or epsilon identity does not match the fit.")
+                if provenance.objective_key.base != raw_fit.provenance.objective_key.base:
+                    raise ValueError("Reporting candidates do not share the frozen base objective.")
+
+        if selection_result is None:
+            validate_partition_identity(partition, refit)
+            bind(partition, refit, raw_fit)
+        else:
+            candidates = (model.raw_reference, model.partition_candidate, model.partition_parent_raw)
+            seen = set()
+            for candidate in candidates:
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                validate_candidate_identity(candidate)
+                bind(candidate.partition, candidate.refit,
+                     candidate.raw_fit if isinstance(candidate, RawFusionCandidate) else None)
+                score = candidate.score
+                if (score.degrees_of_freedom != candidate.partition.n_clusters * data.num_regions
+                    or score.n_eff != effective_bic_mutation_region_count(data)):
+                    raise ValueError("Selection score dimensions do not match the reporting data.")
+        if isinstance(partition, DirectPartition):
+            parent = (None if selection_result is None else model.partition_parent_raw)
+            if partition.parent_raw_candidate_id is not None:
+                parent_fit = raw_fit if selection_result is None else (None if parent is None else parent.raw_fit)
+                if (parent_fit is None
+                    or partition.parent_raw_lambda != parent_fit.provenance.lambda_value
+                    or partition.parent_raw_phi_hash != pilot_matrix_hash(parent_fit.phi)):
+                    raise ValueError("Direct-partition parent-Phi provenance does not match the supplied raw parent.")
+            elif (parent is not None or partition.parent_raw_phi_hash or partition.parent_raw_lambda is not None):
+                raise ValueError("Direct-partition parent provenance is incomplete or spurious.")
+        for name, value in (("data", data), ("input_file", input_file),
+                            ("fit_config", fit_config), ("selection_result", selection_result),
+                            ("raw_fit", raw_fit), ("partition", partition), ("refit", refit)):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_qualification_json", _json_bytes(_qualification(self)))
+
+    @property
+    def qualification(self) -> dict[str, object]:
+        return json.loads(self._qualification_json)
+
+    def __reduce__(self):
+        inputs = dict(data=self.data, input_file=self.input_file,
+                      fit_config=self.fit_config, selection_result=self.selection_result)
+        if self.selection_result is None:
+            inputs.update(raw_fit=self.raw_fit, partition=self.partition, refit=self.refit)
+        # Never serialize cached qualification as authority: copy/load must
+        # rebind source data, numerical evidence and selected identity.
+        return restore_immutable_record, (type(self), inputs)
 
     @property
     def selected_candidate(self) -> SelectablePartitionCandidate:
@@ -613,18 +648,6 @@ class AnalysisSerialization:
         return self.selection_result.selected_model.partition_parent_raw
 
     @property
-    def raw_fit(self) -> RawFit:
-        return self.raw_reference.raw_fit
-
-    @property
-    def partition(self) -> FusionPartition | DirectPartition:
-        return self.selected_candidate.partition
-
-    @property
-    def refit(self) -> PartitionRefitSummary:
-        return self.selected_candidate.refit
-
-    @property
     def score(self) -> SelectionScore:
         return self.selected_candidate.score
 
@@ -634,25 +657,24 @@ def analysis_summary(
     *,
     elapsed_seconds: float,
 ) -> dict[str, object]:
-    """Serialize schema-v4 diagnostics without changing estimator state."""
+    """Serialize schema-v5 diagnostics from the manifest qualification record."""
+
+    if analysis.selection_result is None or analysis.fit_config is None:
+        raise ValueError("An analysis summary requires the completed selection and configuration.")
 
     data = analysis.data
     fit_config = analysis.fit_config
     profile = fit_config.computation_profile
     result = analysis.selection_result
-    selected_model = result.selected_model
-    raw_reference = analysis.raw_reference
     raw_fit = analysis.raw_fit
     parent_raw = analysis.partition_parent_raw
-    partition = analysis.partition
-    refit = analysis.refit
-    score = analysis.score
     selected_lambda = result.selected_lambda_representative
-    optimum_resolved = bool(result.selection_optimum_resolved)
-    selected_partition_certified = bool(
-        isinstance(partition, FusionPartition) and partition.certified
-    )
-    exactness = raw_fit.certificate
+    qualification = analysis.qualification
+    raw_reference_evidence = qualification["raw_reference"]
+    partition_evidence = qualification["selected_partition"]
+    refit_evidence = qualification["refit"]
+    search_evidence = qualification["selection"]
+    score_evidence = search_evidence["score"]
     scalar_pilots = raw_fit.provenance.scalar_pilot_certificates
 
     return {
@@ -677,115 +699,74 @@ def analysis_summary(
             if scalar_pilots else None
         ),
         "computation_profile": str(profile.name),
-        "selection_status": (
-            "resolved" if optimum_resolved else "provisional_unresolved"
-        ),
+        "selection_status": search_evidence["status"],
         "selection_contract_id": str(fit_config.selection.contract_id),
-        "selection_optimum_resolved": optimum_resolved,
-        "selection_boundary_unresolved": bool(result.selection_boundary_unresolved),
+        "selection_optimum_resolved": search_evidence["optimum_resolved"],
+        "selection_boundary_unresolved": search_evidence["boundary_unresolved"],
         "selection_hits_lower_boundary": bool(result.selection_hits_lower_boundary),
         "selection_hits_upper_boundary": bool(result.selection_hits_upper_boundary),
         "selected_lambda": (
             None if selected_lambda is None else float(selected_lambda)
         ),
-        "raw_reference_lambda": float(
-            raw_fit.provenance.lambda_value
-        ),
+        "raw_reference_lambda": raw_reference_evidence["lambda"],
         "raw_reference_objective_certified": bool(
-            raw_reference.raw_objective_certified
+            raw_reference_evidence["kkt_certified"] and raw_reference_evidence["admissible"]
         ),
-        "selected_candidate_family": str(selected_model.selected_candidate_family),
-        "selected_partition_source": str(partition.source),
-        "selected_partition_parent_lambda": (
-            float(partition.parent_raw_lambda)
-            if isinstance(partition, DirectPartition)
-            and partition.parent_raw_lambda is not None
-            else None
-        ),
-        "selected_partition_parent_phi_hash": (
-            str(partition.parent_raw_phi_hash)
-            if isinstance(partition, DirectPartition) and parent_raw is not None
-            else ""
-        ),
+        "selected_candidate_family": partition_evidence["family"],
+        "selected_partition_source": partition_evidence["source"],
+        "selected_partition_parent_lambda": partition_evidence["parent_raw_lambda"],
+        "selected_partition_parent_phi_hash": partition_evidence["parent_raw_phi_hash"] or "",
         "selected_partition_parent_signature": (
             str(parent_raw.partition.signature) if parent_raw is not None else ""
         ),
-        "selected_n_clusters": int(partition.n_clusters),
-        "selected_partition_signature": str(partition.signature),
-        "selected_partition_certified": selected_partition_certified,
-        "selected_labels_hash": _array_fingerprint(
-            partition.labels,
-            dtype=np.dtype(np.int64),
-        ),
-        "raw_reference_phi_hash": _array_fingerprint(
-            raw_fit.phi,
-            dtype=np.dtype(np.float64),
-        ),
-        "selected_fixed_partition_refit_centers_hash": _array_fingerprint(
-            refit.cluster_centers,
-            dtype=np.dtype(np.float64),
-        ),
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
-        "selection_assignment_code_weight": float(score.assignment_code_weight),
-        "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(
-            score.assignment_dirichlet_alpha
-        ),
-        "selected_raw_penalized_objective": float(raw_fit.objective.total),
-        "selected_refit_numerically_resolved": bool(refit.refit_numerically_resolved),
-        "selected_refit_global_optimum_certified": bool(
-            refit.global_optimum_certified
-        ),
-        "selected_refit_global_optimality_gap": float(refit.global_optimality_gap),
-        "selected_refit_global_lower_bound": float(refit.global_lower_bound),
-        "selected_refit_global_certificate_method": str(
-            refit.global_certificate_method
-        ),
-        "selected_raw_solver_primal_tol": float(fit_config.solver.tolerance),
-        "selected_full_kkt_tolerance": float(raw_fit.certificate.tolerance),
-        "selected_full_kkt_residual_method": str(
-            exactness.residual_method
-        ),
-        "selected_working_precision_kkt_residual": float(
-            raw_fit.certificate.working_residual
-        ),
-        "selected_working_dtype": str(
-            raw_fit.certificate.working_dtype
-        ),
-        "selected_certificate_audit_dtype": str(
-            raw_fit.certificate.audit_dtype
-        ),
-        "selected_precision_polish_applied": bool(
-            raw_fit.certificate.precision_polished
-        ),
-        "selected_precision_polish_max_abs_phi_delta": float(
-            raw_fit.certificate.precision_polish_delta
-        ),
-        "selected_base_fusion_objective_hash": str(
-            raw_fit.provenance.base_fusion_objective_hash
-        ),
-        "selected_original_graph_hash": str(raw_fit.provenance.original_graph_hash),
-        "selection_method": str(result.selection_method),
+        "selected_n_clusters": partition_evidence["n_clusters"],
+        "selected_partition_signature": partition_evidence["signature"],
+        "selected_partition_certified": partition_evidence["raw_partition_certified"],
+        "selected_labels_hash": partition_evidence["labels_hash"],
+        "raw_reference_phi_hash": raw_reference_evidence["phi_hash"],
+        "selected_fixed_partition_refit_centers_hash": refit_evidence["centers_hash"],
+        "selection_score_name": score_evidence["name"],
+        "selection_score": score_evidence["value"],
+        "selection_score_numerical_uncertainty": score_evidence["numerical_uncertainty"],
+        "selection_loglik": score_evidence["loglik"],
+        "selection_df": score_evidence["degrees_of_freedom"],
+        "selection_penalty": score_evidence["penalty"],
+        "selection_n_eff": score_evidence["n_eff"],
+        "selection_assignment_log_evidence": score_evidence["assignment_log_evidence"],
+        "selection_assignment_code_weight": score_evidence["assignment_code_weight"],
+        "selection_assignment_penalty": score_evidence["assignment_penalty"],
+        "selection_assignment_dirichlet_alpha": score_evidence["assignment_dirichlet_alpha"],
+        **{
+            f"{prefix}_{name}": None if evidence is None else evidence[key]
+            for prefix, evidence in (("raw_reference", raw_reference_evidence),
+                                     ("selected_raw", qualification["selected_raw_fit"]))
+            for name, key in (("penalized_objective", "objective"),
+                              ("kkt_residual", "kkt_residual"),
+                              ("kkt_tolerance", "kkt_tolerance"),
+                              ("solve_tolerance", "solve_tolerance"),
+                              ("working_dtype", "working_dtype"),
+                              ("working_precision_kkt_residual", "working_precision_kkt_residual"),
+                              ("residual_method", "residual_method"),
+                              ("audit_dtype", "audit_dtype"),
+                              ("precision_polish_applied", "precision_polish_applied"),
+                              ("precision_polish_max_abs_phi_delta", "precision_polish_max_abs_phi_delta"),
+                              ("base_objective_hash", "base_objective_hash"),
+                              ("graph_hash", "graph_hash"),
+                              ("source_data_hash", "source_data_hash"))
+        },
+        "selected_refit_numerically_resolved": refit_evidence["numerically_resolved"],
+        "selected_refit_global_optimum_certified": refit_evidence["global_optimum_certified"],
+        "selected_refit_global_optimality_gap": refit_evidence["global_optimality_gap"],
+        "selected_refit_global_lower_bound": refit_evidence["global_lower_bound"],
+        "selected_refit_global_certificate_method": refit_evidence["certificate_method"],
+        "configured_raw_solver_primal_tol": float(fit_config.solver.tolerance),
+        "selection_method": search_evidence["method"],
         "num_candidates": int(result.num_candidates),
         "num_candidates_certified": int(result.num_candidates_certified),
         "ward_candidate_pool_complete": bool(result.ward_candidate_pool_complete),
-        "raw_lambda_path_complete": bool(result.raw_lambda_path_resolved),
-        "global_hybrid_optimum_certified": bool(
-            result.global_hybrid_optimum_certified
-        ),
-        "selected_kkt_residual": (
-            None
-            if result.selected_kkt_residual is None
-            else float(result.selected_kkt_residual)
-        ),
-        "search_stop_reason": str(result.adaptive_search_stop_reason),
+        "raw_lambda_path_complete": search_evidence["raw_lambda_path_resolved"],
+        "global_hybrid_optimum_certified": search_evidence["global_hybrid_optimum_certified"],
+        "search_stop_reason": search_evidence["stop_reason"],
         "device": str(raw_fit.provenance.device),
         "dtype": str(raw_fit.provenance.dtype),
         "elapsed_seconds": float(elapsed_seconds),
@@ -807,11 +788,7 @@ def write_analysis_outputs(
     if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != analysis.data.tumor_id:
         raise ValueError("Publication does not belong to this tumor and output directory.")
     try:
-        _write_fit_tables(
-            analysis.data, analysis.raw_fit, analysis.partition, analysis.refit,
-            float(analysis.fit_config.eps), publication,
-            selection_result=analysis.selection_result,
-        )
+        _write_fit_tables(analysis, publication)
     except BaseException as error:
         if own_publication:
             publication.fail(error)
@@ -824,10 +801,7 @@ __all__ = [
     "SUMMARY_SCHEMA_VERSION",
     "analysis_summary",
     "write_analysis_outputs",
-    "cluster_output_table",
     "cn_filter_output_table",
-    "mutation_output_table",
-    "mutation_region_output_table",
     "write_cn_filter_output",
     "write_fit_outputs",
 ]

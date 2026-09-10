@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 import numpy as np
 import torch
 
-from ...io.data import TumorData, readonly_array
+from ...io.data import ImmutableArrayRecord, TumorData, readonly_array
 from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
@@ -204,7 +204,7 @@ class InnerSolveResult:
 
 
 @dataclass(frozen=True, slots=True)
-class PairwiseFusionGraph:
+class PairwiseFusionGraph(ImmutableArrayRecord):
     edge_u: np.ndarray
     edge_v: np.ndarray
     edge_w: np.ndarray
@@ -307,14 +307,9 @@ class PreparedProblem:
     exact_pilot: torch.Tensor
     pooled_start: torch.Tensor
     scalar_well_starts: tuple[torch.Tensor, ...]
-    lower: torch.Tensor
-    upper: torch.Tensor
     runtime: TorchRuntime
     data_fingerprint: str
-    graph_hash: str = ""
-    objective_spec_hash: str = ""
-    base_fusion_objective_hash: str = ""
-    base_objective_key: BaseObjectiveKey | None = None
+    base_objective_key: BaseObjectiveKey
     resource_fallback: str | None = None
     fallback_policy: str = "cpu_allowed"
     verbose: bool = False
@@ -332,7 +327,29 @@ class PreparedProblem:
     # view must not silently establish a new baseline under old source hashes.
     _tensor_snapshot: tuple = field(default=(), compare=False, repr=False)
 
+    @property
+    def lower(self) -> torch.Tensor:
+        return self.problem.observed_model.lower
+
+    @property
+    def upper(self) -> torch.Tensor:
+        return self.problem.observed_model.upper
+
+    @property
+    def graph_hash(self) -> str:
+        return self.base_objective_key.graph_hash
+
+    @property
+    def objective_spec_hash(self) -> str:
+        return self.base_objective_key.fingerprint
+
+    @property
+    def base_fusion_objective_hash(self) -> str:
+        return self.base_objective_key.fingerprint
+
     def __post_init__(self) -> None:
+        if self.base_objective_key is None:
+            raise ValueError("PreparedProblem requires a typed base-objective key.")
         if self._tensor_snapshot:
             self.assert_runtime_unchanged()
             return
@@ -353,7 +370,7 @@ class PreparedProblem:
             yield f"model.{name}", getattr(model, name)
         for name in ("edge_index", "weight", "degree", "pdhg_tau_node"):
             yield f"graph.{name}", getattr(self.graph, name)
-        for name in ("lower", "upper", "exact_pilot", "pooled_start"):
+        for name in ("exact_pilot", "pooled_start"):
             yield name, getattr(self, name)
         for index, tensor in enumerate(self.scalar_well_starts):
             yield f"scalar_well_starts[{index}]", tensor
@@ -461,6 +478,7 @@ class ConvergenceResult:
 @dataclass(frozen=True, slots=True)
 class FitProvenance:
     objective_key: LambdaObjectiveKey
+    source_data_hash: str
     device: str
     dtype: str
     inner_solver: str
@@ -490,7 +508,7 @@ class FitProvenance:
 
 
 @dataclass(frozen=True, slots=True)
-class RawFit:
+class RawFit(ImmutableArrayRecord):
     """Compact raw fixed-objective fit; partitions remain a secondary layer."""
 
     phi: np.ndarray
@@ -502,7 +520,7 @@ class RawFit:
     provenance: FitProvenance
 
     def __post_init__(self) -> None:
-        phi = np.array(self.phi, copy=True, order="C")
+        phi = readonly_array(self.phi)
         if phi.ndim != 2 or not np.all(np.isfinite(phi)):
             raise ValueError("RawFit.phi must be a finite mutation-by-region matrix.")
         object.__setattr__(self, "phi", phi)

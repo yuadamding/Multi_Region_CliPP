@@ -37,24 +37,34 @@ from .types import (
 )
 
 
+def validate_partition_identity(
+    partition: FusionPartition | DirectPartition, refit: PartitionRefitSummary,
+) -> None:
+    """Check the immutable labels and their stored fixed-label refit once."""
+    if not np.array_equal(partition.labels, refit.labels):
+        raise AssertionError("Selected partition and fixed refit labels differ.")
+    if partition.signature != _partition_signature(partition.labels, partition.mutation_ids or None):
+        raise AssertionError("Partition signature does not match its labels.")
+    if refit.partition_signature != partition.signature:
+        raise AssertionError("Refit partition signature does not match partition.")
+    labels = np.asarray(partition.labels)
+    if not np.array_equal(np.unique(labels), np.arange(partition.n_clusters)):
+        raise AssertionError("Partition labels must be canonical zero-based IDs.")
+    centers = np.asarray(refit.cluster_centers)
+    if centers.ndim != 2 or centers.shape[0] != partition.n_clusters:
+        raise AssertionError("Refit centers do not match partition clusters.")
+    expected_phi = centers[labels]
+    if refit.phi.shape != expected_phi.shape or not np.allclose(refit.phi, expected_phi, rtol=0.0, atol=1e-12):
+        raise AssertionError("Refit phi does not match centers indexed by labels.")
+
+
 def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None:
     """Fail fast when partition, refit, score, or estimator identity diverges."""
 
     partition = candidate.partition
     refit = candidate.refit
     score = candidate.score
-    if not np.array_equal(partition.labels, refit.labels):
-        raise AssertionError("Fixed-partition refit changed selected labels.")
-    actual_signature = _partition_signature(
-        partition.labels,
-        partition.mutation_ids if partition.mutation_ids else None,
-    )
-    if partition.signature != actual_signature:
-        raise AssertionError("Partition signature does not match its labels.")
-    if int(partition.n_clusters) != int(np.unique(partition.labels).size):
-        raise AssertionError("Partition cluster count is inconsistent.")
-    if refit.partition_signature != partition.signature:
-        raise AssertionError("Refit partition signature does not match partition.")
+    validate_partition_identity(partition, refit)
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
     if score.name != SELECTION_SCORE:
@@ -127,10 +137,11 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         raise AssertionError(
             "Score uncertainty does not cover the refit certificate gap."
         )
-    expected_phi = np.asarray(refit.cluster_centers)[np.asarray(refit.labels)]
-    if not np.allclose(np.asarray(refit.phi), expected_phi, rtol=0.0, atol=1e-12):
-        raise AssertionError("Refit phi does not match centers indexed by labels.")
     if isinstance(candidate, RawFusionCandidate):
+        if candidate.raw_fit.provenance.source_data_hash != refit.source_data_hash:
+            raise ValueError("Raw fit and fixed refit source data identities differ.")
+        if candidate.raw_fit.provenance.likelihood_eps != refit.likelihood_eps:
+            raise ValueError("Raw fit and fixed refit epsilon identities differ.")
         if candidate.eligible_for_selection and (
             not candidate.raw_objective_certified or not candidate.partition.certified
         ):
@@ -285,6 +296,8 @@ def _build_refit_summary(
     *,
     partition_signature: str,
     resolution: PartitionRefitCacheEntry,
+    data: TumorData,
+    eps: float,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -294,6 +307,8 @@ def _build_refit_summary(
         loglik=float(refit.loglik),
         finite_candidate_found=bool(refit.finite_candidate_found),
         global_optimum_certified=bool(refit.global_optimum_certified),
+        source_data_hash=tumor_data_fingerprint(data),
+        likelihood_eps=float(eps),
         refit_numerically_resolved=bool(resolution.numerically_resolved),
         global_lower_bound=float(refit.global_lower_bound),
         global_optimality_gap=float(refit.global_optimality_gap),
@@ -366,6 +381,8 @@ def evaluate_partition(
             refit_result,
             partition_signature=partition.signature,
             resolution=cached_refit,
+            data=data,
+            eps=selection_options.eps,
         ),
         score=score,
     )

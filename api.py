@@ -9,7 +9,7 @@ import torch
 
 from .config import FitConfig, resolve_fit_config
 from .io.data import TumorData
-from .io.multiplicity import CLONAL_INTEGER_MODEL_ID, MAX_MAJOR_CN
+from .io.multiplicity import MAX_MAJOR_CN
 from .io.tumor_txt import CN_FILTER_POLICY_ID, NoEligibleSNVsError, load_tumor_txt
 from .core.fusion.solver import (
     fit_prepared, prepare_torch_problem_with_resource_policy,
@@ -88,12 +88,9 @@ def validate_public_tumor_data(data: TumorData, config: FitConfig) -> None:
     Retained CN arrays alone cannot establish original-input eligibility.
     """
 
-    spec = data.path_likelihood
     report = data.cn_filter_report
     if (
-        spec is None
-        or spec.model_id != CLONAL_INTEGER_MODEL_ID
-        or report is None
+        report is None
         or report.policy_id != CN_FILTER_POLICY_ID
     ):
         raise ValueError(
@@ -102,7 +99,6 @@ def validate_public_tumor_data(data: TumorData, config: FitConfig) -> None:
             "legacy or unvalidated TumorData is not supported."
         )
     _validate_biological_arrays(data)
-    spec.validate_observation_shape((data.num_mutations, data.num_regions))
     excluded = set(report.excluded_mutation_ids)
     if (
         report.retained_mutation_count != data.num_mutations
@@ -130,19 +126,7 @@ def validate_public_tumor_data(data: TumorData, config: FitConfig) -> None:
 def prepare_problem(data: TumorData, options: FitConfig) -> PreparedProblem:
     """Validate inputs and freeze one likelihood, pilot, graph, and runtime."""
     validate_public_tumor_data(data, options)
-    return prepare_torch_problem_with_resource_policy(
-        data, eps=float(options.eps),
-        tol=float(options.solver.tolerance),
-        inner_max_iter=max(int(options.solver.inner_max_iter), 16),
-        graph=options.graph.graph,
-        adaptive_weight_gamma=float(options.graph.adaptive_weight_gamma),
-        adaptive_weight_floor=float(options.graph.adaptive_weight_floor),
-        adaptive_weight_baseline=float(options.graph.adaptive_weight_baseline),
-        device=options.runtime.device, dtype=options.runtime.dtype,
-        dense_fallback_policy=options.runtime.fallback,
-        objective_shape=options.solver.objective_shape,
-        verbose=options.runtime.verbose,
-    )
+    return prepare_torch_problem_with_resource_policy(data, options)
 
 
 def fit_fixed_objective(

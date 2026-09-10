@@ -8,6 +8,7 @@ import torch
 
 from ..core.bic import SelectionScore
 from ..core.fusion.types import DenseEdgeCertificate, RawFit
+from ..io.data import ImmutableArrayRecord, readonly_array
 
 StartArray = np.ndarray | torch.Tensor
 
@@ -25,14 +26,8 @@ def is_zero_edge_singleton(fit: RawFit) -> bool:
     )
 
 
-def _immutable_array(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
-    result = np.array(values, dtype=dtype, copy=True)
-    result.setflags(write=False)
-    return result
-
-
 @dataclass(frozen=True)
-class FusionPartition:
+class FusionPartition(ImmutableArrayRecord):
     labels: np.ndarray
     signature: str
     certified: bool
@@ -48,7 +43,7 @@ class FusionPartition:
         object.__setattr__(
             self,
             "labels",
-            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
+            readonly_array(self.labels, dtype=np.int64),
         )
         object.__setattr__(
             self,
@@ -62,7 +57,7 @@ class FusionPartition:
 
 
 @dataclass(frozen=True)
-class PartitionRefitSummary:
+class PartitionRefitSummary(ImmutableArrayRecord):
     labels: np.ndarray
     partition_signature: str
     phi: np.ndarray
@@ -70,6 +65,8 @@ class PartitionRefitSummary:
     loglik: float
     finite_candidate_found: bool
     global_optimum_certified: bool
+    source_data_hash: str
+    likelihood_eps: float
     refit_numerically_resolved: bool = False
     global_lower_bound: float = float("-inf")
     global_optimality_gap: float = float("inf")
@@ -87,17 +84,17 @@ class PartitionRefitSummary:
         object.__setattr__(
             self,
             "labels",
-            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
+            readonly_array(self.labels, dtype=np.int64),
         )
         object.__setattr__(
             self,
             "phi",
-            _immutable_array(self.phi, dtype=np.dtype(np.float64)),
+            readonly_array(self.phi, dtype=np.float64),
         )
         object.__setattr__(
             self,
             "cluster_centers",
-            _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
+            readonly_array(self.cluster_centers, dtype=np.float64),
         )
 
 
@@ -124,7 +121,7 @@ class RawFusionCandidate:
 
 
 @dataclass(frozen=True)
-class DirectPartition:
+class DirectPartition(ImmutableArrayRecord):
     labels: np.ndarray
     signature: str
     source: Literal[
@@ -141,7 +138,7 @@ class DirectPartition:
     parent_raw_phi_hash: str = ""
 
     def __post_init__(self) -> None:
-        labels = _immutable_array(self.labels, dtype=np.dtype(np.int64))
+        labels = readonly_array(self.labels, dtype=np.int64)
         if labels.ndim != 1 or labels.size == 0:
             raise ValueError("Direct partition labels must be nonempty and 1-D.")
         unique = np.unique(labels)

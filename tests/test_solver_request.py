@@ -63,7 +63,9 @@ def test_equivalent_graph_can_reuse_context(monkeypatch):
 def test_corrupted_cached_graph_identity_is_rejected():
     data, context = _prepared()
     with pytest.raises(ValueError, match="identity is inconsistent"):
-        _fit(data, replace(context, graph_hash="stale"))
+        _fit(data, replace(context, base_objective_key=replace(
+            context.base_objective_key, graph_hash="stale",
+        )))
 
 
 def test_changed_source_data_cannot_reuse_prepared_identity():
@@ -82,7 +84,64 @@ def test_changed_epsilon_cannot_reuse_prepared_identity():
 def test_changed_base_objective_is_rejected():
     data, context = _prepared()
     with pytest.raises(ValueError, match="objective identity"):
-        _fit(data, replace(context, base_fusion_objective_hash="stale"))
+        _fit(data, replace(context, base_objective_key=replace(
+            context.base_objective_key, box_hash="stale",
+        )))
+
+
+def test_prepared_bounds_and_hashes_have_one_authoritative_owner():
+    from dataclasses import fields
+    _, context = _prepared()
+    stored = {field.name for field in fields(context)}
+    assert not stored.intersection({"lower", "upper", "graph_hash", "objective_spec_hash",
+                                    "base_fusion_objective_hash"})
+    assert context.lower is context.problem.observed_model.lower
+    assert context.upper is context.problem.observed_model.upper
+    assert context.graph_hash == context.base_objective_key.graph_hash
+    assert context.objective_spec_hash == context.base_objective_key.fingerprint
+    assert context.base_fusion_objective_hash == context.objective_spec_hash
+
+
+def test_certificate_options_are_reused_without_changing_dtype_or_profile_gate():
+    options = resolve_fit_config(device="cpu", dtype="float64").solver
+    certificate = solver._certificate_options(options, torch.float64)
+    assert solver._certificate_options(options, torch.float64) is certificate
+    assert solver._certificate_options(replace(options), torch.float64) is certificate
+    assert certificate.mapping_tolerance == .1 * options.tolerance
+    assert certificate.column_tolerance == options.tolerance
+    float32 = solver._certificate_options(options, torch.float32)
+    assert float32 is not certificate
+    assert float32.column_tolerance == certificate.column_tolerance
+    deeper = replace(options, tolerance=1e-6, certification_tolerance=options.tolerance)
+    assert solver._certificate_options(deeper, torch.float64) == certificate
+
+
+def test_preparation_resolves_config_once_and_preserves_explicit_frozen_sources(monkeypatch):
+    data, context = _prepared()
+    options = resolve_fit_config(device="cpu", dtype="float64", inner_max_iter=3,
+                                 graph=context.graph_spec, eps=.02)
+    requests = []
+    def prepare(source, **kwargs):
+        assert source is data
+        requests.append(kwargs)
+        return context
+    monkeypatch.setattr(solver, "prepare_torch_problem", prepare)
+    result = solver.prepare_torch_problem_with_resource_policy(data, options)
+    assert result.fallback_policy == options.runtime.fallback
+    initial = requests[-1]
+    assert initial["eps"] == .02
+    assert initial["inner_max_iter"] == 16
+    assert initial["graph"] is context.graph_spec
+    assert initial["tol"] == options.solver.tolerance
+    solver.prepare_torch_problem_with_resource_policy(
+        data, options, graph=None, defer_graph=True, runtime=context.runtime,
+        torch_data=context.problem, exact_pilot=context.exact_pilot,
+    )
+    overridden = requests[-1]
+    assert overridden["graph"] is None and overridden["defer_graph"]
+    assert overridden["runtime"] is context.runtime
+    assert overridden["torch_data"] is context.problem
+    assert overridden["exact_pilot"] is context.exact_pilot
 
 
 def test_frozen_graph_arrays_cannot_be_made_writable():

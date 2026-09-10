@@ -36,10 +36,6 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
     return int(torch.empty((), dtype=dtype).element_size())
 
 
-def _adaptive_weight_work_dtype(dtype: torch.dtype) -> torch.dtype:
-    return torch.float32 if dtype == torch.float16 else dtype
-
-
 def _matches_runtime_device(actual: torch.device, requested: torch.device) -> bool:
     return bool(
         actual.type == requested.type
@@ -72,7 +68,7 @@ def estimate_complete_tensor_graph_bytes(
     )
     if not adaptive:
         return int(persistent_bytes)
-    work_dtype = _adaptive_weight_work_dtype(dtype)
+    work_dtype = dtype
     work_value_bytes = _dtype_nbytes(work_dtype)
     chunk_edges = min(
         edge_count,
@@ -403,7 +399,7 @@ def build_complete_adaptive_tensor_graph(
             "Adaptive pairwise weight baseline must be finite and positive."
         )
 
-    weight_work_dtype = _adaptive_weight_work_dtype(runtime.dtype)
+    weight_work_dtype = runtime.dtype
     pilot = pilot_phi.to(dtype=weight_work_dtype, device=runtime.device)
     observed = (
         None
@@ -493,7 +489,7 @@ def likelihood_noise_distance_floor_torch(
     if lower.device != curvature.device or upper.device != curvature.device:
         raise ValueError("curvature, lower, and upper must be on the same device.")
 
-    work_dtype = _adaptive_weight_work_dtype(curvature.dtype)
+    work_dtype = curvature.dtype
     h = curvature.to(dtype=work_dtype)
     lo = lower.to(dtype=work_dtype)
     hi = upper.to(dtype=work_dtype)

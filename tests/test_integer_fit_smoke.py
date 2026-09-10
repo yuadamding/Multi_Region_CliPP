@@ -7,15 +7,15 @@ import torch
 from scipy.special import gammaln, logsumexp
 
 from CliPP2.config import CertificateConfig, resolve_fit_config
-from CliPP2.core.bic import fixed_partition_bic, fixed_partition_dirichlet_score
+from CliPP2.core.bic import fixed_partition_dirichlet_score
 from CliPP2.core.fusion.graph import build_complete_uniform_graph
-from CliPP2.core.fusion.multiplicity import infer_integer_multiplicity_posterior_numpy
+from CliPP2.core.objective import infer_integer_multiplicity_posterior_numpy
 from CliPP2.api import fit_fixed_objective
 from CliPP2.core.objective import compile_observed_model, observed_terms_numpy
 from CliPP2.core.scalar import partition_constrained_observed_refit
 from CliPP2.io.data import tumor_data_fingerprint
 from CliPP2.io.tumor_txt import load_tumor_txt, write_tumor_txt
-from CliPP2.io.multiplicity import (
+from CliPP2.config import (
     CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_PRIOR_MODE,
 )
 from CliPP2.api import process_tumor
@@ -112,18 +112,14 @@ def test_actual_fixed_partition_refit_marginal_loss_and_bic_reconstruct(smoke_fi
     np.testing.assert_allclose(
         refit.loglik, -_enumerated_loss(data, refit.phi, config.eps).sum(), rtol=1e-12,
     )
-    score = fixed_partition_bic(
-        data=data, labels=labels, num_clusters=2, loglik=refit.loglik,
-        partition_signature="smoke:001",
-    )
-    assert score.n_eff == 3
-    assert score.degrees_of_freedom == 2
-    np.testing.assert_allclose(score.value, -2 * refit.loglik + 2 * np.log(3))
+    classic_bic = -2 * refit.loglik + 2 * np.log(3)
     native_score = fixed_partition_dirichlet_score(
         data=data, labels=labels, num_clusters=2, loglik=refit.loglik,
         partition_signature="smoke:001", alpha=config.selection.dirichlet_alpha,
         code_weight=config.selection.dirichlet_code_weight,
     )
+    assert native_score.n_eff == 3
+    assert native_score.degrees_of_freedom == 2
     alpha = config.selection.dirichlet_alpha
     log_assignment = (
         gammaln(2 * alpha) - gammaln(3 + 2 * alpha)
@@ -132,7 +128,7 @@ def test_actual_fixed_partition_refit_marginal_loss_and_bic_reconstruct(smoke_fi
     )
     assert config.selection.score == native_score.name
     np.testing.assert_allclose(
-        native_score.value, score.value - 2 * config.selection.dirichlet_code_weight * log_assignment,
+        native_score.value, classic_bic - 2 * config.selection.dirichlet_code_weight * log_assignment,
     )
     posterior = infer_integer_multiplicity_posterior_numpy(data, refit.phi, eps=config.eps)
     assert np.all(posterior.multiplicity_call >= 1)
@@ -140,7 +136,7 @@ def test_actual_fixed_partition_refit_marginal_loss_and_bic_reconstruct(smoke_fi
     np.testing.assert_array_equal(posterior.candidate_count, [[3], [6], [3]])
     np.testing.assert_array_equal(fit.phi, raw_phi)
     print(
-        "integer refit smoke:", "loglik=", refit.loglik, "BIC=", score.value,
+        "integer refit smoke:", "loglik=", refit.loglik, "BIC=", classic_bic,
         "Dirichlet score=", native_score.value,
     )
 

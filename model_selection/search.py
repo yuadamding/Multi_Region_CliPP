@@ -9,6 +9,7 @@ from ..api import fit_fixed_objective, validate_public_tumor_data
 from ..core.fusion.graph import build_complete_uniform_graph
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
+    generate_partition_initializer_pool,
     observed_curvature_at_pilot_torch,
 )
 from ..core.fusion.solver import (
@@ -39,7 +40,6 @@ from ..model_selection.online_lambda import (
     OnlineLambdaController,
     OnlineLambdaObservation,
 )
-from ..model_selection.partition_initializer import generate_partition_initializer_pool
 from ..model_selection.partitions import (
     _best_partition_candidate,
 )
@@ -56,7 +56,6 @@ from ..model_selection.proposals import (
     explicit_path_default_start_specs as _explicit_path_default_start_specs,
     offload_solver_state_to_cpu as _offload_solver_state_to_cpu,
     pilot_matrix_hash as _pilot_matrix_hash,
-    rescore_partition_candidates as _rescore_partition_candidates,
     select_raw_start_attempt as _select_raw_start_attempt,
     solver_retry_fit_options,
 )
@@ -91,38 +90,6 @@ class NoEligibleModelSelectionCandidatesError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class BestRawAttemptDiagnostics:
-    search_round: int
-    search_phase: str
-    lambda_value: float
-    source: str
-    kkt_residual: float
-    kkt_tolerance: float
-    dominant_kkt_component: str
-    outer_max_iter: int
-    inner_max_iter: int
-    certificate_max_iter: int
-    working_dtype: str = "not_recorded"
-    audit_dtype: str = "not_recorded"
-    precision_polished: bool = False
-    promotion_status: str = "not_recorded"
-    stage_outer_iterations: int = 0
-    stage_outer_max_iter: int = 0
-    stage_inner_iterations: int = 0
-    stage_inner_max_iter: int = 0
-    stage_inner_solve_calls: int = 0
-    stop_reason: str = "not_recorded"
-    progress_residual_method: str = "not_recorded"
-    solve_tolerance: float = float("nan")
-    legacy_stop_kkt_residual: float = float("inf")
-    componentwise_stop_kkt_residual: float = float("inf")
-    accepted_full_steps: int = 0
-    accepted_damped_steps: int = 0
-    rejected_outer_steps: int = 0
-    fallback_reason: str = ""
-
-
-@dataclass(frozen=True, slots=True)
 class RawReferenceFailureDiagnostics:
     raw_candidate_count: int
     raw_solver_attempt_count: int
@@ -132,7 +99,7 @@ class RawReferenceFailureDiagnostics:
     direct_eligible_count: int
     min_kkt_residual: float
     min_kkt_tolerance: float
-    best_raw_attempt: BestRawAttemptDiagnostics | None
+    best_raw_attempt: RawAttemptTrace | None
     dominant_kkt_component: str
     mm_violation_min: int
     mm_violating_count: int
@@ -234,14 +201,16 @@ def _try_promote_recovery_context(
     return promoted, "applied"
 
 
-def _raw_attempt_diagnostics(
-    attempt: RawAttemptTrace,
-    record: CandidateRecord,
-) -> BestRawAttemptDiagnostics:
+def _raw_attempt_trace(
+    attempt: _RawStartAttempt, *, search_round: int, search_phase: str,
+    outer_max_iter: int, inner_max_iter: int, certificate_max_iter: int,
+) -> RawAttemptTrace:
+    """Project a completed typed solve once, dropping all numerical ownership."""
     fit = attempt.fit
+    if not isinstance(fit, RawFit):
+        raise TypeError("Raw attempt diagnostics require a current typed RawFit.")
     certificate = fit.certificate
     convergence = fit.convergence
-    work = fit.work
     components = {
         "stationarity": float(certificate.components.stationarity),
         "edge_subgradient": float(certificate.components.edge_subgradient),
@@ -251,11 +220,16 @@ def _raw_attempt_diagnostics(
     finite_components = {
         name: value for name, value in components.items() if np.isfinite(value)
     }
-    return BestRawAttemptDiagnostics(
-        search_round=int(record.trace.search_round),
-        search_phase=str(record.trace.search_phase),
+    return RawAttemptTrace(
+        search_round=int(search_round),
+        search_phase=str(search_phase),
         lambda_value=float(fit.provenance.lambda_value),
         source=str(attempt.source),
+        start_value=float(attempt.start_value),
+        breakpoint_escape_changed_count=int(attempt.breakpoint_escape_changed_count),
+        mathematically_certified=bool(attempt.mathematically_certified),
+        objective=float(fit.objective.total),
+        kkt_components=certificate.components,
         kkt_residual=float(certificate.components.residual),
         kkt_tolerance=float(certificate.tolerance),
         dominant_kkt_component=(
@@ -263,69 +237,38 @@ def _raw_attempt_diagnostics(
             if finite_components
             else "unknown"
         ),
-        outer_max_iter=int(attempt.outer_max_iter),
-        inner_max_iter=int(attempt.inner_max_iter),
-        certificate_max_iter=int(attempt.certificate_max_iter),
+        certificate_status=str(certificate.status),
+        certificate_certified=bool(certificate.certified),
+        certificate_admissible=bool(certificate.admissible),
+        mm_consistency_violations=int(convergence.mm_consistency_violations),
+        work=fit.work,
+        outer_max_iter=int(outer_max_iter),
+        inner_max_iter=int(inner_max_iter),
+        certificate_max_iter=int(certificate_max_iter),
         working_dtype=str(certificate.working_dtype),
         audit_dtype=str(certificate.audit_dtype),
         precision_polished=bool(certificate.precision_polished),
         promotion_status=str(attempt.promotion_status),
-        stage_outer_iterations=int(
-            getattr(
-                convergence,
-                "stage_outer_iterations",
-                getattr(convergence, "iterations", 0),
-            )
-        ),
-        stage_outer_max_iter=int(
-            getattr(convergence, "stage_outer_max_iter", attempt.outer_max_iter)
-        ),
-        stage_inner_iterations=int(
-            getattr(
-                convergence,
-                "stage_inner_iterations",
-                getattr(work, "inner_iterations", 0),
-            )
-        ),
-        stage_inner_max_iter=int(
-            getattr(convergence, "stage_inner_max_iter", attempt.inner_max_iter)
-        ),
-        stage_inner_solve_calls=int(
-            getattr(convergence, "stage_inner_solve_calls", 0)
-        ),
-        stop_reason=str(getattr(convergence, "stop_reason", "not_recorded")),
-        progress_residual_method=str(
-            getattr(convergence, "progress_residual_method", "not_recorded")
-        ),
-        solve_tolerance=float(
-            getattr(convergence, "solve_tolerance", float("nan"))
-        ),
-        legacy_stop_kkt_residual=float(
-            getattr(convergence, "legacy_stop_kkt_residual", float("inf"))
-        ),
-        componentwise_stop_kkt_residual=float(
-            getattr(
-                convergence,
-                "componentwise_stop_kkt_residual",
-                float("inf"),
-            )
-        ),
-        accepted_full_steps=int(getattr(convergence, "accepted_full_steps", 0)),
-        accepted_damped_steps=int(
-            getattr(convergence, "accepted_damped_steps", 0)
-        ),
-        rejected_outer_steps=int(getattr(convergence, "rejected_outer_steps", 0)),
+        stage_outer_iterations=int(convergence.stage_outer_iterations),
+        stage_outer_max_iter=int(convergence.stage_outer_max_iter),
+        stage_inner_iterations=int(convergence.stage_inner_iterations),
+        stage_inner_max_iter=int(convergence.stage_inner_max_iter),
+        stage_inner_solve_calls=int(convergence.stage_inner_solve_calls),
+        stop_reason=str(convergence.stop_reason),
+        progress_residual_method=str(convergence.progress_residual_method),
+        solve_tolerance=float(convergence.solve_tolerance),
+        legacy_stop_kkt_residual=float(convergence.legacy_stop_kkt_residual),
+        componentwise_stop_kkt_residual=float(convergence.componentwise_stop_kkt_residual),
+        accepted_full_steps=int(convergence.accepted_full_steps),
+        accepted_damped_steps=int(convergence.accepted_damped_steps),
+        rejected_outer_steps=int(convergence.rejected_outer_steps),
         fallback_reason=str(certificate.fallback_reason),
     )
 
 
-def _compact_raw_attempt_summary(
-    attempt: RawAttemptTrace,
-    record: CandidateRecord,
-) -> str:
+def _compact_raw_attempt_summary(item: RawAttemptTrace) -> str:
     """Render one scalar-only attempt token suitable for scheduler stderr."""
 
-    item = _raw_attempt_diagnostics(attempt, record)
     steps = (
         f"{item.accepted_full_steps}/{item.accepted_damped_steps}/"
         f"{item.rejected_outer_steps}"
@@ -355,7 +298,7 @@ def _raw_attempts(record: CandidateRecord) -> tuple[RawAttemptTrace, ...]:
     if not isinstance(candidate, RawFusionCandidate):
         return ()
     return (
-        RawAttemptTrace(
+        _raw_attempt_trace(_RawStartAttempt(
             fit=candidate.raw_fit,
             source=str(record.trace.start_source),
             start_value=(
@@ -367,6 +310,8 @@ def _raw_attempts(record: CandidateRecord) -> tuple[RawAttemptTrace, ...]:
                 record.trace.breakpoint_escape_changed_count
             ),
             mathematically_certified=bool(candidate.raw_objective_certified),
+        ), search_round=record.trace.search_round,
+            search_phase=record.trace.search_phase,
             outer_max_iter=0,
             inner_max_iter=0,
             certificate_max_iter=0,
@@ -383,31 +328,24 @@ def _raw_reference_failure_diagnostics(
         record for record in records if isinstance(record.candidate, RawFusionCandidate)
     ]
     attempts = [
-        (attempt, record) for record in raw for attempt in _raw_attempts(record)
+        attempt for record in raw for attempt in _raw_attempts(record)
     ]
     finite_attempts = [
-        pair
-        for pair in attempts
-        if np.isfinite(float(pair[0].fit.certificate.components.residual))
+        attempt for attempt in attempts if np.isfinite(attempt.kkt_residual)
     ]
     min_residual = float("nan")
     min_tolerance = float("nan")
-    best_attempt: BestRawAttemptDiagnostics | None = None
+    best_attempt: RawAttemptTrace | None = None
     dominant_component = "unknown"
     if finite_attempts:
-        attempt, record = min(
-            finite_attempts,
-            key=lambda pair: float(pair[0].fit.certificate.components.residual),
-        )
-        best_attempt = _raw_attempt_diagnostics(attempt, record)
+        best_attempt = min(finite_attempts, key=lambda attempt: attempt.kkt_residual)
         min_residual = float(best_attempt.kkt_residual)
         if np.isfinite(float(best_attempt.kkt_tolerance)):
             min_tolerance = float(best_attempt.kkt_tolerance)
         dominant_component = str(best_attempt.dominant_kkt_component)
 
     mm_values = [
-        int(attempt.fit.convergence.mm_consistency_violations)
-        for attempt, _ in attempts
+        attempt.mm_consistency_violations for attempt in attempts
     ]
     direct = [record for record in records if record.family == "direct_partition"]
     return RawReferenceFailureDiagnostics(
@@ -431,16 +369,15 @@ def _raw_reference_failure_diagnostics(
             record.candidate.ineligibility_reason for record in raw
         ),
         certificate_status_counts=_stable_counts(
-            attempt.fit.certificate.status for attempt, _ in attempts
+            attempt.certificate_status for attempt in attempts
         ),
         search_phase_counts=_stable_counts(record.trace.search_phase for record in raw),
         start_source_counts=_stable_counts(record.trace.start_source for record in raw),
         promotion_status_counts=_stable_counts(
-            attempt.promotion_status for attempt, _ in attempts
+            attempt.promotion_status for attempt in attempts
         ),
         attempt_summaries=tuple(
-            _compact_raw_attempt_summary(attempt, record)
-            for attempt, record in attempts
+            _compact_raw_attempt_summary(attempt) for attempt in attempts
         ),
     )
 
@@ -616,12 +553,12 @@ def _partition_guided_admm_selection(
     )
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
-    pilot_torch_data = pilot_context.problem
+    pilot_model = pilot_context.model
     guide_curvature = observed_curvature_at_pilot_torch(
         data,
         pilot_phi,
         eps=float(fit_options.eps),
-        torch_data=pilot_torch_data,
+        model=pilot_model,
         device=pilot_runtime.device,
         dtype=pilot_runtime.dtype,
     )
@@ -630,8 +567,7 @@ def _partition_guided_admm_selection(
         pilot_phi=pilot_phi,
         fit_options=fit_options,
         runtime=pilot_runtime,
-        torch_data=pilot_torch_data,
-        rescore_candidates=_rescore_partition_candidates,
+        model=pilot_model,
         curvature=guide_curvature,
     )
     guide = _best_partition_candidate(list(initializer_pool))
@@ -683,7 +619,6 @@ def _partition_guided_admm_selection(
         pooled_start=pilot_context.pooled_start,
         scalar_well_starts=pilot_context.scalar_well_starts,
         runtime=pilot_runtime,
-        torch_data=pilot_torch_data,
     )
     base_solver_context = transfer_scalar_pilot_certificates(
         pilot_context, base_solver_context
@@ -717,7 +652,7 @@ def _partition_guided_admm_selection(
         solver_state=_offload_solver_state_to_cpu(guided_initialization.solver_state),
     )
     runtime = base_solver_context.runtime
-    torch_data = base_solver_context.problem
+    model = base_solver_context.model
     effective_graph = base_solver_context.graph_spec
     effective_tensor_graph = base_solver_context.graph
     effective_fit_options = replace(
@@ -753,7 +688,10 @@ def _partition_guided_admm_selection(
     result_entries: list[CandidateRecord] = []
     fit_by_lambda: dict[float, RawFit] = {}
     partition_k_by_lambda: dict[float, int] = {}
-    attempts_by_lambda: dict[float, list[RawFit]] = {}
+    # The same-lambda recovery consumer only ever used the stable minimum
+    # finite KKT fit with a state. Retain that exact continuation authority,
+    # not every discarded start. Historical bracket candidates stay separate.
+    recovery_fit_by_lambda: dict[float, RawFit] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     next_step = 0
     # Lazily promoted float64 twin of the working context, built at most once
@@ -765,9 +703,9 @@ def _partition_guided_admm_selection(
         if proposal is None:
             break
         lambda_key = _canonical_lambda(proposal.lambda_value)
-        for attempt_key in list(attempts_by_lambda):
+        for attempt_key in list(recovery_fit_by_lambda):
             if float(attempt_key) != float(lambda_key):
-                del attempts_by_lambda[attempt_key]
+                del recovery_fit_by_lambda[attempt_key]
         candidate_fit_options = solver_retry_fit_options(
             data, effective_fit_options, retry_number=int(proposal.retry_number),
             certification_recovery=proposal.phase in {"solver_recovery", "bootstrap_certification_anchor"},
@@ -775,8 +713,8 @@ def _partition_guided_admm_selection(
 
         def solve_raw_path() -> tuple[
             RawFit,
-            _RawStartAttempt,
-            tuple[_RawStartAttempt, ...],
+            RawAttemptTrace,
+            tuple[RawAttemptTrace, ...],
         ]:
             context = base_solver_context
             # Certification-recovery attempts run at float64: iteration budget
@@ -814,13 +752,6 @@ def _partition_guided_admm_selection(
                 alternate_fit = fit_by_lambda.get(
                     _canonical_lambda(proposal.alternate_start_lambda)
                 )
-            same_lambda_attempts = attempts_by_lambda.get(lambda_key, [])
-            finite_failed = [
-                attempt
-                for attempt in same_lambda_attempts
-                if attempt.state is not None
-                and np.isfinite(float(attempt.certificate.components.residual))
-            ]
             start_specs: list[_RawStartSpec] = []
             seen_start_states: set[tuple[str, int | str]] = set()
 
@@ -848,13 +779,8 @@ def _partition_guided_admm_selection(
                 start_specs.append((str(source), float(start_value), state, phi))
 
             if proposal.phase == "solver_recovery":
-                if finite_failed:
-                    best_failed_fit = min(
-                        finite_failed,
-                        key=lambda attempt: float(
-                            attempt.certificate.components.residual
-                        ),
-                    )
+                best_failed_fit = recovery_fit_by_lambda.get(lambda_key)
+                if best_failed_fit is not None:
                     append_distinct_start(
                         "best_same_lambda_kkt_state",
                         float(best_failed_fit.provenance.lambda_value),
@@ -1020,7 +946,9 @@ def _partition_guided_admm_selection(
             ):
                 append_distinct_start(source, start_value, state, phi)
 
-            start_attempts: list[_RawStartAttempt] = []
+            start_traces: list[RawAttemptTrace] = []
+            selected_attempt: _RawStartAttempt | None = None
+            selected_trace: RawAttemptTrace | None = None
             for (
                 lambda_start_source,
                 lambda_start_value,
@@ -1070,28 +998,44 @@ def _partition_guided_admm_selection(
                         seed_fit,
                         state=_offload_solver_state_to_cpu(seed_fit.state),
                     )
-                attempts_by_lambda.setdefault(lambda_key, []).append(seed_fit)
+                recovery_fit = recovery_fit_by_lambda.get(lambda_key)
+                residual = float(seed_fit.certificate.components.residual)
+                if seed_fit.state is not None and np.isfinite(residual) and (
+                    recovery_fit is None
+                    or residual < float(recovery_fit.certificate.components.residual)
+                ):
+                    recovery_fit_by_lambda[lambda_key] = seed_fit
                 mathematically_certified = bool(
                     float(seed_fit.provenance.lambda_value) > 0.0
                     and seed_fit.certificate.certified
                     and seed_fit.certificate.admissible
                 )
-                start_attempts.append(
-                    _RawStartAttempt(
-                        fit=seed_fit,
-                        source=str(lambda_start_source),
-                        start_value=float(lambda_start_value),
-                        breakpoint_escape_changed_count=int(changed_count),
-                        mathematically_certified=bool(mathematically_certified),
-                        promotion_status=str(recovery_promotion_status),
-                    )
+                raw_attempt = _RawStartAttempt(
+                    fit=seed_fit,
+                    source=str(lambda_start_source),
+                    start_value=float(lambda_start_value),
+                    breakpoint_escape_changed_count=int(changed_count),
+                    mathematically_certified=bool(mathematically_certified),
+                    promotion_status=str(recovery_promotion_status),
                 )
-            selected_attempt = _select_raw_start_attempt(start_attempts)
-            seed_fit = selected_attempt.fit
+                trace = _raw_attempt_trace(
+                    raw_attempt, search_round=int(next_step), search_phase=str(proposal.phase),
+                    outer_max_iter=int(candidate_fit_options.solver.outer_max_iter),
+                    inner_max_iter=int(candidate_fit_options.solver.inner_max_iter),
+                    certificate_max_iter=int(candidate_fit_options.solver.certificate.max_iter),
+                )
+                start_traces.append(trace)
+                if selected_attempt is None or _select_raw_start_attempt(
+                    [selected_attempt, raw_attempt]
+                ) is raw_attempt:
+                    selected_attempt, selected_trace = raw_attempt, trace
+                del seed_fit, raw_attempt, recovery_fit
+            if selected_attempt is None or selected_trace is None:
+                raise ValueError("At least one raw start attempt is required.")
             # Subsequent bracket proposals must warm-start from the same raw
             # basin that was admitted to partition scoring, never from a lower
             # objective but mathematically uncertified side attempt.
-            return seed_fit, selected_attempt, tuple(start_attempts)
+            return selected_attempt.fit, selected_trace, tuple(start_traces)
 
         selected_raw_fit, selected_start, raw_start_attempts = solve_raw_path()
         fit, artifact = evaluate_raw_fusion_candidate(
@@ -1100,7 +1044,7 @@ def _partition_guided_admm_selection(
             lambda_value=float(proposal.lambda_value),
             bic_refit_cache=bic_refit_cache,
             precomputed_fit=selected_raw_fit,
-            source_model=base_solver_context.problem.source_model,
+            source_model=base_solver_context.source_model,
         )
         (
             lambda_start_source,
@@ -1124,30 +1068,7 @@ def _partition_guided_admm_selection(
                     breakpoint_escape_changed_count=int(
                         path_breakpoint_escape_changed_count
                     ),
-                    raw_attempts=tuple(
-                        RawAttemptTrace(
-                            fit=attempt.fit,
-                            source=str(attempt.source),
-                            start_value=float(attempt.start_value),
-                            breakpoint_escape_changed_count=int(
-                                attempt.breakpoint_escape_changed_count
-                            ),
-                            mathematically_certified=bool(
-                                attempt.mathematically_certified
-                            ),
-                            outer_max_iter=int(
-                                candidate_fit_options.solver.outer_max_iter
-                            ),
-                            inner_max_iter=int(
-                                candidate_fit_options.solver.inner_max_iter
-                            ),
-                            certificate_max_iter=int(
-                                candidate_fit_options.solver.certificate.max_iter
-                            ),
-                            promotion_status=str(attempt.promotion_status),
-                        )
-                        for attempt in raw_start_attempts
-                    ),
+                    raw_attempts=raw_start_attempts,
                 ),
             )
         )
@@ -1235,8 +1156,7 @@ def _partition_guided_admm_selection(
             pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
             fit_options=effective_fit_options,
             runtime=runtime,
-            torch_data=torch_data,
-            rescore_candidates=_rescore_partition_candidates,
+            model=model,
             declared_k_grid=final_k_grid,
         )
         direct_proposals.extend(
@@ -1274,7 +1194,7 @@ def _partition_guided_admm_selection(
                 else _pilot_matrix_hash(parent_raw.raw_fit.phi)
             ),
             refit_cache=bic_refit_cache,
-            source_model=base_solver_context.problem.source_model,
+            source_model=base_solver_context.source_model,
         )
         result_entries.append(
             CandidateRecord(

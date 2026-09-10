@@ -22,8 +22,6 @@ from CliPP2.core.scalar import (
 )
 from CliPP2.core.fusion.torch_backend import (
     resolve_runtime,
-    to_torch_tumor_data,
-    validate_torch_tumor_data,
 )
 from CliPP2.io.data import TumorData, tumor_data_fingerprint
 
@@ -81,7 +79,7 @@ def test_numpy_torch_grid_scalar_and_em_use_all_candidates(major):
     data = integer_data(major)
     model = compile_observed_model(data, eps=EPS)
     runtime = resolve_runtime("cpu", dtype="float64")
-    tm = model_to_torch(model, runtime)
+    tm = model_to_torch(model, runtime, eps=EPS)
     phi = np.full(model.shape, 0.73)
     loss, posterior = enumeration(data, phi)
     nt = observed_terms_numpy(model, phi, eps=EPS)
@@ -115,7 +113,7 @@ def test_gradient_finite_difference_and_torch_autograd():
     finite_difference = (enumeration(data, phi + step)[0]
                          - enumeration(data, phi - step)[0]) / (2 * step)
     np.testing.assert_allclose(terms.gradient, finite_difference, atol=2e-8, rtol=1e-7)
-    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"))
+    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"), eps=EPS)
     tensor = torch.tensor(phi, requires_grad=True)
     observed_terms_torch(tm, tensor, eps=EPS).loss.sum().backward()
     np.testing.assert_allclose(tensor.grad.numpy(), terms.gradient, atol=1e-11)
@@ -186,12 +184,13 @@ def test_candidate_model_identity_invalidates_tensor_and_refit_cache():
     data = integer_data(((4,),))
     changed = integer_data(((3,),))
     runtime = resolve_runtime("cpu", dtype="float64")
-    tensors = to_torch_tumor_data(changed, runtime)
+    from CliPP2.core.fusion.partition_starts import _resolve_partition_runtime
+    tensors = model_to_torch(compile_observed_model(changed, eps=EPS), runtime, eps=EPS)
     assert tumor_data_fingerprint(data) != tumor_data_fingerprint(changed)
     assert compile_observed_model(data, eps=EPS).fingerprint != (
         compile_observed_model(changed, eps=EPS).fingerprint)
-    with pytest.raises(ValueError, match="fingerprint"):
-        validate_torch_tumor_data(tensors, data=data, runtime=runtime)
+    with pytest.raises(ValueError, match="runtime source"):
+        _resolve_partition_runtime(data=data, model=tensors, eps=EPS)
     stale = compile_observed_model(changed, eps=EPS)
     with pytest.raises(ValueError, match="tumor objective"):
         partition_constrained_observed_refit(

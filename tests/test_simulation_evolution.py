@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from CliPP2.io.multiplicity import MAX_MAJOR_CN
+from CliPP2.config import MAX_MAJOR_CN
 from CliPP2.io.tumor_txt import CN_FILTER_POLICY_ID, load_tumor_txt
 from tools.simulation import (
     CopyNumberEvolutionConfig,

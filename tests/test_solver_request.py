@@ -77,8 +77,12 @@ def test_changed_source_data_cannot_reuse_prepared_identity():
 
 def test_changed_epsilon_cannot_reuse_prepared_identity():
     data, context = _prepared()
+    with pytest.raises(TypeError, match="eps"):
+        replace(context, eps=.01)
     with pytest.raises(ValueError, match="likelihood or epsilon"):
-        _fit(data, replace(context, problem=replace(context.problem, eps=.01)))
+        _fit(data, replace(context, base_objective_key=replace(
+            context.base_objective_key, eps_hex=float(.01).hex(),
+        )))
 
 
 def test_changed_base_objective_is_rejected():
@@ -93,10 +97,11 @@ def test_prepared_bounds_and_hashes_have_one_authoritative_owner():
     from dataclasses import fields
     _, context = _prepared()
     stored = {field.name for field in fields(context)}
-    assert not stored.intersection({"lower", "upper", "graph_hash", "objective_spec_hash",
+    assert not stored.intersection({"lower", "upper", "eps", "graph_hash", "objective_spec_hash",
                                     "base_fusion_objective_hash"})
-    assert context.lower is context.problem.observed_model.lower
-    assert context.upper is context.problem.observed_model.upper
+    assert context.eps.hex() == context.base_objective_key.eps_hex
+    assert context.lower is context.model.lower
+    assert context.upper is context.model.upper
     assert context.graph_hash == context.base_objective_key.graph_hash
     assert context.objective_spec_hash == context.base_objective_key.fingerprint
     assert context.base_fusion_objective_hash == context.objective_spec_hash
@@ -135,12 +140,12 @@ def test_preparation_resolves_config_once_and_preserves_explicit_frozen_sources(
     assert initial["tol"] == options.solver.tolerance
     solver.prepare_torch_problem_with_resource_policy(
         data, options, graph=None, defer_graph=True, runtime=context.runtime,
-        torch_data=context.problem, exact_pilot=context.exact_pilot,
+        exact_pilot=context.exact_pilot,
     )
     overridden = requests[-1]
     assert overridden["graph"] is None and overridden["defer_graph"]
     assert overridden["runtime"] is context.runtime
-    assert overridden["torch_data"] is context.problem
+    assert "torch_data" not in overridden
     assert overridden["exact_pilot"] is context.exact_pilot
 
 
@@ -160,11 +165,11 @@ def test_preparation_preserves_nondefault_epsilon_and_float64_source():
         data, eps=.02, tol=8e-4, inner_max_iter=16,
         graph=build_complete_uniform_graph(2), device="cpu", dtype="float32",
     )
-    assert context.problem.eps == .02
-    assert context.problem.source_model is compile_observed_model(data, eps=.02)
+    assert context.eps == .02
+    assert context.source_model is compile_observed_model(data, eps=.02)
     promoted = solver.promote_solver_context_dtype(context, dtype=torch.float64)
-    assert promoted.problem.eps == .02
-    assert promoted.problem.source_model is context.problem.source_model
+    assert promoted.eps == .02
+    assert promoted.source_model is context.source_model
     solver._validate_prepared_problem(promoted)
 
 
@@ -173,7 +178,7 @@ def test_prepared_runtime_tensor_mutation_is_rejected_before_optimization(monkey
     data, context = _prepared()
     tensors = {
         "weights": context.graph.weight,
-        "counts": context.problem.observed_model.alt,
+        "counts": context.model.alt,
         "lower": context.lower,
         "pilot": context.exact_pilot,
         "preconditioner": context.graph.pdhg_tau_node,
@@ -188,9 +193,9 @@ def test_replacing_runtime_views_cannot_rebaseline_stale_identity():
     _, context = _prepared()
     with pytest.raises(ValueError, match="Prepared runtime tensor graph.weight changed"):
         replace(context, graph=replace(context.graph, weight=context.graph.weight * 10))
-    model = context.problem.observed_model
+    model = context.model
     with pytest.raises(ValueError, match="Prepared runtime tensor model.alt changed"):
-        replace(context, problem=replace(context.problem, observed_model=replace(model, alt=model.alt + 1)))
+        replace(context, model=replace(model, alt=model.alt + 1))
 
 
 def test_runtime_precision_rebuild_is_bound_to_unchanged_host_sources():
@@ -199,9 +204,26 @@ def test_runtime_precision_rebuild_is_bound_to_unchanged_host_sources():
     solver._validate_prepared_problem(promoted)
     restored = solver.promote_solver_context_dtype(promoted, dtype=torch.float64)
     solver._validate_prepared_problem(restored)
-    assert restored.problem.source_model is context.problem.source_model
+    assert restored.source_model is context.source_model
     assert restored.graph_hash == context.graph_hash
     torch.testing.assert_close(restored.graph.weight, context.graph.weight, rtol=0, atol=0)
+    for field in ("alt", "nonalt", "lower", "upper", "slope", "log_prior", "valid", "observed"):
+        torch.testing.assert_close(getattr(restored.model, field), getattr(context.model, field),
+                                   rtol=0, atol=0)
+    assert not torch.equal(promoted.model.slope.double(), context.model.slope)
     context.graph.weight.add_(1)
     with pytest.raises(ValueError, match="Prepared runtime tensor graph.weight changed"):
         solver.promote_solver_context_dtype(context, dtype=torch.float32)
+
+
+def test_audit_tensors_are_rebuilt_from_source_and_cached_per_frozen_context():
+    _, context64 = _prepared()
+    context32 = solver.promote_solver_context_dtype(context64, dtype=torch.float32)
+    audit = solver._float64_audit_context(context32)
+    assert solver._float64_audit_context(context32) is audit
+    assert audit.model.source_fingerprint == context64.source_model.fingerprint
+    torch.testing.assert_close(audit.model.slope, context64.model.slope, rtol=0, atol=0)
+    torch.testing.assert_close(audit.graph.weight, context64.graph.weight, rtol=0, atol=0)
+    context32.model.alt.add_(1)
+    with pytest.raises(ValueError, match="Prepared runtime tensor model.alt changed"):
+        solver._float64_audit_context(context32)

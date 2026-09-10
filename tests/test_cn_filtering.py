@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from CliPP2.io.data import tumor_data_fingerprint
-from CliPP2.io.multiplicity import CLONAL_INTEGER_MODEL_ID
+from CliPP2.config import CLONAL_INTEGER_MODEL_ID
 from CliPP2.io import tumor_txt
 from CliPP2.core.objective import compile_observed_model
 

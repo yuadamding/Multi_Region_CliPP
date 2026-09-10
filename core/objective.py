@@ -16,11 +16,12 @@ import numpy as np
 import torch
 
 from ..io.data import ImmutableArrayRecord, readonly_array as _readonly_array
-from ..io.multiplicity import (
+from ..config import (
     CLONAL_INTEGER_GENERATOR_VERSION,
     CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
     MAX_MAJOR_CN,
+    validate_likelihood_precision,
 )
 
 if TYPE_CHECKING:
@@ -261,10 +262,6 @@ class ObservedModel(ImmutableArrayRecord):
         return tuple(int(value) for value in self.slope.shape)
 
     @property
-    def model_version(self) -> str:
-        return "1"
-
-    @property
     def candidate_generator_version(self) -> str:
         return CLONAL_INTEGER_GENERATOR_VERSION
 
@@ -289,8 +286,9 @@ def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) 
     """
     if not isinstance(model, ObservedModel):
         return False
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+    try:
+        epsilon = _validated_epsilon(eps)
+    except ValueError:
         return False
     if epsilon not in model._convexity:
         model._convexity[epsilon] = _qualify_clipped_convexity(model, epsilon)
@@ -384,7 +382,7 @@ class _NumpyPathKernel:
 class _TorchPathKernel:
     mass: torch.Tensor
     probability: torch.Tensor
-    slope: torch.Tensor
+    slope: torch.Tensor | None
 
 
 def _compile_integer_candidates(major_cn: np.ndarray, scaling: np.ndarray) -> dict[str, object]:
@@ -414,9 +412,7 @@ def compile_integer_observations(
     major_cn: np.ndarray, scaling: np.ndarray, eps: float,
 ) -> ObservedModel:
     """Compile canonical arrays before the final immutable input is constructed."""
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    epsilon = _validated_epsilon(eps)
     alt = np.asarray(alt_counts, dtype=np.float64)
     total = np.asarray(total_counts, dtype=np.float64)
     if alt.shape != total.shape:
@@ -436,9 +432,7 @@ def compile_observed_model(
 ) -> ObservedModel:
     """Compile the supported uniform integer likelihood into float64 sources."""
 
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    epsilon = _validated_epsilon(eps)
     cached = data._compiled_models.get(epsilon)
     if cached is not None:
         return cached
@@ -453,13 +447,15 @@ def compile_observed_model(
 def model_to_torch(
     model: ObservedModel,
     runtime: "TorchRuntime",
+    *,
+    eps: float,
 ) -> TorchObservedModel:
     """Build a runtime view from immutable source arrays, never another view."""
 
     dtype = runtime.dtype
     device = runtime.device
-    if dtype not in (torch.float16, torch.float32, torch.float64):
-        raise ValueError("Observed-model runtime dtype must be floating point.")
+    epsilon = _validated_epsilon(eps, dtype)
+    _validate_candidate_range(model, epsilon, dtype)
 
     def numeric(value: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(np.array(value, copy=True), dtype=dtype, device=device)
@@ -493,9 +489,7 @@ def make_base_objective_key(
 ) -> BaseObjectiveKey:
     """Construct a dtype-invariant base-objective identity from host sources."""
 
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    epsilon = _validated_epsilon(eps)
     graph_fingerprint = str(graph_hash).strip()
     if not graph_fingerprint:
         raise ValueError("graph_hash must be nonempty.")
@@ -530,11 +524,42 @@ def make_lambda_objective_key(
     return LambdaObjectiveKey(base=base, lambda_hex=value.hex())
 
 
-def _validated_epsilon(eps: float) -> float:
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    return epsilon
+def _validated_epsilon(eps: float, dtype: torch.dtype = torch.float64) -> float:
+    name = {torch.float32: "float32", torch.float64: "float64"}.get(dtype)
+    if name is None:
+        raise ValueError("Observed-model runtime dtype must be float32 or float64.")
+    return validate_likelihood_precision(eps, name)
+
+
+def _validate_candidate_range(model: ObservedModel, eps: float, dtype: torch.dtype) -> None:
+    """Conservatively preflight intermediate arithmetic from float64 sources.
+
+    Interior endpoints alone do not prevent count/probability-squared overflow.
+    Bound the *unweighted* candidate intermediates, including padded entries;
+    posterior or observed masks applied later cannot repair NaNs.
+    """
+    cast_endpoint = np.float32 if dtype == torch.float32 else np.float64
+    lower = float(cast_endpoint(eps))
+    complement = 1.0 - float(cast_endpoint(1.0 - eps))
+    count = max(float(model.alt.max()), float(model.nonalt.max()))
+    slope = max(float(model.slope.max()), 1.0)
+    # Bounds cover count conversion, log-kernels, scores, summed curvature
+    # intermediates, and slope squares; log space avoids overflow in preflight.
+    log_slope = np.log(slope)
+    log_limit = np.log(torch.finfo(dtype).max)
+    log_bound = 2.0 * log_slope
+    if count > 0.0:
+        log_bound = max(
+            log_bound,
+            np.log(count) + np.log(2.0) + 2.0 * log_slope
+            - 2.0 * np.log(min(lower, complement)),
+        )
+    if log_bound >= log_limit - np.log(2.0):
+        raise ValueError(
+            f"Candidate arithmetic may overflow in {dtype} for these counts, "
+            "slopes and eps. Use float64 or a representable numerical input "
+            "before preparation; the clipping rule is never adjusted."
+        )
 
 
 def _path_kernel_numpy(
@@ -593,6 +618,7 @@ def _path_kernel_torch(
     phi: torch.Tensor,
     *,
     eps: float,
+    derivatives: bool = True,
 ) -> _TorchPathKernel:
     """Evaluate every canonical path over optional trailing grid dimensions.
 
@@ -601,7 +627,7 @@ def _path_kernel_torch(
     caller evaluates any number of candidate CCFs per mutation-region.
     """
 
-    epsilon = _validated_epsilon(eps)
+    epsilon = _validated_epsilon(eps, model.alt.dtype)
     if phi.ndim < 2 or tuple(phi.shape[:2]) != model.shape:
         raise ValueError(
             "phi must start with the observed-model shape "
@@ -619,11 +645,13 @@ def _path_kernel_torch(
     candidate_slope = path_view(model.slope)
     mass = candidate_slope * expanded_phi
     probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    slope = torch.where(
-        (mass > epsilon) & (mass < 1.0 - epsilon),
-        candidate_slope,
-        torch.zeros_like(candidate_slope),
-    )
+    slope = None
+    if derivatives:
+        slope = torch.where(
+            (mass > epsilon) & (mass < 1.0 - epsilon),
+            candidate_slope,
+            torch.zeros_like(candidate_slope),
+        )
     return _TorchPathKernel(mass=mass, probability=probability, slope=slope)
 
 
@@ -720,7 +748,7 @@ def observed_loss_grid_torch(
     start generation.
     """
 
-    kernel = _path_kernel_torch(model, phi, eps=eps)
+    kernel = _path_kernel_torch(model, phi, eps=eps, derivatives=False)
     grid_ndim = phi.ndim - 2
     observation_shape = (*model.shape, *((1,) * grid_ndim))
     path_shape = (*observation_shape, model.path_shape[-1])
@@ -814,20 +842,6 @@ def observed_em_terms_torch(
     )
 
 
-def observed_probability_and_slope_torch(
-    model: TorchObservedModel,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return canonical path probabilities and left-segment slopes."""
-
-    if tuple(phi.shape) != model.shape:
-        raise ValueError(f"phi must have shape {model.shape}.")
-    kernel = _path_kernel_torch(model, phi, eps=eps)
-    return kernel.probability, kernel.slope
-
-
 def observed_internal_breakpoints_torch(
     model: TorchObservedModel,
     *,
@@ -835,7 +849,7 @@ def observed_internal_breakpoints_torch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return linear-emission clipping points with aligned validity."""
 
-    epsilon = _validated_epsilon(eps)
+    epsilon = _validated_epsilon(eps, model.alt.dtype)
     points = []
     masks = []
     for target in (epsilon, 1.0 - epsilon):
@@ -863,7 +877,7 @@ def observed_one_sided_gradients_torch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return exact left/right loss gradients at canonical breakpoints."""
 
-    epsilon = _validated_epsilon(eps)
+    epsilon = _validated_epsilon(eps, model.alt.dtype)
     if tuple(phi.shape) != model.shape:
         raise ValueError(f"phi must have shape {model.shape}.")
     kernel = _path_kernel_torch(model, phi, eps=epsilon)
@@ -901,7 +915,65 @@ def observed_one_sided_gradients_torch(
     return gradient_left, gradient_right, at_breakpoint
 
 
+@dataclass(frozen=True)
+class IntegerMultiplicityPosterior:
+    """Categorical multiplicity posterior conditional on the supplied CCF.
+
+    ``multiplicity_call`` is the smallest MAP candidate, including prior-only
+    ties. Reporting must hide uninformative calls with multiple candidates;
+    a singleton remains structurally fixed at one.
+    """
+
+    posterior: np.ndarray
+    multiplicity_call: np.ndarray
+    map_probability: np.ndarray
+    candidate_count: np.ndarray
+    informative: np.ndarray
+
+
+def infer_integer_multiplicity_posterior_numpy(
+    data: TumorData,
+    phi: np.ndarray,
+    *,
+    eps: float,
+) -> IntegerMultiplicityPosterior:
+    """Evaluate the fitted integer mixture without replacing marginalization."""
+
+    phi_array = np.asarray(phi, dtype=np.float64)
+    expected_shape = np.asarray(data.alt_counts).shape
+    if phi_array.shape != expected_shape:
+        raise ValueError(
+            "phi must have the same mutation-region shape as the tumor data; "
+            f"got {phi_array.shape}, expected {expected_shape}."
+        )
+    if not np.all(np.isfinite(phi_array)):
+        raise ValueError("phi must contain only finite values.")
+    model = compile_observed_model(data, eps=eps)
+    if np.any((phi_array < model.lower) | (phi_array > model.upper)):
+        raise ValueError("phi must lie inside the compiled CCF bounds.")
+
+    posterior = np.asarray(
+        observed_terms_numpy(model, phi_array, eps=eps).posterior,
+        dtype=np.float64,
+    )
+    # The compiler validates the complete, increasingly ordered integer range.
+    # np.argmax therefore selects the lowest candidate on an exact tie.
+    map_index = np.argmax(np.where(model.valid, posterior, -np.inf), axis=-1)
+    probability = np.take_along_axis(
+        posterior, map_index[..., None], axis=-1
+    )[..., 0]
+    return IntegerMultiplicityPosterior(
+        posterior=posterior,
+        multiplicity_call=map_index.astype(np.int64) + 1,
+        map_probability=probability,
+        candidate_count=np.sum(model.valid, axis=-1).astype(np.int64),
+        informative=model.observed & ((model.alt + model.nonalt) > 0.0),
+    )
+
+
 __all__ = [
+    "IntegerMultiplicityPosterior",
+    "infer_integer_multiplicity_posterior_numpy",
     "BaseObjectiveKey",
     "LambdaObjectiveKey",
     "ObservedModel",
@@ -917,7 +989,6 @@ __all__ = [
     "observed_internal_breakpoints_torch",
     "observed_loss_grid_torch",
     "observed_one_sided_gradients_torch",
-    "observed_probability_and_slope_torch",
     "observed_terms_numpy",
     "observed_terms_torch",
 ]

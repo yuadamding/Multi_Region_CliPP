@@ -26,8 +26,8 @@ def _roundtrip(value, mode):
 @pytest.fixture(scope="module")
 def records(request):
     data, problem, fit = request.getfixturevalue("raw_fit")
-    model = problem.problem.source_model
-    epsilon = problem.problem.eps
+    model = problem.source_model
+    epsilon = problem.eps
     has_proven_convex_observed_loss(model, eps=epsilon)
     labels = np.zeros(data.num_mutations, dtype=np.int64)
     return dict(

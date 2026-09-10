@@ -12,10 +12,13 @@ from CliPP2.config import (
     FINAL_PHI_LADDER_KMAX,
     FINAL_PHI_PARENT_COUNT,
     PARTITION_K_ANCHORS,
+    PARTITION_CEM_MAX_ITER,
+    PARTITION_GENERATION_REFIT_MAX_ITER,
+    PARTITION_MAX_CANDIDATES_PER_K,
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
     resolve_fit_config,
 )
-from CliPP2.model_selection import partition_initializer
+from CliPP2.core.fusion import partition_starts
 
 
 @pytest.mark.parametrize("profile,expected", [
@@ -89,24 +92,22 @@ def test_hybrid_initializer_keeps_ward_cem_and_reference_settings(monkeypatch):
         observed.update(kwargs)
         return ["candidate"]
 
-    monkeypatch.setattr(partition_initializer, "hessian_weighted_ward_label_sets_torch", labels)
-    monkeypatch.setattr(partition_initializer, "generate_likelihood_partition_starts", generate)
-    result = partition_initializer.generate_partition_initializer_pool(
+    monkeypatch.setattr(partition_starts, "hessian_weighted_ward_label_sets_torch", labels)
+    monkeypatch.setattr(partition_starts, "generate_likelihood_partition_starts", generate)
+    result = partition_starts.generate_partition_initializer_pool(
         data=SimpleNamespace(num_mutations=31), pilot_phi="pilot",
         fit_options=resolve_fit_config(device="cpu"),
-        runtime=SimpleNamespace(device="cpu", dtype="float64"), torch_data=None,
-        curvature="curvature", rescore_candidates=lambda candidates, **kwargs: candidates,
+        runtime=SimpleNamespace(device="cpu", dtype="float64"), model=None,
+        curvature="curvature",
     )
     assert result == ("candidate",)
     assert observed["k_grid"] == [*range(1, 16), 20, 25, 30, 31]
-    assert observed["classification_weight_alpha"] == 1.0
-    assert observed["classification_code_weight"] == 0.7
-    assert observed["include_plain_ward"]
-    assert observed["include_ward_cem"]
-    assert not observed["allow_component_death"]
-    assert observed["cem_max_iter"] == 8
-    assert observed["refit_max_iter"] == 32
-    assert observed["max_candidates_per_K"] == 5
+    assert observed["label_sets"] == ("ward_labels",)
+    assert not {"classification_weight_alpha", "classification_code_weight", "use_torch",
+                "include_plain_ward", "include_ward_cem", "allow_component_death"} & observed.keys()
+    assert PARTITION_CEM_MAX_ITER == 8
+    assert PARTITION_GENERATION_REFIT_MAX_ITER == 32
+    assert PARTITION_MAX_CANDIDATES_PER_K == 5
     assert PARTITION_K_ANCHORS == (*range(1, 16), 20, 25, 30, 40, 50)
     assert FINAL_PHI_LADDER_KMAX == 30
     assert FINAL_PHI_PARENT_COUNT == 1

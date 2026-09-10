@@ -249,36 +249,6 @@ class TorchRuntime:
     dtype: torch.dtype
 
 
-@dataclass(frozen=True)
-class TorchTumorData:
-    """Runtime tumor payload with one authoritative observed-likelihood model."""
-
-    observed_model: TorchObservedModel
-    data_fingerprint: str
-    source_model: ObservedModel | None = None
-    eps: float = 1e-6
-
-    @property
-    def alt(self) -> torch.Tensor:
-        return self.observed_model.alt
-
-    @property
-    def total(self) -> torch.Tensor:
-        return self.observed_model.total
-
-    @property
-    def nonalt(self) -> torch.Tensor:
-        return self.observed_model.nonalt
-
-    @property
-    def phi_upper(self) -> torch.Tensor:
-        return self.observed_model.upper
-
-    @property
-    def count_observed(self) -> torch.Tensor:
-        return self.observed_model.observed
-
-
 @dataclass(frozen=True, slots=True)
 class TensorFusionGraph:
     edge_index: torch.Tensor
@@ -301,7 +271,8 @@ class TensorFusionGraph:
 @dataclass(frozen=True, slots=True)
 class PreparedProblem:
     source_data: TumorData
-    problem: TorchTumorData
+    source_model: ObservedModel
+    model: TorchObservedModel
     graph: TensorFusionGraph
     graph_spec: PairwiseFusionGraph
     exact_pilot: torch.Tensor
@@ -328,12 +299,16 @@ class PreparedProblem:
     _tensor_snapshot: tuple = field(default=(), compare=False, repr=False)
 
     @property
+    def eps(self) -> float:
+        return float.fromhex(self.base_objective_key.eps_hex)
+
+    @property
     def lower(self) -> torch.Tensor:
-        return self.problem.observed_model.lower
+        return self.model.lower
 
     @property
     def upper(self) -> torch.Tensor:
-        return self.problem.observed_model.upper
+        return self.model.upper
 
     @property
     def graph_hash(self) -> str:
@@ -365,7 +340,7 @@ class PreparedProblem:
         object.__setattr__(self, "_tensor_snapshot", tuple(snapshot))
 
     def _runtime_tensors(self):
-        model = self.problem.observed_model
+        model = self.model
         for name in ("alt", "nonalt", "observed", "lower", "upper", "slope", "log_prior", "valid"):
             yield f"model.{name}", getattr(model, name)
         for name in ("edge_index", "weight", "degree", "pdhg_tau_node"):

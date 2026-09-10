@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from CliPP2.io.multiplicity import (
+from CliPP2.config import (
     CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
 )
@@ -57,7 +57,7 @@ def test_prior_validation_does_not_silently_renormalize_or_duplicate():
 
 
 def test_candidate_specification_class_is_removed():
-    from CliPP2.io import multiplicity
+    from CliPP2.core import objective
 
-    assert not hasattr(multiplicity, "IntegerMultiplicitySpec")
-    assert not hasattr(multiplicity, "build_clonal_integer_likelihood")
+    assert not hasattr(objective, "IntegerMultiplicitySpec")
+    assert not hasattr(objective, "build_clonal_integer_likelihood")

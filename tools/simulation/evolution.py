@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from CliPP2.io.multiplicity import MAX_MAJOR_CN
+from CliPP2.config import MAX_MAJOR_CN
 from .config import CopyNumberEvolutionConfig, _validate_copy_number_config
 
 

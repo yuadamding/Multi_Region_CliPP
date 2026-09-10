@@ -28,7 +28,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .torch_backend import TorchTumorData
+    from ..objective import TorchObservedModel
 
 
 # Column generation assumes that the retained-edge subproblem has itself been
@@ -100,7 +100,7 @@ def _inadmissible_downward_kink_mask(
 
 
 def build_certificate_gradient(
-    data: TorchTumorData,
+    data: TorchObservedModel,
     phi: torch.Tensor,
     *,
     smooth_gradient: torch.Tensor,
@@ -131,7 +131,7 @@ def build_certificate_gradient(
 
     gradient_left, gradient_right, at_breakpoint = (
         observed_one_sided_gradients_torch(
-            data.observed_model, phi, eps=float(eps)
+            data, phi, eps=float(eps)
         )
     )
     gradient_lower = torch.where(

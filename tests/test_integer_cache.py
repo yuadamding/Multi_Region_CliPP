@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from CliPP2.config import resolve_fit_config
-from CliPP2.core.fusion.torch_backend import (
-    resolve_runtime, to_torch_tumor_data, validate_torch_tumor_data,
-)
-from CliPP2.core.objective import compile_observed_model
+from CliPP2.core.fusion import solver
+from CliPP2.core.fusion.torch_backend import resolve_runtime
+from CliPP2.core.fusion.partition_starts import _resolve_partition_runtime
+from CliPP2.core.objective import compile_observed_model, model_to_torch
 from CliPP2.io.data import CNFilterRecord, CNFilterReport, tumor_data_fingerprint
 from CliPP2.model_selection import candidates
 from CliPP2.model_selection.partitions import _partition_signature
@@ -81,31 +81,33 @@ def test_same_shape_source_model_must_match_requested_data(change):
     if change == "bounds":
         source = replace(source, upper=source.upper * 0.8)
     runtime = resolve_runtime("cpu", dtype="float64")
-    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
-        to_torch_tumor_data(data, runtime, source_model=source)
+    tensor = model_to_torch(source, runtime, eps=.01 if change == "eps" else 1e-6)
+    with pytest.raises(ValueError, match="TumorData/eps objective"):
+        _resolve_partition_runtime(data=data, model=tensor)
 
 
 def test_forged_runtime_input_label_cannot_authorize_wrong_source_model():
-    data = integer_data(((4,),))
+    from test_solver_request import _prepared
+    data, context = _prepared()
     changed = replace(data, alt_counts=data.alt_counts + 1)
     runtime = resolve_runtime("cpu", dtype="float64")
-    correct = to_torch_tumor_data(data, runtime)
-    wrong = to_torch_tumor_data(changed, runtime)
-    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
-        validate_torch_tumor_data(
-            replace(wrong, data_fingerprint=correct.data_fingerprint), data=data, runtime=runtime,
-        )
-    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
-        validate_torch_tumor_data(replace(correct, source_model=None), data=data, runtime=runtime)
+    wrong = compile_observed_model(changed, eps=1e-6)
+    forged = replace(context, source_model=wrong, model=model_to_torch(wrong, runtime, eps=1e-6),
+                     _tensor_snapshot=())
+    with pytest.raises(ValueError, match="likelihood or epsilon"):
+        solver._validate_prepared_problem(forged)
+    with pytest.raises(ValueError, match="likelihood or epsilon"):
+        solver._validate_prepared_problem(replace(context, source_model=None))
 
 
 def test_runtime_validation_supports_matching_nondefault_eps():
     data = integer_data(((4,),))
     runtime = resolve_runtime("cpu", dtype="float64")
-    tensors = to_torch_tumor_data(data, runtime, eps=0.01)
-    validate_torch_tumor_data(tensors, data=data, runtime=runtime, eps=0.01)
-    with pytest.raises(ValueError, match="requested TumorData/eps objective"):
-        validate_torch_tumor_data(tensors, data=data, runtime=runtime)
+    tensors = model_to_torch(compile_observed_model(data, eps=.01), runtime, eps=.01)
+    _, rebuilt = _resolve_partition_runtime(data=data, model=tensors, eps=.01)
+    assert rebuilt.source_fingerprint == tensors.source_fingerprint
+    with pytest.raises(ValueError, match="TumorData/eps objective"):
+        _resolve_partition_runtime(data=data, model=tensors)
 
 
 def test_exclusion_provenance_does_not_invalidate_retained_refit_cache():

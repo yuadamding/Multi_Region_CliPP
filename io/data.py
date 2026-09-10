@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, fields
 
 import numpy as np
 
-from .multiplicity import (
+from ..config import (
     CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
 )

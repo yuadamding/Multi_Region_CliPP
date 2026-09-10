@@ -630,9 +630,9 @@ def build_guided_fusion_initialization(
     )
 
     terms = observed_terms_torch(
-        solver_context.problem.observed_model,
+        solver_context.model,
         phi,
-        eps=float(solver_context.problem.eps),
+        eps=float(solver_context.eps),
     )
     grad = terms.gradient.detach()
     gradient_source = "observed_likelihood"

@@ -3,10 +3,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ...io.data import TumorData
 from ..objective import (
     ObservedModel,
-    compile_observed_model,
+    TorchObservedModel,
     observed_terms_torch,
 )
 from ..scalar import (
@@ -18,9 +17,7 @@ from ..scalar import (
     scalar_loss_and_gradient,
     scalar_problem_from_model,
 )
-from .torch_backend import (
-    TorchTumorData,
-)
+from .types import TorchRuntime
 
 
 _ROOT_SCAN_POINTS = 65
@@ -33,14 +30,6 @@ def initialize_marginal_phi(model: ObservedModel, *, eps: float) -> np.ndarray:
         eps=eps, tol=1e-10, max_iter=256,
     )
     return np.clip(np.asarray(primary, dtype=np.float64), eps, model.upper)
-
-
-def _source_observed_model(torch_data: TorchTumorData) -> ObservedModel:
-    """Return the immutable float64 source required by host scalar searches."""
-
-    if torch_data.source_model is None:
-        raise ValueError("Host scalar searches require an immutable source model.")
-    return torch_data.source_model
 
 
 def _golden_section_minimize(
@@ -497,7 +486,7 @@ def _deduplicate_tensor_starts(starts: list[torch.Tensor]) -> tuple[torch.Tensor
 
 
 def _linear_candidate_starts_torch(
-    torch_data: TorchTumorData, *, pilot: torch.Tensor, eps: float
+    model: TorchObservedModel, *, pilot: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, ...]:
     """Bounded candidate seeds, each refined against the *full* mixture.
 
@@ -507,7 +496,6 @@ def _linear_candidate_starts_torch(
     global scalar certificates.
     """
 
-    model = torch_data.observed_model
     if int(model.path_shape[-1]) <= 2:
         return ()
     lower, upper = model.lower, model.upper
@@ -545,7 +533,7 @@ def _linear_candidate_starts_torch(
 
 
 def compute_scalar_well_start_bank_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
     *,
     eps: float,
     exact_pilot: torch.Tensor,
@@ -553,15 +541,15 @@ def compute_scalar_well_start_bank_torch(
     valid_secondary: torch.Tensor | np.ndarray | None = None,
     max_region_flips: int = 4,
 ) -> tuple[torch.Tensor, ...]:
-    dtype = torch_data.alt.dtype
-    device = torch_data.alt.device
-    lower = torch.full_like(torch_data.phi_upper, float(eps))
+    dtype = model.alt.dtype
+    device = model.alt.device
+    lower = torch.full_like(model.upper, float(eps))
     pilot = exact_pilot.to(dtype=dtype, device=device)
-    pilot = torch.minimum(torch.maximum(pilot, lower), torch_data.phi_upper)
+    pilot = torch.minimum(torch.maximum(pilot, lower), model.upper)
 
     starts: list[torch.Tensor] = [pilot]
     starts.extend(_linear_candidate_starts_torch(
-        torch_data, pilot=pilot, eps=float(eps)
+        model, pilot=pilot, eps=float(eps)
     ))
     if secondary_wells is None or valid_secondary is None:
         return _deduplicate_tensor_starts(starts)
@@ -574,7 +562,7 @@ def compute_scalar_well_start_bank_torch(
 
     global_alternate = torch.where(valid, secondary, pilot)
     starts.append(
-        torch.minimum(torch.maximum(global_alternate, lower), torch_data.phi_upper)
+        torch.minimum(torch.maximum(global_alternate, lower), model.upper)
     )
 
     region_delta = torch.where(
@@ -597,31 +585,20 @@ def compute_scalar_well_start_bank_torch(
             region_start[:, region_idx],
         )
         starts.append(
-            torch.minimum(torch.maximum(region_start, lower), torch_data.phi_upper)
+            torch.minimum(torch.maximum(region_start, lower), model.upper)
         )
 
     return _deduplicate_tensor_starts(starts)
 
 
-def compute_scalar_mutation_region_wells(
-    data: TumorData, *, eps: float, tol: float, max_iter: int,
-    certificates: list[ScalarGlobalMinimumCertificate] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return _scalar_wells_from_model(
-        compile_observed_model(data, eps=eps),
-        phi_init=np.asarray(data.phi_init, dtype=np.float64),
-        eps=float(eps), tol=float(tol), max_iter=int(max_iter), certificates=certificates,
-    )
-
-
 def compute_scalar_mutation_region_wells_torch(
-    torch_data: TorchTumorData, *, phi_init: torch.Tensor | np.ndarray,
+    model: ObservedModel, runtime: TorchRuntime, *, phi_init: torch.Tensor | np.ndarray,
     eps: float, tol: float, max_iter: int,
     certificates: list[ScalarGlobalMinimumCertificate] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dtype, device = torch_data.alt.dtype, torch_data.alt.device
+    dtype, device = runtime.dtype, runtime.device
     primary, secondary, valid = _scalar_wells_from_model(
-        _source_observed_model(torch_data),
+        model,
         phi_init=phi_init.detach().cpu().numpy() if torch.is_tensor(phi_init) else np.asarray(phi_init),
         eps=float(eps), tol=float(tol), max_iter=int(max_iter), certificates=certificates,
     )
@@ -633,15 +610,12 @@ def compute_scalar_mutation_region_wells_torch(
 
 
 def compute_pooled_observed_data_start_torch(
-    torch_data: TorchTumorData, *, eps: float, tol: float, max_iter: int,
-    beta_hints: torch.Tensor | np.ndarray | None = None,
+    model: ObservedModel, runtime: TorchRuntime, *, eps: float, tol: float, max_iter: int,
+    beta_hints: torch.Tensor | np.ndarray,
 ) -> torch.Tensor:
-    if beta_hints is None:
-        hints = 0.5 * (float(eps) + torch_data.phi_upper.detach().cpu().numpy())
-    else:
-        hints = beta_hints.detach().cpu().numpy() if torch.is_tensor(beta_hints) else np.asarray(beta_hints)
+    hints = beta_hints.detach().cpu().numpy() if torch.is_tensor(beta_hints) else np.asarray(beta_hints)
     pooled = _pooled_start_from_model(
-        _source_observed_model(torch_data), beta_hints=hints,
+        model, beta_hints=hints,
         eps=float(eps), tol=float(tol), max_iter=int(max_iter),
     )
-    return torch.as_tensor(pooled, dtype=torch_data.alt.dtype, device=torch_data.alt.device)
+    return torch.as_tensor(pooled, dtype=runtime.dtype, device=runtime.device)

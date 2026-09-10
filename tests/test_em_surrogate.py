@@ -17,7 +17,7 @@ from test_integer_likelihood import integer_data
 def test_frozen_responsibility_em_matches_independent_free_energy(epsilon):
     data = integer_data(((1, 2), (4, 6)), observed=np.array([[True, False], [True, True]]))
     model = compile_observed_model(data, eps=epsilon)
-    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"))
+    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"), eps=epsilon)
     phi = np.array([[epsilon / 2, 0.31], [0.67, 1.0]])
     weights = np.where(model.valid, np.arange(1, 7)[None, None, :], 0.0)
     weights /= weights.sum(axis=-1, keepdims=True)
@@ -53,7 +53,7 @@ def test_em_touches_observed_loss_at_e_step_and_bounds_elsewhere():
     data = integer_data(((1,), (2,), (3,), (4,), (5,), (6,)))
     data = replace(data, alt_counts=np.arange(0, 120, 20)[:, None].astype(float))
     model = model_to_torch(compile_observed_model(data, eps=1e-6),
-                           resolve_runtime("cpu", dtype="float64"))
+                           resolve_runtime("cpu", dtype="float64"), eps=1e-6)
     start = torch.full((6, 1), 0.6, dtype=torch.float64)
     observed = observed_terms_torch(model, start, eps=1e-6)
     for phi in (start, torch.full_like(start, 0.2), torch.full_like(start, 0.9)):

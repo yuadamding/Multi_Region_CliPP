@@ -92,6 +92,19 @@ assert not hasattr(core, 'nonexistent_public_operation')
     )
 
 
+@pytest.mark.parametrize("module", [
+    "CliPP2.io.multiplicity", "CliPP2.core.fusion.multiplicity",
+    "CliPP2.model_selection.partition_initializer",
+])
+def test_retired_modules_have_no_compatibility_shell(module):
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    assert find_spec(module) is None
+    with pytest.raises(ModuleNotFoundError, match=module):
+        import_module(module)
+
+
 def test_built_wheel_installs_without_checkout_shadow_and_completes_cpu_fit(tmp_path):
     repository = Path(__file__).resolve().parents[1]
     # Build a source copy: no generated build/ or egg-info dirties the checkout.
@@ -113,6 +126,12 @@ def test_built_wheel_installs_without_checkout_shadow_and_completes_cpu_fit(tmp_
         assert all(not name.startswith(("CliPP2/tests/", "CliPP2/tools/", "CliPP2/simulation/", "CliPP2/runners/")) for name in names)
         assert "CliPP2/api.py" in names and "CliPP2/reporting.py" in names
         assert "CliPP2/setup.py" not in names
+        assert sorted(name for name in names if name.startswith("CliPP2/examples/")) == [
+            "CliPP2/examples/minimal.tsv",
+        ]
+        for retired in ("io/multiplicity.py", "core/fusion/multiplicity.py",
+                        "model_selection/partition_initializer.py"):
+            assert f"CliPP2/{retired}" not in names
         identity = json.loads(archive.read("CliPP2/_build_source.json"))
         digest = hashlib.sha256()
         for name in sorted(name for name in names if name.startswith("CliPP2/") and name.endswith(".py")):
@@ -159,6 +178,11 @@ assert summary["raw_reference_objective_certified"]
 manifest = json.loads(Path("results/wheel_run_manifest.json").read_text())
 assert manifest["status"] == "complete"
 assert len(manifest["files"]) == 4
+example = package / "examples" / "minimal.tsv"
+example_summary = process_tumor(example, Path("minimal_results"), fit_config=config)
+assert example_summary["retained_mutation_count"] == 2
+assert example_summary["excluded_mutation_count"] == 0
+assert example_summary["raw_reference_objective_certified"]
 print(CliPP2.__file__)
 '''
     smoke = subprocess.run(

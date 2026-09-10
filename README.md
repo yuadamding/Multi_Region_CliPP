@@ -14,8 +14,16 @@ clipp2 fit --input-file examples/exampleTumor1.tsv --outdir exampleTumor1_result
 
 The default is CUDA with the `balanced` computation profile. Use `--device cpu`
 for a small smoke test; production GPU and cohort qualification are separate.
+Working precision supports **float32 and float64 only**; float16 is retired.
+Epsilon must retain strictly interior, ordered clipping endpoints in the chosen
+dtype. Incompatible requests (for example, float32 with `eps=1e-12`) fail before
+pilot/graph preparation, without adjusting epsilon or silently promoting the
+objective. Extreme counts/slopes that risk candidate-arithmetic overflow also
+fail preflight. Default float32/`eps=1e-6` remains supported.
 `clipp2 fit --help` lists numerical profiles, solver/resource budgets, and refit
 controls. Use a fresh output directory for each attempt.
+The installed wheel includes `CliPP2/examples/minimal.tsv`; the larger example,
+simulator, and tests stay in the source repository.
 
 ## Input and model
 
@@ -54,6 +62,10 @@ introduce nonconvex transitions. A raw global-optimum flag requires a separate
 conservative proof over the actual source emissions, counts, and feasible box,
 in addition to KKT admission. Failure of that sufficient proof means unproven,
 not necessarily nonconvex.
+Both pilot and final-CCF proposal pools use Torch curvature/Ward calculations
+followed by the same host-side CEM and fixed-label refit. Plain Ward and Ward+CEM
+candidates, empty-cluster repair, and fixed score parameters are retained;
+the alternate Torch CEM/refit implementation and its switches are retired.
 
 Release 0.5.0 retires binary/occupancy likelihood families and their options:
 `--major-prior`, `--dosage-prior-penalty`, `--unsupported-policy`,
@@ -83,6 +95,8 @@ Torch views fail before optimization. Float64 continuation rebuilds from frozen
 float64 sources, not rounded working tensors. Loaded scaling, bounds, and the
 deterministic initialization remain immutable and coherence-checked to preserve
 pilot conventions; the compiled likelihood is cached per dataset/epsilon.
+The prepared problem owns the source/runtime model pair directly; epsilon is
+derived from its immutable objective key rather than stored again.
 
 `fit_prepared(..., warm_state=previous_fit.state, include_default_starts=False)`
 registers a warm-only continuation. If `phi_start` is also supplied, it is a
@@ -94,6 +108,9 @@ Returned `RawFit.phi`, partition labels, and fixed-refit arrays use immutable
 buffers, preserving raw dtype. Copies and pickle roundtrips rerun their normal
 constructors to restore validation and immutability; cached identities and
 qualification are rebuilt. `SolverState` remains mutable numerical work state.
+Discarded multistart fits are released after comparison. Search attempt traces
+retain immutable diagnostics, never discarded fits or certificate tensors;
+actual controller continuation and bracket states remain available.
 
 ## Outputs and integrity
 
@@ -197,97 +214,11 @@ likelihood/derivatives, clipping certificates, graph/data identity, output
 publication, simulation truth, and an isolated installed-wheel CPU fit. Tests
 and tools are excluded from the wheel. GitHub Actions runs these same CPU gates.
 
-The numerical reference for this contraction is integer-model commit `cc5a3d1`,
-not the older binary estimator. Candidate support, scalar evidence, pilot/graph
-conventions, refits, scores, and integer posteriors require paired validation.
+Compare each revision with its explicit frozen numerical reference. Candidate
+support, scalar evidence, pilot/final proposal pools, graph identities, refits,
+scores and their uncertainties, and integer posteriors require paired validation.
 CUDA and representative cohort/release-panel qualification remain necessary;
 passing CPU tests alone is not evidence of improved benchmark accuracy.
 
-### Unreleased integrity and simplification pass — 2026-09-09
-
-Following the review of `5ca5a1914cffc929949c4d1e22b44432a99c3b9f`, this pass
-closes writable-result, mismatched-reporting-input, and selected/raw-reference
-summary gaps. It also removes duplicated prepared bounds/hashes and solver
-argument forwarding, consolidates preparation/retry configuration, freezes data
-once, removes the stored multiplicity specification, and shares NumPy/Torch
-candidate arithmetic across scalar, observed, grid, and EM evaluation. The
-statistical reductions remain separate. Likelihood-only grids do not compute
-posterior derivatives, and warm continuations no longer allocate discarded
-copies of their primals. No graph backend or hybrid candidate family is removed.
-
-A pinned comparison captured five tiny CPU-float64 fixtures (CN1, CN2, CN6,
-equal CN6, and an independently generated two-region count fixture). The
-captured numerical records match **byte for byte**: retained numerical inputs,
-candidate support/priors, initialization, pilot, graph weights/hashes, objective
-keys, loss/gradient/curvature, raw and warm CCFs/objectives, certificates/stop
-reasons, and three hybrid selections' labels/refit CCFs/scores/posteriors/four
-TSVs. The two-region fixture's CNA-only multiplicity macro/micro-F1 also matches
-(10 eligible rows; a parity check, not a cohort accuracy estimate). Capture
-SHA-256: `ce8e7fc88e46e00cbacd9161ad3ecf0eb3133f96029e09741092c84891e5748d`.
-These checks do not establish bitwise equivalence on other inputs or devices.
-
-In `ml1`, **437 tests passed** in 26.37 seconds, including the isolated installed
-wheel and new result/reporting/copy-integrity regressions. Ruff and
-`git diff --check` passed. Validation command:
-
-```bash
-env -u PYTHONPATH PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
-  conda run -n ml1 python -m pytest -q -p no:cacheprovider
-```
-
-Inference source remains 37 Python files and decreases from **772,924 to
-767,700 bytes** (5,224 fewer bytes, about 0.7%), excluding setup, tests, tools,
-and documentation. The principal simplification is fewer independently stored
-quantities and forwarding paths, not fewer module files; new integrity checks
-and regression tests are retained.
-
-Retained-input fingerprint schema changes from v2 to **v3** because the stored
-candidate specification is gone; numerical model, likelihood, box, graph, and
-objective-key schemas remain unchanged. Do not reuse cross-revision input
-caches or identity-free saved results. Package version remains **0.5.0**, with
-no new release tag. CUDA and representative cohort qualification are pending.
-
-### Correction qualification (`5ca5a19`) — 2026-09-09
-
-The correction-only patch following `1a0893d` addresses clipped-likelihood
-global certification, explicit warm/start pairing, portable source hashing,
-and manifest numerical qualification. The supplied two-mutation plateau
-counterexample reproduced at lambdas 0, 0.1, and 100: objective **276.310391**
-was falsely marked global despite a feasible objective of **65.016595**.
-The corrected path compares the scalar pilot and reaches the better point,
-without claiming whole-box global optimality. Tests cover CPU float32 and
-float64, both solver routes, clipping endpoints, warm-only calls, and separate
-warm/explicit starts. The objective, clipping, box, graph, and gate are unchanged.
-
-In `ml1`, **350 tests passed** in 26.86 seconds, including the existing reference
-pipeline checks, independent numerical formulas, portable-path hash checks,
-and isolated installed-wheel CPU fit. Ruff and `git diff --check` passed.
-Native Windows execution and production CUDA were not tested in this patch.
-
-At this reference commit the prepared-state, data-ownership, and arithmetic
-contractions remained separate work. Its corrections alone made no
-benchmark-accuracy claim.
-
-### Release 0.5.0 qualification (`1a0893d`) — 2026-09-09
-
-In `ml1` (Python 3.13.2, NumPy 2.2.6, SciPy 1.18.0, Torch 2.9.1), all
-**277 checked-in tests passed**, including the isolated wheel fit. Ruff and
-`git diff --check` passed. The untouched reference passed its 152 regressions.
-
-Paired CPU-float64 checks against
-`cc5a3d1ac28097c2b3005c1c2615930f0ab424de` covered four tiny CN1/CN2/CN6
-fixtures. Selected labels, refitted CCFs, Dirichlet scores, multiplicity
-posteriors, four TSV schemas, and fixed-lambda objectives matched exactly.
-Maximum raw-CCF difference was `3.8e-15`. Kernel, scalar-bound, initialization,
-and pipeline reference values are preserved in the tests.
-
-This is numerical equivalence, **not bitwise search equivalence**: generalized
-initialization changed pilots by up to `4.2e-13` and adaptive weights by up to
-`5.35e-12` in the paired probes. An adaptive graph hash and one recovery trace
-changed. New fingerprint schemas invalidate old caches; within-run graph and
-objective identities remain strict. CUDA/cohort qualification is pending.
-
-Inference Python source decreased from 45 modules / 860,280 bytes to 36 modules /
-759,123 bytes (about 12% fewer bytes). Moving the simulator also removes its
-eight modules from the wheel; restoring tests intentionally increases the
-maintained repository's test coverage rather than minimizing its file count.
+Detailed dated evidence, parity captures, source measurements, and remaining
+release gates live in [QUALIFICATION.md](QUALIFICATION.md).

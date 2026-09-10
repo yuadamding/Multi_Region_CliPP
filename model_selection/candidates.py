@@ -5,7 +5,7 @@ import numpy as np
 
 from ..core.bic import (
     cluster_sizes_from_labels,
-    compute_dirichlet_exact_partition_log_mass,
+    _dirichlet_exact_partition_log_mass_and_uncertainty,
     fixed_partition_dirichlet_score,
 )
 from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, FitConfig, SELECTION_SCORE
@@ -85,7 +85,7 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
     expected_bic_penalty = float(score.degrees_of_freedom) * np.log(
         max(int(score.n_eff), 1)
     )
-    expected_log_evidence = compute_dirichlet_exact_partition_log_mass(
+    expected_log_evidence, _ = _dirichlet_exact_partition_log_mass_and_uncertainty(
         cluster_sizes_from_labels(partition.labels),
         alpha=float(score.assignment_dirichlet_alpha),
     )
@@ -325,29 +325,20 @@ def _score_fixed_labels(
     refit_result: PartitionRefitResult,
     selection_options: FitConfig,
 ) -> SelectionScore:
-    computation_profile = selection_options.computation_profile
-    score_kwargs: dict[str, object] = {
-        "loglik": float(refit_result.loglik),
-        "num_clusters": int(np.unique(labels).size),
-        "data": data,
-        "partition_signature": str(partition_signature),
-        "labels": np.asarray(labels, dtype=np.int64),
-        "loglik_uncertainty": (
+    return fixed_partition_dirichlet_score(
+        loglik=float(refit_result.loglik),
+        num_clusters=int(np.unique(labels).size),
+        data=data,
+        partition_signature=str(partition_signature),
+        labels=np.asarray(labels, dtype=np.int64),
+        loglik_uncertainty=(
             float(refit_result.global_optimality_gap)
-            if computation_profile.is_strict
+            if selection_options.computation_profile.is_strict
             else 0.0
         ),
-    }
-    score_kwargs.update(
         alpha=float(selection_options.selection.dirichlet_alpha),
         code_weight=float(selection_options.selection.dirichlet_code_weight),
     )
-    score = fixed_partition_dirichlet_score(**score_kwargs)
-    if str(score.name) != SELECTION_SCORE:
-        raise AssertionError(
-            f"Expected score {SELECTION_SCORE} but got {score.name}."
-        )
-    return score
 
 
 def evaluate_partition(

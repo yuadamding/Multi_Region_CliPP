@@ -84,8 +84,8 @@ def test_working_precision_clipping_keeps_pilot_when_source_is_just_outside(tmp_
     config = replace(config, runtime=replace(config.runtime, dtype="float32"))
     problem = prepare_problem(data, config)
     phi = torch.full((2, 1), config.eps / .45, dtype=torch.float32)
-    source_mass = problem.problem.source_model.slope[..., 0] * phi.numpy()
-    working_mass = problem.problem.observed_model.slope[..., 0] * phi
+    source_mass = problem.source_model.slope[..., 0] * phi.numpy()
+    working_mass = problem.model.slope[..., 0] * phi
     assert np.all(source_mass > config.eps)
     assert bool((working_mass <= config.eps).all())
     assert solver._clipped_singleton_start_needs_pilot(problem, phi)

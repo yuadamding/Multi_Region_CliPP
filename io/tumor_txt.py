@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
-from .multiplicity import MAX_MAJOR_CN
+from ..config import MAX_MAJOR_CN
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "clonal_cn_major_le6_whole_mutation_v1"

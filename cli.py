@@ -48,7 +48,7 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--dtype",
-        choices=["auto", "float16", "float32", "float64"],
+        choices=["auto", "float32", "float64"],
         default=None,
     )
     parser.add_argument(

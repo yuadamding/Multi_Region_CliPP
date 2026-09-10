@@ -55,7 +55,7 @@ def test_integer_kernel_matches_pinned_cc5a3d1_numeric_reference():
     model = _reference_model()
     phi = np.array([0.5, 0.4, 0.6, 0.8, 0.75, 0.9])[:, None]
     numpy_terms = observed_terms_numpy(model, phi, eps=EPS)
-    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"))
+    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"), eps=EPS)
     tensor = torch.tensor(phi)
     torch_terms = observed_terms_torch(tm, tensor, eps=EPS)
     em_terms = observed_em_terms_torch(
@@ -103,7 +103,7 @@ def test_clipping_retains_exact_one_sided_derivatives(boundary):
         slope=np.array([[[1.0]]]), log_prior=np.array([[[0.0]]]),
         valid=np.array([[[True]]]), model_id="clipp2_clonal_integer_multiplicity_mixture_v1",
     )
-    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"))
+    tm = model_to_torch(model, resolve_runtime("cpu", dtype="float64"), eps=epsilon)
     tensor = torch.tensor([[boundary]], dtype=torch.float64)
     left, right, kink = observed_one_sided_gradients_torch(tm, tensor, eps=epsilon)
     untruncated_gradient = -(20 / boundary - 80 / (1 - boundary))

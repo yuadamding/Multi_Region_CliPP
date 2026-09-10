@@ -63,11 +63,9 @@ def _context(*, certified=True, fingerprint="same", pilot=0.7, device="cpu"):
     # The transfer boundary only reads model identity and the exact pilot;
     # no GPU runtime or solver is needed for the controlled fallback test.
     context = SimpleNamespace()
-    context.problem = SimpleNamespace(
-        eps=EPS,
-        observed_model=SimpleNamespace(source_fingerprint=fingerprint),
-        source_model=SimpleNamespace(fingerprint=fingerprint),
-    )
+    context.eps = EPS
+    context.model = SimpleNamespace(source_fingerprint=fingerprint)
+    context.source_model = SimpleNamespace(fingerprint=fingerprint)
     context.exact_pilot = torch.tensor([[pilot]], dtype=torch.float64)
     context.pooled_start = context.exact_pilot
     context.scalar_well_starts = ()
@@ -97,20 +95,20 @@ def test_transfer_rejects_changed_compiled_model_even_with_same_runtime_identity
     model = compile_observed_model(integer_data(((4,),)), eps=EPS)
     source = _context(fingerprint=model.fingerprint)
     target = _context(fingerprint=model.fingerprint)
-    source.problem.source_model = target.problem.source_model = model
+    source.source_model = target.source_model = model
     if change == "eps":
-        setattr(target.problem, change, 0.1)
+        setattr(target, change, 0.1)
     elif change == "lower":
-        target.problem.source_model = replace(model, lower=np.full(model.shape, 0.01))
+        target.source_model = replace(model, lower=np.full(model.shape, 0.01))
     elif change == "prior":
-        target.problem.source_model = replace(
+        target.source_model = replace(
             model, log_prior=np.log(np.array([[[0.1, 0.2, 0.3, 0.4]]]))
         )
     else:
-        target.problem.source_model = None
+        target.source_model = None
     # A stale label on the runtime view cannot authorize a different source.
-    assert source.problem.observed_model.source_fingerprint == (
-        target.problem.observed_model.source_fingerprint
+    assert source.model.source_fingerprint == (
+        target.model.source_fingerprint
     )
     with pytest.raises(ValueError, match="changed pilot/model"):
         transfer_scalar_pilot_certificates(source, target)

@@ -14,20 +14,18 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .core.fusion.multiplicity import (
-    infer_integer_multiplicity_posterior_numpy,
-)
 from ._version import __version__
 from ._source import source_fingerprint
-from .config import FitConfig
-from .core.fusion.types import RawFit
-from .core.bic import effective_bic_mutation_region_count
-from .core.objective import compile_observed_model, make_base_objective_key
-from .io.data import CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record
-from .io.multiplicity import (
-    CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION,
+from .config import (
+    FitConfig, CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION,
     CLONAL_INTEGER_PRIOR_MODE, MAX_MAJOR_CN,
 )
+from .core.fusion.types import RawFit
+from .core.bic import effective_bic_mutation_region_count
+from .core.objective import (
+    compile_observed_model, make_base_objective_key, infer_integer_multiplicity_posterior_numpy,
+)
+from .io.data import CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record
 from .model_selection.candidates import validate_candidate_identity, validate_partition_identity
 from .model_selection.proposals import pilot_matrix_hash
 from .model_selection.types import (

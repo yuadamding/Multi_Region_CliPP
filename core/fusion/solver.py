@@ -10,8 +10,8 @@ from ...io.data import (
     TumorData,
     tumor_data_fingerprint,
 )
-from ...io.multiplicity import CLONAL_INTEGER_MODEL_ID
 from ..objective import (
+    TorchObservedModel,
     compile_observed_model,
     has_proven_convex_observed_loss,
     make_base_objective_key,
@@ -23,6 +23,7 @@ from ..objective import (
     observed_terms_torch,
 )
 from ...config import (
+    CLONAL_INTEGER_MODEL_ID,
     FitConfig,
     SolverConfig,
     DEFAULT_DEVICE,
@@ -56,9 +57,7 @@ from .starts import (
 )
 from .torch_backend import (
     CudaUnavailableError,
-    TorchTumorData,
     as_runtime_tensor,
-    copy_torch_tumor_data,
     dtype_name,
     graph_adjoint_edges_in_dtype,
     graph_fusion_kkt_residual_from_grad_torch,
@@ -66,8 +65,6 @@ from .torch_backend import (
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
     solve_majorized_subproblem_pdhg_torch,
-    to_torch_tumor_data,
-    validate_torch_tumor_data,
     validate_lambda_value,
 )
 from .types import (
@@ -99,38 +96,34 @@ from .types import (
 @dataclass(frozen=True, slots=True)
 class _Float64AuditContext:
     runtime: TorchRuntime
-    torch_data: TorchTumorData
+    model: TorchObservedModel
     graph: TensorFusionGraph
 
     @property
     def lower(self) -> torch.Tensor:
-        return self.torch_data.observed_model.lower
+        return self.model.lower
 
     @property
     def upper(self) -> torch.Tensor:
-        return self.torch_data.observed_model.upper
+        return self.model.upper
 
 
 def _float64_audit_context(
-    *,
-    torch_data: TorchTumorData,
-    graph_spec: PairwiseFusionGraph,
-    graph_hash: str,
-    cache: dict[tuple[str, str, str], object] | None,
+    problem: PreparedProblem,
 ) -> _Float64AuditContext:
     """Return the immutable float64 audit tensors for one tumor/graph/device."""
 
-    source_model = torch_data.source_model
+    problem.assert_runtime_unchanged()
+    source_model = problem.source_model
     if source_model is None:
         raise ValueError("Float64 audit requires an immutable observed-model source.")
-    device = torch_data.alt.device
-    key = (str(source_model.fingerprint), str(graph_hash), str(device))
-    if cache is not None:
-        cached = cache.get(key)
-        if cached is not None:
-            if not isinstance(cached, _Float64AuditContext):
-                raise TypeError("PreparedProblem float64 audit cache is corrupted.")
-            return cached
+    device = problem.runtime.device
+    key = (str(source_model.fingerprint), str(problem.graph_hash), str(device))
+    cached = problem.audit_context_cache.get(key)
+    if cached is not None:
+        if not isinstance(cached, _Float64AuditContext):
+            raise TypeError("PreparedProblem float64 audit cache is corrupted.")
+        return cached
     runtime = TorchRuntime(
         device=device,
         device_name=str(device),
@@ -138,50 +131,37 @@ def _float64_audit_context(
     )
     context = _Float64AuditContext(
         runtime=runtime,
-        torch_data=copy_torch_tumor_data(
-            torch_data,
-            dtype=torch.float64,
-            device=device,
-        ),
+        model=model_to_torch(source_model, runtime, eps=problem.eps),
         graph=tensorize_graph(
-            graph_spec,
+            problem.graph_spec,
             runtime,
             num_nodes=int(source_model.shape[0]),
         ),
     )
-    if cache is not None:
-        cache[key] = context
+    problem.audit_context_cache[key] = context
     return context
 
 
 def _terminal_backward_error_audit_float64(
     *,
-    torch_data: TorchTumorData,
+    problem: PreparedProblem,
     phi: torch.Tensor,
     certificate: GraphFusionCertificate | None,
-    graph_spec: PairwiseFusionGraph,
-    graph_hash: str,
     lambda_value: float,
 
-    eps: float,
     tol: float,
-    audit_context_cache: dict[tuple[str, str, str], object] | None = None,
 ) -> tuple[KKTDiagnostics, str, bool, float]:
     """Audit the unchanged terminal witness with float64 backward error."""
 
-    audit = _float64_audit_context(
-        torch_data=torch_data,
-        graph_spec=graph_spec,
-        graph_hash=graph_hash,
-        cache=audit_context_cache,
-    )
-    data64 = audit.torch_data
+    audit = _float64_audit_context(problem)
+    eps, graph_hash = problem.eps, problem.graph_hash
+    data64 = audit.model
     graph64 = audit.graph
     lower64 = audit.lower
     upper64 = audit.upper
     phi64 = phi.to(dtype=torch.float64, device=audit.runtime.device)
     terms64 = observed_terms_torch(
-        data64.observed_model,
+        data64,
         phi64,
         eps=float(eps),
     )
@@ -284,17 +264,17 @@ def _clipped_singleton_start_needs_pilot(
     problem: PreparedProblem, start: np.ndarray | torch.Tensor,
 ) -> bool:
     """Detect a flat clipping start with feasible downhill likelihood beyond it."""
-    model = problem.problem.source_model
+    model = problem.source_model
     if model is None:
         raise ValueError("PreparedProblem lacks an immutable observed-model source.")
     working_phi = as_runtime_tensor(start, problem.runtime).detach()
     working_phi = torch.minimum(torch.maximum(working_phi, problem.lower), problem.upper)
-    working_mass = problem.problem.observed_model.slope[..., 0] * working_phi
+    working_mass = problem.model.slope[..., 0] * working_phi
     phi = working_phi.cpu().numpy()
     phi = np.clip(phi, model.lower, model.upper)
     slope = model.slope[..., 0]
     mass = slope * phi
-    eps = float(problem.problem.eps)
+    eps = float(problem.eps)
     upper_clip = 1.0 - eps
     active = model.observed & ((model.alt > 0) | (model.nonalt > 0))
     active &= np.sum(model.valid, axis=-1) == 1
@@ -392,7 +372,7 @@ def objective_shape_for_data(data: TumorData, requested: str) -> str:
 
 
 def _clipping_smooth_interval_bounds(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
     phi: torch.Tensor,
     *,
     lower: torch.Tensor,
@@ -407,7 +387,7 @@ def _clipping_smooth_interval_bounds(
     """
 
     points, valid = observed_internal_breakpoints_torch(
-        torch_data.observed_model,
+        model,
         eps=float(eps),
     )
     valid = (
@@ -743,15 +723,15 @@ def transfer_scalar_pilot_certificates(
 
     if not source.scalar_pilot_certificates:
         return target
-    source_model = source.problem.source_model
-    target_model = target.problem.source_model
+    source_model = source.source_model
+    target_model = target.source_model
     if (
         source_model is None
         or target_model is None
         or source_model.fingerprint != target_model.fingerprint
-        or source_model.fingerprint != source.problem.observed_model.source_fingerprint
-        or target_model.fingerprint != target.problem.observed_model.source_fingerprint
-        or float(source.problem.eps) != float(target.problem.eps)
+        or source_model.fingerprint != source.model.source_fingerprint
+        or target_model.fingerprint != target.model.source_fingerprint
+        or float(source.eps) != float(target.eps)
 
         or not torch.equal(
             source.exact_pilot.detach().cpu().double(),
@@ -781,20 +761,16 @@ def promote_solver_context_dtype(
         and start_override is None
     ):
         return context
-    source_model = context.problem.source_model
+    source_model = context.source_model
     if source_model is None:
         raise ValueError("PreparedProblem lacks an immutable observed-model source.")
-    promoted_data = copy_torch_tumor_data(
-        context.problem,
-        dtype=dtype,
-        device=target_device,
-    )
     runtime = replace(
         context.runtime,
         dtype=dtype,
         device=target_device,
         device_name=str(target_device),
     )
+    promoted_model = model_to_torch(source_model, runtime, eps=context.eps)
     graph = tensorize_graph(
         context.graph_spec,
         runtime,
@@ -818,7 +794,7 @@ def promote_solver_context_dtype(
     return replace(
         context,
         _tensor_snapshot=(),
-        problem=promoted_data,
+        model=promoted_model,
         graph=graph,
         exact_pilot=exact,
         pooled_start=pooled,
@@ -957,7 +933,7 @@ def escape_path_breakpoint_solver_state(
     """
 
     certificate = None if state is None else state.certificate
-    model = context.problem.observed_model
+    model = context.model
     if (
         state is None
 
@@ -984,7 +960,6 @@ def escape_path_breakpoint_solver_state(
     ):
         return state, 0
 
-    torch_data = context.problem
     with torch.no_grad():
         fusion_adjustment = graph_adjoint_edges(
             dual,
@@ -994,9 +969,9 @@ def escape_path_breakpoint_solver_state(
         )
         gradient_left, gradient_right, at_breakpoint = (
             observed_one_sided_gradients_torch(
-                torch_data.observed_model,
+                model,
                 phi,
-                eps=float(context.problem.eps),
+                eps=float(context.eps),
             )
         )
         left_total = gradient_left + fusion_adjustment
@@ -1025,7 +1000,7 @@ def escape_path_breakpoint_solver_state(
         choose_right = right_descends & (~left_descends | (-right_total >= left_total))
         choose_left = left_descends & ~choose_right
         base_offset = max(
-            10.0 * float(context.problem.eps),
+            10.0 * float(context.eps),
             0.2 * tolerance,
         )
         offset = torch.maximum(
@@ -1079,7 +1054,6 @@ def prepare_torch_problem(
     device: str | None = DEFAULT_DEVICE,
     dtype: str | None = DEFAULT_DTYPE,
     runtime=None,
-    torch_data: TorchTumorData | None = None,
     objective_shape: str = OBJECTIVE_SHAPE_AUTO,
     defer_graph: bool = False,
     verbose: bool = False,
@@ -1095,29 +1069,8 @@ def prepare_torch_problem(
         data,
         eps=float(eps),
     )
-    if torch_data is None:
-        effective_torch_data = to_torch_tumor_data(
-            data,
-            effective_runtime,
-            source_model=source_model,
-            eps=float(eps),
-        )
-        data_fingerprint = effective_torch_data.data_fingerprint
-    else:
-        effective_torch_data = replace(
-            torch_data,
-            source_model=source_model,
-            observed_model=model_to_torch(source_model, effective_runtime),
-            eps=float(eps),
-        )
-        data_fingerprint = tumor_data_fingerprint(data)
-        validate_torch_tumor_data(
-            effective_torch_data,
-            data=data,
-            runtime=effective_runtime,
-            expected_fingerprint=data_fingerprint,
-            eps=float(eps),
-        )
+    runtime_model = model_to_torch(source_model, effective_runtime, eps=float(eps))
+    data_fingerprint = tumor_data_fingerprint(data)
 
     pilot_certificates = (
         [] if exact_pilot is None and source_model.model_id == CLONAL_INTEGER_MODEL_ID
@@ -1126,7 +1079,7 @@ def prepare_torch_problem(
     if exact_pilot is None:
         exact_pilot_tensor, secondary_wells, valid_secondary = (
             compute_scalar_mutation_region_wells_torch(
-                effective_torch_data,
+                source_model, effective_runtime,
                 phi_init=data.phi_init,
                 eps=float(eps),
                 tol=tol,
@@ -1139,7 +1092,7 @@ def prepare_torch_problem(
         if scalar_well_starts is None and not use_unimodal_objective:
             _, secondary_wells, valid_secondary = (
                 compute_scalar_mutation_region_wells_torch(
-                    effective_torch_data,
+                    source_model, effective_runtime,
                     phi_init=data.phi_init,
                     eps=float(eps),
                     tol=tol,
@@ -1192,7 +1145,7 @@ def prepare_torch_problem(
         working_tensor_graph = build_complete_adaptive_tensor_graph(
             exact_pilot_tensor,
             effective_runtime,
-            count_observed=effective_torch_data.count_observed,
+            count_observed=runtime_model.observed,
             gamma=float(adaptive_weight_gamma),
             tau=max(float(adaptive_weight_floor), float(eps)),
             baseline=float(adaptive_weight_baseline),
@@ -1223,7 +1176,7 @@ def prepare_torch_problem(
         pooled_start_tensor = exact_pilot_tensor
     elif pooled_start is None:
         pooled_start_tensor = compute_pooled_observed_data_start_torch(
-            effective_torch_data,
+            source_model, effective_runtime,
             eps=float(eps),
             tol=tol,
             max_iter=max(int(inner_max_iter), 16),
@@ -1236,7 +1189,7 @@ def prepare_torch_problem(
         scalar_well_starts_seq = ()
     elif scalar_well_starts is None:
         scalar_well_starts_seq = compute_scalar_well_start_bank_torch(
-            effective_torch_data,
+            runtime_model,
             eps=float(eps),
             exact_pilot=exact_pilot_tensor,
             secondary_wells=secondary_wells,
@@ -1255,7 +1208,8 @@ def prepare_torch_problem(
     )
     return PreparedProblem(
         source_data=data,
-        problem=effective_torch_data,
+        source_model=source_model,
+        model=runtime_model,
         graph=tensor_graph,
         graph_spec=effective_graph,
         exact_pilot=exact_pilot_tensor,
@@ -1303,7 +1257,6 @@ def prepare_torch_problem_with_resource_policy(
     normalized_policy = normalize_dense_fallback_policy(kwargs.pop("dense_fallback_policy"))
     supplied_prebuilt_tensor_graph = kwargs.pop("prebuilt_tensor_graph", None)
     supplied_runtime = kwargs.pop("runtime", None)
-    supplied_torch_data = kwargs.pop("torch_data", None)
     requested_device = kwargs.pop("device")
     requested_dtype = kwargs.pop("dtype")
     resolved_by_cpu_fallback = False
@@ -1316,16 +1269,10 @@ def prepare_torch_problem_with_resource_policy(
     except CudaUnavailableError:
         if normalized_policy != "cpu_allowed":
             raise
-        try:
-            requested_runtime = resolve_runtime("cpu", dtype=requested_dtype)
-        except RuntimeError as exc:
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: the requested runtime is unavailable "
-                "and dense CPU fallback does not support the requested dtype."
-            ) from exc
+        requested_runtime = resolve_runtime("cpu", dtype=requested_dtype)
         resolved_by_cpu_fallback = True
 
-    def prepare_on_runtime(*, retain_torch_data: bool) -> PreparedProblem:
+    def prepare_on_runtime() -> PreparedProblem:
         reusable_tensor_graph = supplied_prebuilt_tensor_graph
         graph_runtime = None if reusable_tensor_graph is None else (
             reusable_tensor_graph.weight.device,
@@ -1338,7 +1285,6 @@ def prepare_torch_problem_with_resource_policy(
             device=requested_runtime.device_name,
             dtype=dtype_name(requested_runtime.dtype),
             runtime=requested_runtime,
-            torch_data=supplied_torch_data if retain_torch_data else None,
             prebuilt_tensor_graph=reusable_tensor_graph,
             **kwargs,
         )
@@ -1354,7 +1300,7 @@ def prepare_torch_problem_with_resource_policy(
                 limit_name="host limit",
             )
         try:
-            return prepare_on_runtime(retain_torch_data=not resolved_by_cpu_fallback)
+            return prepare_on_runtime()
         except (MemoryError, torch.OutOfMemoryError) as exc:
             action = decide_next_action(
                 PolicyState(
@@ -1370,17 +1316,10 @@ def prepare_torch_problem_with_resource_policy(
                     f"construction exhausted memory on "
                     f"{requested_runtime.device_name}."
                 ) from exc
-            try:
-                requested_runtime = resolve_runtime(
-                    "cpu", dtype=dtype_name(requested_runtime.dtype)
-                )
-            except RuntimeError as cpu_exc:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: dense CPU fallback does not "
-                    f"support dtype {dtype_name(requested_runtime.dtype)}."
-                ) from cpu_exc
+            requested_runtime = resolve_runtime(
+                "cpu", dtype=dtype_name(requested_runtime.dtype)
+            )
             resolved_by_cpu_fallback = True
-            supplied_torch_data = None
 
 
 def _initial_outer_diag() -> dict[str, float | int]:
@@ -1606,12 +1545,12 @@ def _fit_from_start(
     options: SolverConfig,
     attempt: _StartAttempt,
 ) -> RawFit:
-    data, torch_data, runtime = problem.source_data, problem.problem, problem.runtime
+    data, model, runtime = problem.source_data, problem.model, problem.runtime
     graph, tensor_graph = problem.graph_spec, problem.graph
     lower, upper = problem.lower, problem.upper
     graph_hash, objective_spec_hash = problem.graph_hash, problem.objective_spec_hash
     base_objective_key = problem.base_objective_key
-    eps, verbose = float(torch_data.eps), bool(problem.verbose)
+    eps, verbose = float(problem.eps), bool(problem.verbose)
     phi_start, solver_state = attempt.phi, attempt.warm_state
     tol = _validate_solver_tolerance(options.tolerance)
     cert_tol = _validate_solver_tolerance(
@@ -1664,7 +1603,7 @@ def _fit_from_start(
     if (
         solver_state is not None
         and solver_state.phi is not None
-        and tuple(solver_state.phi.shape) == tuple(torch_data.phi_upper.shape)
+        and tuple(solver_state.phi.shape) == tuple(model.upper.shape)
     ):
         phi = solver_state.phi.to(dtype=runtime.dtype, device=runtime.device)
     else:
@@ -1733,7 +1672,7 @@ def _fit_from_start(
     full_step_curvature_multiplier = torch.ones_like(phi)
 
     current_mutation_region_terms = observed_terms_torch(
-        torch_data.observed_model, phi, eps=eps
+        model, phi, eps=eps
     )
     fit_loss, penalty, objective = (
         _objective_value_from_mutation_region_terms_torch(
@@ -1757,7 +1696,7 @@ def _fit_from_start(
             if responsibilities is None:
                 raise AssertionError("Observed terms lack path responsibilities.")
             surrogate_terms = observed_em_terms_torch(
-                torch_data.observed_model,
+                model,
                 phi,
                 responsibilities=responsibilities,
                 eps=eps,
@@ -1765,13 +1704,13 @@ def _fit_from_start(
             surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
         h_base, surrogate_grad = _safe_surrogate_curvature_and_gradient(
             surrogate_terms,
-            torch_data.count_observed,
+            model.observed,
         )
         if use_unimodal_objective:
             smooth_lower, smooth_upper = lower, upper
         else:
             smooth_lower, smooth_upper = _clipping_smooth_interval_bounds(
-                torch_data,
+                model,
                 phi,
                 lower=lower,
                 upper=upper,
@@ -1786,7 +1725,7 @@ def _fit_from_start(
                     gradient_scope="observed_objective",
                 )
             forcing_gradient = build_certificate_gradient(
-                torch_data,
+                model,
                 phi=phi,
                 smooth_gradient=current_mutation_region_terms.gradient,
                 lower=lower,
@@ -1845,7 +1784,7 @@ def _fit_from_start(
                 phi,
                 surrogate_grad=surrogate_grad,
                 h=h,
-                count_observed=torch_data.count_observed,
+                count_observed=model.observed,
             )
             if use_unimodal_objective and not require_full_step_backtracking:
                 q_current = None
@@ -1941,7 +1880,7 @@ def _fit_from_start(
                 inner_dual_start_is_actual = bool(use_alm)
             delta = phi_trial - phi
             trial_mutation_region_terms = observed_terms_torch(
-                torch_data.observed_model, phi_trial, eps=eps
+                model, phi_trial, eps=eps
             )
             trial_fit_loss, _, trial_objective = (
                 _objective_value_from_mutation_region_terms_torch(
@@ -1986,7 +1925,7 @@ def _fit_from_start(
                     em_envelope_gap = 0.0
                 else:
                     trial_surrogate_terms = observed_em_terms_torch(
-                        torch_data.observed_model,
+                        model,
                         phi_trial,
                         responsibilities=responsibilities,
                         eps=eps,
@@ -2162,7 +2101,7 @@ def _fit_from_start(
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
                 theta_mutation_region_terms = observed_terms_torch(
-                    torch_data.observed_model, phi_theta, eps=eps
+                    model, phi_theta, eps=eps
                 )
                 theta_fit_loss, _, theta_objective = (
                     _objective_value_from_mutation_region_terms_torch(
@@ -2268,7 +2207,7 @@ def _fit_from_start(
                 or isinstance(observed_start, CompressedEdgeCertificate)
             )
             periodic_gradient = build_certificate_gradient(
-                torch_data,
+                model,
                 phi,
                 smooth_gradient=outer_terms.gradient,
                 lower=lower,
@@ -2338,7 +2277,7 @@ def _fit_from_start(
             lambda_value=lambda_value,
         )
     certificate_gradient = build_certificate_gradient(
-        torch_data,
+        model,
         phi,
         smooth_gradient=final_terms.gradient,
         lower=lower,
@@ -2381,7 +2320,7 @@ def _fit_from_start(
             num_nodes=int(phi.shape[0]),
         )
         next_gradient = build_certificate_gradient(
-            torch_data,
+            model,
             phi,
             smooth_gradient=final_terms.gradient,
             lower=lower,
@@ -2436,15 +2375,11 @@ def _fit_from_start(
             audit_directional_admissible,
             authoritative_objective,
         ) = _terminal_backward_error_audit_float64(
-            torch_data=torch_data,
+            problem=problem,
             phi=phi,
             certificate=certificate,
-            graph_spec=graph,
-            graph_hash=graph_hash,
             lambda_value=lambda_value,
-            eps=eps,
             tol=cert_tol,
-            audit_context_cache=problem.audit_context_cache,
         )
         certificate_audit_dtype = "float64"
         gradient_scope = audit_gradient_scope
@@ -2499,8 +2434,7 @@ def _fit_from_start(
     )
     global_optimality_certified = bool(
         selection_eligible
-        and torch_data.source_model is not None
-        and has_proven_convex_observed_loss(torch_data.source_model, eps=eps)
+        and has_proven_convex_observed_loss(problem.source_model, eps=eps)
     )
     global_optimality_basis = (
         _CONVEX_GLOBAL_OPTIMALITY_BASIS
@@ -2614,10 +2548,11 @@ def _validate_prepared_problem(context: PreparedProblem) -> None:
     data = context.source_data
     if context.data_fingerprint != tumor_data_fingerprint(data):
         raise ValueError("Prepared problem data fingerprint is inconsistent.")
-    source = compile_observed_model(data, eps=context.problem.eps)
+    source = compile_observed_model(data, eps=context.eps)
     if (
-        context.problem.source_model is None
-        or context.problem.source_model.fingerprint != source.fingerprint
+        context.source_model is None
+        or context.source_model.fingerprint != source.fingerprint
+        or context.model.source_fingerprint != source.fingerprint
     ):
         raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
     if context.graph_spec.name == "deferred_likelihood_pilot":
@@ -2625,7 +2560,7 @@ def _validate_prepared_problem(context: PreparedProblem) -> None:
     if context.graph_hash != context.graph_spec.fingerprint:
         raise ValueError("Prepared problem graph identity is inconsistent.")
     key = make_base_objective_key(
-        source, graph_hash=context.graph_hash, eps=context.problem.eps,
+        source, graph_hash=context.graph_hash, eps=context.eps,
         lower=source.lower, upper=source.upper,
     )
     if context.base_objective_key != key:
@@ -2687,9 +2622,7 @@ def fit_prepared(
 
     cpu_fallback_context: PreparedProblem | None = None
     best_artifacts: RawFit | None = None
-    best_artifacts_index = -1
-    start_artifacts: list[RawFit] = []
-    start_contexts: list[PreparedProblem] = []
+    selected_start_context: PreparedProblem | None = None
     for start_attempt in attempts:
         cpu_seed = start_attempt.phi
         attempted_artifacts: RawFit | None = None
@@ -2780,6 +2713,9 @@ def fit_prepared(
                     policy_state.resource_error = None
                     policy_state.runtime_device_type = "cpu"
                     policy_state.representation_retry_done = True
+                    # The exception traceback can own failed GPU edge states.
+                    # Once fallback construction succeeds it has no consumer.
+                    del resource_exc
                 case NextAction.ACCEPT:
                     artifacts = policy_state.result
                     if artifacts is None:
@@ -2808,21 +2744,16 @@ def fit_prepared(
                     ) from resource_exc
                 case NextAction.FLOAT64_POLISH:
                     raise AssertionError("Working-fit policy requested polishing.")
-        start_artifacts.append(artifacts)
-        start_contexts.append(artifacts_context)
-        if best_artifacts is None:
+        if best_artifacts is None or _prefer_multistart_fit(artifacts, best_artifacts):
             best_artifacts = artifacts
-            best_artifacts_index = len(start_artifacts) - 1
-            continue
-        if _prefer_multistart_fit(artifacts, best_artifacts):
-            best_artifacts = artifacts
-            best_artifacts_index = len(start_artifacts) - 1
+            selected_start_context = artifacts_context
+        # Drop all local aliases before entering the next solve, including the
+        # policy result and dense-retry predecessor's edge states.
+        del artifacts, artifacts_context, attempted_artifacts, policy_state
+        del attempt_context, current_attempt, cpu_seed
 
-    if best_artifacts is None:
+    if best_artifacts is None or selected_start_context is None:
         raise RuntimeError("No valid start produced a fusion fit.")
-    if best_artifacts_index < 0:
-        raise AssertionError("Best multistart fit lacks a source context.")
-    selected_start_context = start_contexts[best_artifacts_index]
     working_artifacts = best_artifacts
     polish_options = replace(solver_options, outer_max_iter=1)
     precision_context: PreparedProblem | None = None
@@ -2891,6 +2822,7 @@ def fit_prepared(
                 policy_state.result = None
                 policy_state.resource_error = None
                 policy_state.runtime_device_type = "cpu"
+                del polish_exc
             case NextAction.ACCEPT:
                 if policy_state.result is None:
                     raise AssertionError("Accepted precision state lacks a fit.")

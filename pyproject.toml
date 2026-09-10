@@ -42,8 +42,7 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
-    "examples/README.md",
-    "examples/*.tsv",
+    "examples/minimal.tsv",
 ]
 
 [tool.ruff]

@@ -14,7 +14,7 @@ import torch
 from CliPP2.api import fit_fixed_objective, process_tumor_bundle
 from CliPP2.config import resolve_fit_config
 from CliPP2.core.fusion.graph import build_complete_uniform_graph
-from CliPP2.core.fusion.multiplicity import infer_integer_multiplicity_posterior_numpy
+from CliPP2.core.objective import infer_integer_multiplicity_posterior_numpy
 from CliPP2.io.tumor_txt import load_tumor_txt, write_tumor_txt
 from CliPP2.model_selection.partitions import extract_certified_fusion_partition
 from CliPP2.model_selection import search as search_module

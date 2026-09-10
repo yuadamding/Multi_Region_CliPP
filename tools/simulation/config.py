@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from CliPP2.io.multiplicity import MAX_MAJOR_CN
+from CliPP2.config import MAX_MAJOR_CN
 
 DEFAULT_CNA_EVENT_RATE = 1.5
 GENERATOR_VERSION = "evolution_clonal_trunk_gain_only_v6"

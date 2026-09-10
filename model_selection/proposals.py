@@ -6,8 +6,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from ..core.bic import compute_partition_dirichlet_score
-from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, normalize_dense_fallback_policy
+from ..config import normalize_dense_fallback_policy
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
 from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
@@ -413,7 +412,7 @@ def build_guided_initialization_with_resource_policy(
                 data, fit_options,
                 dense_fallback_policy="device_only",
                 inherited_resource_fallback="dense_cpu",
-                eps=float(solver_context.problem.eps),
+                eps=float(solver_context.eps),
                 graph=solver_context.graph_spec,
                 exact_pilot=cpu_start(solver_context.exact_pilot),
                 pooled_start=cpu_start(solver_context.pooled_start),
@@ -471,8 +470,8 @@ def build_partition_guided_graph_with_resource_policy(
             upper=host_array(solver_context.upper),
             count_observed=(
                 None
-                if solver_context.problem.count_observed is None
-                else host_array(solver_context.problem.count_observed)
+                if solver_context.model.observed is None
+                else host_array(solver_context.model.observed)
             ),
             **graph_options,
         )
@@ -493,7 +492,7 @@ def build_partition_guided_graph_with_resource_policy(
             runtime,
             lower=solver_context.lower,
             upper=solver_context.upper,
-            count_observed=solver_context.problem.count_observed,
+            count_observed=solver_context.model.observed,
             **graph_options,
         )
         return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau
@@ -514,43 +513,6 @@ def build_partition_guided_graph_with_resource_policy(
                 "exhausted host memory during the authorized CPU retry."
             ) from host_exc
         return graph, None, tau
-
-
-def rescore_partition_candidates(
-    candidates: list[PartitionCandidate],
-    *,
-    data: TumorData,
-) -> list[PartitionCandidate]:
-    """Put the active selection score in ``PartitionCandidate.bic``.
-
-    Candidate generation historically used that field for per-K ordering,
-    refinement focus, and deduplication.  Keeping the field as the active score
-    lets those operations follow the requested criterion while the candidate
-    output rows continue to report classic BIC explicitly.
-    """
-    # This score orders deterministic Ward/CEM proposals and chooses the raw
-    # guide. Under a selectable hybrid contract, the authoritative evaluator
-    # later refits every retained label set and recomputes the common score;
-    # generation-time values never become selection authority directly.
-    rescored: list[PartitionCandidate] = []
-    for candidate in candidates:
-        selected_score = compute_partition_dirichlet_score(
-            -float(candidate.fit_loss),
-            np.bincount(
-                np.asarray(candidate.labels, dtype=np.int64),
-                minlength=int(candidate.K),
-            ),
-            data=data,
-            alpha=DIRICHLET_ALPHA,
-            code_weight=DIRICHLET_CODE_WEIGHT,
-        )
-        rescored.append(
-            replace(
-                candidate,
-                bic=float(selected_score),
-            )
-        )
-    return rescored
 
 
 def adaptive_stop_certifies_global_optimum(stop_reason: str) -> bool:
@@ -592,7 +554,6 @@ __all__ = [
     "escape_path_breakpoint_retry_state",
     "offload_solver_state_to_cpu",
     "pilot_matrix_hash",
-    "rescore_partition_candidates",
     "select_raw_start_attempt",
     "solver_retry_fit_options",
 ]

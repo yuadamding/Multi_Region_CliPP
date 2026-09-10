@@ -7,6 +7,7 @@ import heapq
 
 import numpy as np
 
+from ..config import validate_likelihood_precision
 from ..io.data import ImmutableArrayRecord, TumorData, readonly_array
 from .objective import ObservedModel, candidate_terms_numpy, compile_observed_model
 
@@ -44,11 +45,9 @@ class ScalarProblem(ImmutableArrayRecord):
             arrays[name] = value
         lower = float(self.lower)
         upper = float(self.upper)
-        eps = float(self.eps)
+        eps = validate_likelihood_precision(self.eps)
         if not np.isfinite(lower) or not np.isfinite(upper) or upper < lower:
             raise ValueError("Require a finite scalar interval with lower <= upper.")
-        if not np.isfinite(eps) or not 0.0 < eps < 0.5:
-            raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
         for name, value in {
             "alt": alt,
             "nonalt": nonalt,

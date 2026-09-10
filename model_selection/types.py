@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import DenseEdgeCertificate, RawFit
+from ..core.fusion.types import DenseEdgeCertificate, KKTComponents, RawFit, WorkCounters
 from ..io.data import ImmutableArrayRecord, readonly_array
 
 StartArray = np.ndarray | torch.Tensor
@@ -232,17 +232,46 @@ class CandidateRecord:
 
 @dataclass(frozen=True, slots=True)
 class RawAttemptTrace:
-    """Failure-relevant provenance for one authorized raw optimizer start."""
+    """Immutable diagnostics only: never retain a raw fit, primal or witness."""
 
-    fit: RawFit
+    search_round: int
+    search_phase: str
+    lambda_value: float
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
     mathematically_certified: bool
+    objective: float
+    kkt_components: KKTComponents
+    kkt_residual: float
+    kkt_tolerance: float
+    dominant_kkt_component: str
+    certificate_status: str
+    certificate_certified: bool
+    certificate_admissible: bool
+    mm_consistency_violations: int
+    work: WorkCounters
     outer_max_iter: int
     inner_max_iter: int
     certificate_max_iter: int
+    working_dtype: str
+    audit_dtype: str
+    precision_polished: bool
     promotion_status: str = "not_recorded"
+    stage_outer_iterations: int = 0
+    stage_outer_max_iter: int = 0
+    stage_inner_iterations: int = 0
+    stage_inner_max_iter: int = 0
+    stage_inner_solve_calls: int = 0
+    stop_reason: str = "not_recorded"
+    progress_residual_method: str = "not_recorded"
+    solve_tolerance: float = float("nan")
+    legacy_stop_kkt_residual: float = float("inf")
+    componentwise_stop_kkt_residual: float = float("inf")
+    accepted_full_steps: int = 0
+    accepted_damped_steps: int = 0
+    rejected_outer_steps: int = 0
+    fallback_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,18 +328,6 @@ class SelectedModel:
     # separate from ``raw_reference``, which is selected independently as the
     # best certified raw-fusion result for estimator provenance.
     partition_parent_raw: RawFusionCandidate | None = None
-
-    @property
-    def selected_partition_signature(self) -> str:
-        return str(self.partition_candidate.partition.signature)
-
-    @property
-    def selected_candidate_family(self) -> CandidateFamily:
-        return (
-            "raw_fusion"
-            if isinstance(self.partition_candidate, RawFusionCandidate)
-            else "direct_partition"
-        )
 
     @property
     def selected_lambda(self) -> float | None:

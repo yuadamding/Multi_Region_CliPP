@@ -14,8 +14,8 @@ from CliPP2.core.fusion.solver import (
     promote_solver_context_dtype,
     has_multiplicity_ambiguity,
 )
-from CliPP2.core.fusion.torch_backend import resolve_runtime, to_torch_tumor_data
-from CliPP2.core.objective import compile_observed_model, observed_terms_torch
+from CliPP2.core.fusion.torch_backend import resolve_runtime
+from CliPP2.core.objective import compile_observed_model, model_to_torch, observed_terms_torch
 from CliPP2.core.scalar import (
     certify_scalar_minimum,
     scalar_loss,
@@ -37,10 +37,13 @@ def test_singleton_is_fixed_and_multiple_candidates_route_nonconvex():
 @pytest.mark.parametrize("candidates", [1, 2, 6])
 def test_all_candidate_counts_share_scalar_numpy_and_torch_pilot(candidates):
     data = integer_data(((candidates,),))
-    direct = starts.compute_scalar_mutation_region_wells(data, eps=EPS, tol=1e-7, max_iter=64)
-    tensor = to_torch_tumor_data(data, resolve_runtime("cpu", dtype="float64"))
+    source = compile_observed_model(data, eps=EPS)
+    direct = starts._scalar_wells_from_model(
+        source, phi_init=data.phi_init, eps=EPS, tol=1e-7, max_iter=64,
+    )
+    runtime = resolve_runtime("cpu", dtype="float64")
     converted = starts.compute_scalar_mutation_region_wells_torch(
-        tensor, phi_init=data.phi_init, eps=EPS, tol=1e-7, max_iter=64,
+        source, runtime, phi_init=data.phi_init, eps=EPS, tol=1e-7, max_iter=64,
     )
     for numpy_values, torch_values in zip(direct, converted):
         np.testing.assert_array_equal(numpy_values, torch_values.numpy())
@@ -84,8 +87,9 @@ def test_certified_pilot_and_adaptive_graph_match_cc5a3d1(
     write_tumor_txt(path, pd.DataFrame(rows))
     data = load_tumor_txt(path)
     records = []
-    primary, _, _ = starts.compute_scalar_mutation_region_wells(
-        data, eps=EPS, tol=1e-5, max_iter=64, certificates=records,
+    primary, _, _ = starts._scalar_wells_from_model(
+        compile_observed_model(data, eps=EPS), phi_init=data.phi_init,
+        eps=EPS, tol=1e-5, max_iter=64, certificates=records,
     )
     np.testing.assert_allclose(primary[:, 0], expected_pilot, atol=1e-10, rtol=0)
     assert all(record.globally_certified for record in records)
@@ -96,7 +100,7 @@ def test_certified_pilot_and_adaptive_graph_match_cc5a3d1(
 def test_candidate_start_bank_is_bounded_and_refines_full_marginal_loss():
     data = integer_data(((6,), (4,)))
     runtime = resolve_runtime("cpu", dtype="float64")
-    td = to_torch_tumor_data(data, runtime)
+    td = model_to_torch(compile_observed_model(data, eps=EPS), runtime, eps=EPS)
     pilot = torch.tensor(data.phi_init)
     candidate_starts = starts._linear_candidate_starts_torch(td, pilot=pilot, eps=EPS)
     assert 1 < len(candidate_starts) <= 6
@@ -104,25 +108,25 @@ def test_candidate_start_bank_is_bounded_and_refines_full_marginal_loss():
     assert 1 <= len(bank) <= 7
     torch.testing.assert_close(bank[0], pilot)
     for index in range(6):
-        scale = td.observed_model.slope[..., index]
-        valid = td.observed_model.valid[..., index]
+        scale = td.slope[..., index]
+        valid = td.valid[..., index]
         seed = torch.where(valid, ((td.alt + 0.5) / (td.total + 1.0))
                            / torch.clamp(scale, min=1e-100), pilot)
         seed = torch.clamp(seed, min=EPS, max=1.0)
-        seed_loss = observed_terms_torch(td.observed_model, seed, eps=EPS).loss
+        seed_loss = observed_terms_torch(td, seed, eps=EPS).loss
         # Deduplication can merge candidates. At least one retained matrix
         # reaches a loss no worse than each original initialization seed.
-        assert any(bool(torch.all(observed_terms_torch(td.observed_model, s,
+        assert any(bool(torch.all(observed_terms_torch(td, s,
                        eps=EPS).loss <= seed_loss + 1e-10)) for s in candidate_starts)
-    assert all(bool(torch.all((s >= EPS) & (s <= td.phi_upper))) for s in bank)
+    assert all(bool(torch.all((s >= EPS) & (s <= td.upper))) for s in bank)
 
 
 def test_scalar_certificate_metadata_propagates_without_grid_global_claim():
     data = integer_data(((4,),))
     model = compile_observed_model(data, eps=EPS)
     records = []
-    primary, _, _ = starts.compute_scalar_mutation_region_wells(
-        data, eps=EPS, tol=1e-5, max_iter=64,
+    primary, _, _ = starts._scalar_wells_from_model(
+        model, phi_init=data.phi_init, eps=EPS, tol=1e-5, max_iter=64,
         certificates=records)
     assert len(records) == 1
     result = records[0]

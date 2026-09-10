@@ -5,13 +5,7 @@ import warnings
 import numpy as np
 import torch
 
-from ...io.data import TumorData, tumor_data_fingerprint
-from ..objective import (
-    ObservedModel,
-    compile_observed_model,
-    model_to_torch,
-)
-from ...config import DEFAULT_DTYPE
+from ...config import normalize_runtime_dtype
 from .graph_ops import (
     DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES,
     PDHG_PRECONDITIONER_ETA,
@@ -19,25 +13,7 @@ from .graph_ops import (
     graph_forward_edges,
     project_dual_ball,
 )
-from .types import TorchRuntime, TorchTumorData
-
-
-def copy_torch_tumor_data(
-    data: TorchTumorData,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> TorchTumorData:
-    """Rebuild from immutable float64 source; never promote rounded tensors."""
-    if data.source_model is None:
-        raise ValueError("Runtime promotion requires the immutable observed-model source.")
-    runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
-    return TorchTumorData(
-        observed_model=model_to_torch(data.source_model, runtime),
-        data_fingerprint=data.data_fingerprint,
-        source_model=data.source_model,
-        eps=data.eps,
-    )
+from .types import TorchRuntime
 
 
 DEFAULT_INNER_KKT_CHECK_EVERY = 8
@@ -54,7 +30,6 @@ _CERTIFICATE_PLATEAU_ATOL_SCALE = 0.01
 _CERTIFICATE_PLATEAU_EPS_SCALE = 32.0
 
 _DTYPE_TO_NAME = {
-    torch.float16: "float16",
     torch.float32: "float32",
     torch.float64: "float64",
 }
@@ -276,6 +251,8 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     reproducible GPU runs, enable torch.use_deterministic_algorithms(True) and set
     CUBLAS_WORKSPACE_CONFIG before fitting.
     """
+    requested_dtype = normalize_runtime_dtype(dtype)
+    runtime_dtype = {"float32": torch.float32, "float64": torch.float64}[requested_dtype]
     requested = "auto" if device is None else str(device).strip().lower()
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
@@ -301,118 +278,10 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
         runtime_device = torch.device("cuda", device_index)
     else:
         runtime_device = torch.device("cpu")
-    requested_dtype = "auto" if dtype is None else str(dtype).strip().lower()
-    if requested_dtype == "auto":
-        requested_dtype = DEFAULT_DTYPE
-    if requested_dtype == "float16":
-        runtime_dtype = torch.float16
-    elif requested_dtype == "float32":
-        runtime_dtype = torch.float32
-    elif requested_dtype == "float64":
-        runtime_dtype = torch.float64
-    else:
-        raise ValueError(f"Unknown runtime dtype: {dtype}")
-    if runtime_dtype == torch.float16 and runtime_device.type != "cuda":
-        raise RuntimeError("Float16 runtime dtype is only supported on CUDA.")
     device_name = str(runtime_device)
     return TorchRuntime(
         device=runtime_device, device_name=device_name, dtype=runtime_dtype
     )
-
-
-def to_torch_tumor_data(
-    data: TumorData,
-    runtime: TorchRuntime,
-    *,
-    source_model: ObservedModel | None = None,
-
-    eps: float = 1e-6,
-) -> TorchTumorData:
-    expected_model = compile_observed_model(data, eps=float(eps))
-    if source_model is not None and source_model.fingerprint != expected_model.fingerprint:
-        raise ValueError("ObservedModel source does not match the requested TumorData/eps objective.")
-    source_model = expected_model
-    return TorchTumorData(
-        observed_model=model_to_torch(source_model, runtime),
-        data_fingerprint=tumor_data_fingerprint(data),
-        source_model=source_model,
-        eps=float(eps),
-    )
-
-
-def validate_torch_tumor_data(
-    tensor_data: TorchTumorData,
-    *,
-    data: TumorData,
-    runtime: TorchRuntime,
-    expected_fingerprint: str | None = None,
-    eps: float = 1e-6,
-) -> None:
-    """Reject stale or runtime-incompatible tensors before solver reuse."""
-
-    fingerprint = expected_fingerprint or tumor_data_fingerprint(data)
-    if tensor_data.data_fingerprint != fingerprint:
-        raise ValueError("TorchTumorData fingerprint does not match TumorData.")
-
-    expected_shape = (int(data.num_mutations), int(data.num_regions))
-
-    def validate_tensor(
-        label: str,
-        value: torch.Tensor,
-        *,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-    ) -> None:
-        if not torch.is_tensor(value) or tuple(value.shape) != shape:
-            raise ValueError(f"{label} must have shape {shape}.")
-        if value.dtype != dtype:
-            raise ValueError(f"{label} must use runtime dtype {dtype}.")
-        if value.device.type != runtime.device.type or (
-            runtime.device.index is not None
-            and value.device.index != runtime.device.index
-        ):
-            raise ValueError(f"{label} must be on runtime device {runtime.device_name}.")
-
-    expected_model = compile_observed_model(data, eps=float(eps))
-    observed_model = tensor_data.observed_model
-    expected_model_shape = expected_model.path_shape
-
-    for name in ("alt", "nonalt", "lower", "upper"):
-        validate_tensor(
-            f"TorchObservedModel.{name}",
-            getattr(observed_model, name),
-            shape=expected_shape,
-            dtype=runtime.dtype,
-        )
-    validate_tensor(
-        "TorchObservedModel.observed",
-        observed_model.observed,
-        shape=expected_shape,
-        dtype=torch.bool,
-    )
-    for name in ("slope", "log_prior"):
-        validate_tensor(
-            f"TorchObservedModel.{name}",
-            getattr(observed_model, name),
-            shape=expected_model_shape,
-            dtype=runtime.dtype,
-        )
-    validate_tensor(
-        "TorchObservedModel.valid",
-        observed_model.valid,
-        shape=expected_model_shape,
-        dtype=torch.bool,
-    )
-    if not observed_model.source_fingerprint:
-        raise ValueError("TorchObservedModel.source_fingerprint must be nonempty.")
-    if observed_model.model_id != expected_model.model_id:
-        raise ValueError("TorchObservedModel model_id does not match TumorData.")
-
-    source_model = tensor_data.source_model
-    if source_model is None or source_model.fingerprint != expected_model.fingerprint:
-        raise ValueError("ObservedModel source does not match the requested TumorData/eps objective.")
-    if source_model.fingerprint != observed_model.source_fingerprint:
-        raise ValueError("TorchObservedModel was not built from the retained ObservedModel.")
 
 
 def downward_kink_mask_torch(

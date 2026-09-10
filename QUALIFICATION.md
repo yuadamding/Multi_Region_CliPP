@@ -1,0 +1,230 @@
+# Numerical qualification
+
+Dated evidence for the changes below, not a claim that a moving branch or a
+new device/cohort is qualified. See [README.md](README.md) for current usage.
+
+## Deletion-first compaction — 2026-09-09
+
+Reference: `bb726ad3fb3737cca48e06cce66943d5fbba52b4`; version remains `0.5.0`.
+The tested inference-source fingerprint is
+`efe7f40e2912f516f12f5418a064557796a5925766325d85f11eab6ee755cd76`.
+This pass completes the precision/memory contraction below without changing
+the integer likelihood, graph, fusion penalty, hybrid candidate families,
+Dirichlet score (`alpha=1`, weight `0.7`), KKT gate, or output meanings.
+
+Production proposals now have one host CEM/refit implementation; Torch still
+computes curvature and Ward labels. The alternate Torch refit/CEM branch,
+fixed-policy switches, redundant rescoring, and duplicate best-refit tracking
+are deleted. Leave-one-out allocation costs, empty-cluster repair, strict score
+improvement, refit caching, both candidate families, ordering, and deduplication
+are preserved. Shared constants now live in `config.py`, conditional integer
+posteriors in `core/objective.py`, and initializer orchestration in
+`core/fusion/partition_starts.py`. Their three former modules have no
+compatibility shells. Lazy public imports retain their names and identities.
+
+Search traces contain immutable diagnostics, not fits, primals, solver states,
+or certificate witnesses. Start comparison retains its stable ordering and
+tie rules. Same-lambda recovery retains precisely the minimum finite-KKT
+state previously selected from the complete attempt list; actual selected
+history and bracket states remain available. Failure diagnostics use typed
+fields; the duplicate diagnostic class and obsolete-object fallbacks are gone.
+The prepared problem derives epsilon from its immutable objective key.
+
+Validation in `ml1`: **545 tests passed**, including the independently installed
+wheel and its minimal runnable example; Ruff and `git diff --check` pass.
+The wheel contains only that minimal example, while the larger example,
+simulator, and regression evidence remain in the repository. Tests cover
+retired interfaces, host-CEM statistical invariants, exact pinned failure
+diagnostic fields/tokens, streaming ties and nonfinite comparisons, and
+state release across actual search recovery/bracket orchestration.
+
+Fresh fixed-environment CPU captures match the pinned reference byte-for-byte
+in both float32 and float64:
+
+| Capture | Coverage | Matching SHA-256 |
+| --- | --- | --- |
+| Proposal pools | Ambiguous CN2/3/6, 8 mutations, 2 regions; pilot and final-Phi Ward/CEM labels, refits, ordering, scores and selection | `a2447cfe2b7d2d43318f490cf32d9166e84e67bafc539ac83e2e25b937fffe72` |
+| Raw/warm and hybrid | Ten raw/warm cases and two hybrid fits; 17,900 numerical leaves | `4041b281a0e16ddbb3405e6a11d367d5080ebdf21b40b68527d39fe56ab96bbd` |
+| CNA-positive hybrid | Four fits; public labels/refit CCFs, score uncertainty, posteriors, CNA-only F1, qualification and four TSVs | `52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4` |
+
+Proposal captures contain nine pilot candidates in each dtype, nine final-Phi
+candidates in float32, and ten in float64; both Ward and distinct Ward+CEM
+partitions are exercised. CNA-positive fits each contain eight positive-depth
+`major_cn != minor_cn` rows. These small fixtures establish parity, not cohort
+accuracy or a new F1 performance estimate. Graph/objective identities, selected
+basins, certificates, and reporting remain equal in the paired captures.
+
+A larger state-lifetime probe uses real `fit_prepared` orchestration with a
+mocked numerical solve: 256 mutations, 3 regions, 32,640 complete-graph edges,
+and 783,360 bytes per unique float64 dual buffer shared by state and witness.
+At 4/12/32 starts, the reference retains 4/12/32 such buffers at peak; the new
+low-level fit and isolated diagnostic-projection probes each peak at two
+(incumbent plus current), with one winner remaining afterward. At 32 starts
+this is **25,067,520 → 1,566,720 bytes**, a 93.75% reduction in that measured
+storage component. Attempt order, tied winner, and identities match. Separate
+search tests preserve incumbent, recovery, and historical selected states.
+These are weak-reference live-buffer measurements, not RSS, end-to-end solver
+memory, production GPU VRAM, or runtime speedup measurements.
+
+The canonical inference inventory decreases **37 → 34 modules** and
+**767,700 → 725,861 source bytes** (41,839 fewer bytes; 5.45%). AST counts are
+364 → 343 top-level functions, 128 → 120 methods, and 29 → 25 nested functions.
+The README now focuses on usage and supported behavior; dated qualification
+history is preserved in this document rather than deleted.
+
+CUDA and representative cohort/release-panel qualification remain pending.
+No scheduler jobs were launched: the external LSF project runbook is absent,
+and the worktree is not yet an immutable committed run source under the
+`clipp2-run` contract. No objective or certificate threshold was relaxed to
+obtain the CPU parity results.
+
+## Precision and memory contraction (first pass) — 2026-09-09
+
+The reference is `bb726ad3fb3737cca48e06cce66943d5fbba52b4`. This pass narrows
+precision support, retains only the best completed multistart fit/context,
+omits clipped-slope tensors and masks from likelihood-only grids, and removes
+the intermediate `TorchTumorData` wrapper. `PreparedProblem` owns immutable
+source and working models, epsilon, and objective identity directly. Promotion
+and terminal auditing still rebuild from float64 sources; ordinary runtime
+mutations still fail identity checks. No compatibility wrapper remains.
+
+Scoring has one BIC primitive, one Dirichlet mass/uncertainty primitive, and one
+final `fixed_partition_dirichlet_score` constructor. Plain-BIC/duplicate numeric
+score interfaces are retired, not the BIC contribution. Configuration owns the
+unchanged `alpha=1` and assignment weight `0.7`; the score retains nominal
+`K*S` degrees of freedom and the positive-depth observed-row count convention.
+Score arithmetic uncertainty
+and ranking boundaries are preserved, as are the graph, likelihood, scalar
+refit modes, raw admission gate, output schemas, and reporting validation.
+
+Validation in `ml1` includes the isolated installed wheel, precision endpoint
+and padded-candidate regressions, exact score/uncertainty goldens, and weakref
+state-lifetime checks. With 4 or 32 starts, only the incumbent completed-start
+dual remains before each next solve. Composite compressed/dense/CPU-fallback
+tests also check discarded traceback storage and exact winner-context polishing.
+These are CPU lifetime checks, not measured production GPU VRAM.
+The full suite passes **508 tests**; Ruff and `git diff --check` also pass.
+
+Pinned float32/float64 CPU comparisons cover ten raw/warm cases and six hybrid
+fits: 8–24 mutations, 1/3 regions, CN1–6, balanced CN6, LOH, purity variation,
+missing observations, and zero depth. Inputs, priors, pilots, graph/objective
+identities, raw results/certificates, selected labels, fixed-refit CCFs, score
+uncertainties, posteriors, qualification, and four TSVs match exactly. Four
+CNA-positive hybrid fits each have eight `major_cn != minor_cn` positive-depth
+rows; their public-refit CNA-only multiplicity F1 also matches. Capture hashes:
+
+- Broader raw/warm and two hybrid checks:
+  `4041b281a0e16ddbb3405e6a11d367d5080ebdf21b40b68527d39fe56ab96bbd`.
+- Four CNA-positive hybrid checks:
+  `52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4`.
+
+For a `128 × 3 × 257 × 6` likelihood grid, CPU dispatch-visible peak live
+intermediate storage decreases **14,213,376 → 11,844,864 bytes** in float32 and
+**28,424,448 → 23,687,424 bytes** in float64 (about 16.7%); loss arrays match
+byte-for-byte. This excludes input storage and opaque operator workspaces and
+is not an end-to-end runtime or CUDA memory measurement.
+
+Inference source remains **37 modules**, decreasing **767,700 → 752,294 bytes**
+(15,406 fewer bytes, 2.01%). AST definition counts decrease from 364 to 350
+top-level functions, 128 to 119 methods, and 29 to 28 nested functions. The
+reachability audit removes export-only legacy helpers and test-only forwarding
+wrappers after migrating their tests, not public import hooks, documented
+writers, or reachable sparse/dense/resource fallbacks. Source accounting
+excludes setup, tests, tools, and documentation, as in the reference measure.
+
+These remain bounded synthetic CPU parity checks, not cohort accuracy or CUDA
+qualification. Some raw smoke fits remain identically uncertified under their
+small budgets; all six hybrid checks have admitted positive-lambda references.
+LSF qualification is pending: the external project runbook is currently absent
+and surviving historical runners expect obsolete v0.4 interfaces. Do not use
+them unchanged or treat these local results as a production release gate.
+Version stays **0.5.0**; no output or numerical identity schema is changed.
+
+## Integrity qualification (`bb726ad`) — 2026-09-09
+
+Following the review of `5ca5a1914cffc929949c4d1e22b44432a99c3b9f`, this pass
+closes writable-result, mismatched-reporting-input, and selected/raw-reference
+summary gaps. It also removes duplicated prepared bounds/hashes and solver
+argument forwarding, consolidates preparation/retry configuration, freezes data
+once, removes the stored multiplicity specification, and shares NumPy/Torch
+candidate arithmetic across scalar, observed, grid, and EM evaluation. The
+statistical reductions remain separate. Likelihood-only grids do not compute
+posterior derivatives, and warm continuations no longer allocate discarded
+copies of their primals. No graph backend or hybrid candidate family is removed.
+
+A pinned comparison captured five tiny CPU-float64 fixtures (CN1, CN2, CN6,
+equal CN6, and an independently generated two-region count fixture). The
+captured numerical records match **byte for byte**: retained numerical inputs,
+candidate support/priors, initialization, pilot, graph weights/hashes, objective
+keys, loss/gradient/curvature, raw and warm CCFs/objectives, certificates/stop
+reasons, and three hybrid selections' labels/refit CCFs/scores/posteriors/four
+TSVs. The two-region fixture's CNA-only multiplicity macro/micro-F1 also matches
+(10 eligible rows; a parity check, not a cohort accuracy estimate). Capture
+SHA-256: `ce8e7fc88e46e00cbacd9161ad3ecf0eb3133f96029e09741092c84891e5748d`.
+These checks do not establish bitwise equivalence on other inputs or devices.
+
+In `ml1`, **437 tests passed** in 26.37 seconds, including the isolated installed
+wheel and new result/reporting/copy-integrity regressions. Ruff and
+`git diff --check` passed. Validation command:
+
+```bash
+env -u PYTHONPATH PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  conda run -n ml1 python -m pytest -q -p no:cacheprovider
+```
+
+Inference source remains 37 Python files and decreases from **772,924 to
+767,700 bytes** (5,224 fewer bytes, about 0.7%), excluding setup, tests, tools,
+and documentation. The principal simplification is fewer independently stored
+quantities and forwarding paths, not fewer module files; new integrity checks
+and regression tests are retained.
+
+Retained-input fingerprint schema changes from v2 to **v3** because the stored
+candidate specification is gone; numerical model, likelihood, box, graph, and
+objective-key schemas remain unchanged. Do not reuse cross-revision input
+caches or identity-free saved results. Package version remains **0.5.0**, with
+no new release tag. CUDA and representative cohort qualification are pending.
+
+## Correction qualification (`5ca5a19`) — 2026-09-09
+
+The correction-only patch following `1a0893d` addresses clipped-likelihood
+global certification, explicit warm/start pairing, portable source hashing,
+and manifest numerical qualification. The supplied two-mutation plateau
+counterexample reproduced at lambdas 0, 0.1, and 100: objective **276.310391**
+was falsely marked global despite a feasible objective of **65.016595**.
+The corrected path compares the scalar pilot and reaches the better point,
+without claiming whole-box global optimality. Tests cover CPU float32 and
+float64, both solver routes, clipping endpoints, warm-only calls, and separate
+warm/explicit starts. The objective, clipping, box, graph, and gate are unchanged.
+
+In `ml1`, **350 tests passed** in 26.86 seconds, including the existing reference
+pipeline checks, independent numerical formulas, portable-path hash checks,
+and isolated installed-wheel CPU fit. Ruff and `git diff --check` passed.
+Native Windows execution and production CUDA were not tested in this patch.
+
+At this reference commit the prepared-state, data-ownership, and arithmetic
+contractions remained separate work. Its corrections alone made no
+benchmark-accuracy claim.
+
+## Release 0.5.0 qualification (`1a0893d`) — 2026-09-09
+
+In `ml1` (Python 3.13.2, NumPy 2.2.6, SciPy 1.18.0, Torch 2.9.1), all
+**277 checked-in tests passed**, including the isolated wheel fit. Ruff and
+`git diff --check` passed. The untouched reference passed its 152 regressions.
+
+Paired CPU-float64 checks against
+`cc5a3d1ac28097c2b3005c1c2615930f0ab424de` covered four tiny CN1/CN2/CN6
+fixtures. Selected labels, refitted CCFs, Dirichlet scores, multiplicity
+posteriors, four TSV schemas, and fixed-lambda objectives matched exactly.
+Maximum raw-CCF difference was `3.8e-15`. Kernel, scalar-bound, initialization,
+and pipeline reference values are preserved in the tests.
+
+This is numerical equivalence, **not bitwise search equivalence**: generalized
+initialization changed pilots by up to `4.2e-13` and adaptive weights by up to
+`5.35e-12` in the paired probes. An adaptive graph hash and one recovery trace
+changed. New fingerprint schemas invalidate old caches; within-run graph and
+objective identities remain strict. CUDA/cohort qualification is pending.
+
+Inference Python source decreased from 45 modules / 860,280 bytes to 36 modules /
+759,123 bytes (about 12% fewer bytes). Moving the simulator also removes its
+eight modules from the wheel; restoring tests intentionally increases the
+maintained repository's test coverage rather than minimizing its file count.

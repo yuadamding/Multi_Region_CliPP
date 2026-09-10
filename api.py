@@ -9,7 +9,7 @@ import torch
 
 from .config import FitConfig, resolve_fit_config
 from .io.data import TumorData
-from .io.multiplicity import MAX_MAJOR_CN
+from .config import MAX_MAJOR_CN
 from .io.tumor_txt import CN_FILTER_POLICY_ID, NoEligibleSNVsError, load_tumor_txt
 from .core.fusion.solver import (
     fit_prepared, prepare_torch_problem_with_resource_policy,

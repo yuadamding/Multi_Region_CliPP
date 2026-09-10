@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from CliPP2.core.fusion.multiplicity import infer_integer_multiplicity_posterior_numpy
+from CliPP2.core.objective import infer_integer_multiplicity_posterior_numpy
 from CliPP2.core.objective import compile_observed_model, observed_terms_numpy, make_base_objective_key, make_lambda_objective_key
 from CliPP2.core.fusion.types import (
     RawFit, ObjectiveValue, KKTComponents, CertificateResult, ConvergenceResult,

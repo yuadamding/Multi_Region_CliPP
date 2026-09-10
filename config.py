@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
+import struct
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
 DenseFallbackPolicy: TypeAlias = Literal["device_only", "cpu_allowed", "error"]
+
+# Fixed model identifiers shared by input, inference, reporting and simulation.
+CLONAL_INTEGER_MODEL_ID = "clipp2_clonal_integer_multiplicity_mixture_v1"
+CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_major_cap6_v1"
+CLONAL_INTEGER_PRIOR_MODE = "uniform_distinct_integer_v1"
+MAX_MAJOR_CN = 6
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"
@@ -22,6 +30,34 @@ DEFAULT_WORKSET_MAX_EXPANSIONS: Final = 16
 DEFAULT_CERTIFICATE_MAX_ITER: Final = 512
 DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS: Final = 2
 DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE: Final = 1.0
+
+
+def normalize_runtime_dtype(value: str | None) -> str:
+    dtype = "auto" if value is None else str(value).strip().lower()
+    if dtype == "auto":
+        dtype = DEFAULT_DTYPE
+    if dtype not in ("float32", "float64"):
+        raise ValueError("Runtime dtype must be float32 or float64; float16 is unsupported.")
+    return dtype
+
+
+@lru_cache(maxsize=64)
+def validate_likelihood_precision(eps: float, dtype: str = "float64") -> float:
+    """Reject unrepresentable clipping endpoints without changing the objective."""
+    epsilon = float(eps)
+    if not math.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    name = normalize_runtime_dtype(dtype)
+    lower, upper = epsilon, 1.0 - epsilon
+    if name == "float32":
+        lower, upper = struct.unpack("=ff", struct.pack("=ff", lower, upper))
+    if not 0.0 < lower < upper < 1.0:
+        raise ValueError(
+            f"eps={epsilon:g} is incompatible with {name}: clipping endpoints "
+            "must remain strictly inside (0, 1). Choose a representable eps "
+            "or use float64 before model preparation; epsilon is never adjusted."
+        )
+    return epsilon
 
 
 def normalize_dense_fallback_policy(value: str) -> DenseFallbackPolicy:
@@ -67,12 +103,6 @@ class ComputationProfile:
     @property
     def is_strict(self) -> bool:
         return self.name == "strict"
-
-    @property
-    def objective_equivalent_to_strict(self) -> bool:
-        # Pilot precision and numerical stopping differ across profiles; do not
-        # claim cross-profile frozen-graph equality without comparing hashes.
-        return self.is_strict
 
 STRICT_PROFILE: Final = ComputationProfile(
     name="strict",
@@ -186,6 +216,7 @@ class RuntimeConfig:
     verbose: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "dtype", normalize_runtime_dtype(self.dtype))
         object.__setattr__(self, "fallback", normalize_dense_fallback_policy(self.fallback))
 
 
@@ -312,7 +343,7 @@ class FitConfig:
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.lambda_value)) or float(self.lambda_value) < 0.0:
             raise ValueError("lambda_value must be finite and nonnegative.")
-        _positive("eps", self.eps)
+        validate_likelihood_precision(self.eps, self.runtime.dtype)
 
 
 def resolve_fit_config(

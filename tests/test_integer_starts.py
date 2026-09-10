@@ -12,7 +12,7 @@ from CliPP2.core.fusion.solver import (
     objective_shape_for_data,
     prepare_torch_problem,
     promote_solver_context_dtype,
-    uses_nonconvex_observed_likelihood,
+    has_multiplicity_ambiguity,
 )
 from CliPP2.core.fusion.torch_backend import resolve_runtime, to_torch_tumor_data
 from CliPP2.core.objective import compile_observed_model, observed_terms_torch
@@ -28,9 +28,9 @@ from test_integer_likelihood import EPS, integer_data
 def test_singleton_is_fixed_and_multiple_candidates_route_nonconvex():
     fixed = integer_data(((1,),))
     mixture = integer_data(((6,),))
-    assert not uses_nonconvex_observed_likelihood(fixed)
+    assert not has_multiplicity_ambiguity(fixed)
     assert objective_shape_for_data(fixed, "auto") == "unimodal"
-    assert uses_nonconvex_observed_likelihood(mixture)
+    assert has_multiplicity_ambiguity(mixture)
     assert objective_shape_for_data(mixture, "unimodal") == "generic_nonconvex"
 
 

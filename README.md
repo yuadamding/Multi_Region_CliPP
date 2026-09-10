@@ -49,6 +49,11 @@ and Ward/CEM proposals and the existing Dirichlet-augmented fixed-partition scor
 (`alpha=1`, assignment weight `0.7`). The fusion objective, fixed-label output
 meaning, and KKT gate are unchanged. Balanced admission remains `5*tol = 0.004`;
 approximate refits and bounded unresolved searches are not global certificates.
+Singleton multiplicity is not a convexity proof: probability clipping can
+introduce nonconvex transitions. A raw global-optimum flag requires a separate
+conservative proof over the actual source emissions, counts, and feasible box,
+in addition to KKT admission. Failure of that sufficient proof means unproven,
+not necessarily nonconvex.
 
 Release 0.5.0 retires binary/occupancy likelihood families and their options:
 `--major-prior`, `--dosage-prior-penalty`, `--unsupported-policy`,
@@ -75,6 +80,13 @@ float64 sources, not rounded working tensors. Loaded scaling, bounds, and the
 deterministic initialization remain immutable and coherence-checked to preserve
 pilot conventions; the compiled likelihood is cached per dataset/epsilon.
 
+`fit_prepared(..., warm_state=previous_fit.state, include_default_starts=False)`
+registers a warm-only continuation. If `phi_start` is also supplied, it is a
+separate cold attempt, not an override of the warm primal. Disabling defaults
+without either start is a configuration error. A singleton start on a clipping
+plateau with feasible downhill likelihood also retains the existing scalar
+pilot, even with defaults disabled; that comparison is not a global proof.
+
 ## Outputs and integrity
 
 The tumor ID is the input stem unless `##tumor_id` overrides it. A successful
@@ -86,7 +98,7 @@ run publishes four TSVs plus one manifest:
 | `cluster_centers.tsv` | Selected cluster sizes and refitted regional CCFs |
 | `mutation_region_multiplicity.tsv` | Retained mutation × region CCF, CN, integer MAP call and conditional probabilities |
 | `excluded_mutations.tsv` | Original mutation × sample × exclusion reason |
-| `run_manifest.json` | Status, unique run ID, version/source identity, input/configuration/output hashes |
+| `run_manifest.json` | Publication status, numerical qualification, run/source identity, input/configuration/output hashes |
 
 Integer columns include `multiplicity_candidates`, `multiplicity_candidate_count`,
 nullable `multiplicity_call`, `multiplicity_call_probability`,
@@ -101,6 +113,18 @@ without clobbering; only after every file hash verifies is the manifest marked
 `complete`. Consumers must check that status and the hashes, not merely the
 presence of TSVs. Wheels retain hash-validated build provenance; unavailable
 Git revision information is recorded as unavailable, never inferred.
+Build and runtime use one dependency-free source inventory and hashing helper,
+with case-sensitive, UTF-8 POSIX-relative filenames on every platform.
+
+The manifest's `analysis` section separately records raw-reference KKT admission
+and global status, selected-partition identity, fixed-label refit qualification,
+and bounded-search status, including objective/graph/CCF hashes. A direct
+Ward/CEM selection has no `selected_raw_fit` and does not inherit raw KKT
+certification. Standalone fit writing records search status as `not_provided`;
+unavailable facts are null. `analysis` is null before a qualified fit is ready;
+it can remain available after a later publication failure. Publication
+`status="complete"` never means global or resolved inference. Older manifests
+without `analysis` provide no persisted numerical qualification.
 
 ## Matched simulation
 
@@ -155,7 +179,28 @@ conventions, refits, scores, and integer posteriors require paired validation.
 CUDA and representative cohort/release-panel qualification remain necessary;
 passing CPU tests alone is not evidence of improved benchmark accuracy.
 
-### Local qualification — 2026-09-09
+### Unreleased corrections to 0.5.0 — 2026-09-09
+
+The correction-only patch following `1a0893d` addresses clipped-likelihood
+global certification, explicit warm/start pairing, portable source hashing,
+and manifest numerical qualification. The supplied two-mutation plateau
+counterexample reproduced at lambdas 0, 0.1, and 100: objective **276.310391**
+was falsely marked global despite a feasible objective of **65.016595**.
+The corrected path compares the scalar pilot and reaches the better point,
+without claiming whole-box global optimality. Tests cover CPU float32 and
+float64, both solver routes, clipping endpoints, warm-only calls, and separate
+warm/explicit starts. The objective, clipping, box, graph, and gate are unchanged.
+
+In `ml1`, **350 tests passed** in 26.86 seconds, including the existing reference
+pipeline checks, independent numerical formulas, portable-path hash checks,
+and isolated installed-wheel CPU fit. Ruff and `git diff --check` passed.
+Native Windows execution and production CUDA were not tested in this patch.
+
+The larger prepared-state, data-ownership, and arithmetic/policy contractions
+(review items P1–P7) remain separate work. CUDA and cohort qualification are
+still pending; these corrections alone make no benchmark-accuracy claim.
+
+### Release 0.5.0 qualification (`1a0893d`) — 2026-09-09
 
 In `ml1` (Python 3.13.2, NumPy 2.2.6, SciPy 1.18.0, Torch 2.9.1), all
 **277 checked-in tests passed**, including the isolated wheel fit. Ruff and

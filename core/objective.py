@@ -258,6 +258,56 @@ class ObservedModel:
         return tuple(int(value) for value in self.slope.shape)
 
 
+def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) -> bool:
+    """Conservative convexity/endpoint-gradient qualification on the actual box.
+
+    A singleton binomial emission is convex between clipping transitions, but
+    its derivative can jump downward when a flat clipped region ends or
+    begins. At the lower threshold its right derivative must be nonnegative;
+    at the upper threshold its left derivative must be nonpositive. Include
+    transitions touching the feasible endpoints: the kernel's zero derivative
+    on the flat side cannot otherwise support a global KKT claim there.
+
+    Unobserved, zero-depth and fixed-coordinate losses are constant. Other
+    multi-candidate mixtures have no convexity proof here. False means this
+    sufficient test did not qualify the loss, not necessarily nonconvexity.
+    """
+    if not isinstance(model, ObservedModel):
+        return False
+    epsilon = float(eps)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        return False
+    active = model.observed & ((model.alt > 0.0) | (model.nonalt > 0.0))
+    active &= model.lower < model.upper
+    if np.any(active & (np.sum(model.valid, axis=-1) != 1)):
+        return False
+    slope = np.max(np.where(model.valid, model.slope, 0.0), axis=-1)
+    mass_lower = slope * model.lower
+    mass_upper = slope * model.upper
+    upper_clip = 1.0 - epsilon
+    # Entirely clipped intervals, including their flat-side endpoint, are
+    # constant. Zero slope likewise cannot introduce a clipping transition.
+    moving = active & (slope > 0.0) & (mass_upper > epsilon) & (mass_lower < upper_clip)
+    lower_transition = moving & (mass_lower <= np.nextafter(epsilon, np.inf))
+    upper_transition = moving & (mass_upper >= np.nextafter(upper_clip, -np.inf))
+
+    # Cross products avoid dividing by a tiny clipping probability or summing
+    # very large counts. Outward-rounded comparisons decline near-zero signs;
+    # the exact zero-alt/all-alt sufficient cases remain available.
+    lower_jump_nonnegative = (model.alt == 0.0) | (
+        np.nextafter(model.nonalt * epsilon, -np.inf)
+        >= np.nextafter(model.alt * upper_clip, np.inf)
+    )
+    upper_jump_nonnegative = (model.nonalt == 0.0) | (
+        np.nextafter(model.alt * (1.0 - upper_clip), -np.inf)
+        >= np.nextafter(model.nonalt * upper_clip, np.inf)
+    )
+    return not bool(np.any(
+        (lower_transition & ~lower_jump_nonnegative)
+        | (upper_transition & ~upper_jump_nonnegative)
+    ))
+
+
 @dataclass(frozen=True, slots=True)
 class TorchObservedModel:
     """Runtime view rebuilt directly from an :class:`ObservedModel`."""
@@ -829,6 +879,7 @@ __all__ = [
     "TorchObservedModel",
     "TorchObservedTerms",
     "compile_observed_model",
+    "has_proven_convex_observed_loss",
     "make_base_objective_key",
     "make_lambda_objective_key",
     "model_to_torch",

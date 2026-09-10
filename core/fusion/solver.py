@@ -14,6 +14,7 @@ from ..scalar import ScalarGlobalMinimumCertificate
 from ..objective import (
     BaseObjectiveKey,
     compile_observed_model,
+    has_proven_convex_observed_loss,
     make_base_objective_key,
     make_lambda_objective_key,
     model_to_torch,
@@ -251,25 +252,66 @@ def _terminal_backward_error_audit_float64(
     )
 
 
-def _deduplicate_starts(
-    starts: list[np.ndarray | torch.Tensor],
+@dataclass(frozen=True, slots=True)
+class _StartAttempt:
+    phi: np.ndarray | torch.Tensor
+    warm_state: SolverState | None
+    source: str
+
+
+def _deduplicate_start_attempts(
+    attempts: list[_StartAttempt],
     *,
     runtime,
+    shape: tuple[int, ...],
     atol: float = 1e-8,
-) -> list[np.ndarray | torch.Tensor]:
-    unique: list[np.ndarray | torch.Tensor] = []
+) -> list[_StartAttempt]:
+    unique: list[_StartAttempt] = []
     unique_tensors: list[torch.Tensor] = []
-    for start in starts:
-        start_tensor = as_runtime_tensor(start, runtime).detach()
+    for attempt in attempts:
+        start_tensor = as_runtime_tensor(attempt.phi, runtime).detach()
+        if tuple(start_tensor.shape) != shape or not bool(torch.isfinite(start_tensor).all()):
+            raise ValueError(f"Invalid {attempt.source} start: expected finite CCFs with shape {shape}.")
         duplicate = any(
-            torch.allclose(start_tensor, retained, rtol=0.0, atol=float(atol))
-            for retained in unique_tensors
+            attempt.warm_state is previous.warm_state
+            and torch.allclose(start_tensor, retained, rtol=0.0, atol=float(atol))
+            for previous, retained in zip(unique, unique_tensors)
         )
         if duplicate:
             continue
         unique_tensors.append(start_tensor)
-        unique.append(start)
+        unique.append(attempt)
     return unique
+
+
+def _clipped_singleton_start_needs_pilot(
+    problem: PreparedProblem, start: np.ndarray | torch.Tensor,
+) -> bool:
+    """Detect a flat clipping start with feasible downhill likelihood beyond it."""
+    model = problem.problem.source_model
+    if model is None:
+        raise ValueError("PreparedProblem lacks an immutable observed-model source.")
+    working_phi = as_runtime_tensor(start, problem.runtime).detach()
+    working_phi = torch.minimum(torch.maximum(working_phi, problem.lower), problem.upper)
+    working_mass = problem.problem.observed_model.slope[..., 0] * working_phi
+    phi = working_phi.cpu().numpy()
+    phi = np.clip(phi, model.lower, model.upper)
+    slope = model.slope[..., 0]
+    mass = slope * phi
+    eps = float(problem.problem.eps)
+    upper_clip = 1.0 - eps
+    active = model.observed & ((model.alt > 0) | (model.nonalt > 0))
+    active &= np.sum(model.valid, axis=-1) == 1
+    # Rounded working slopes can land on a clipping plateau even when the
+    # float64 source mass is just outside it. Compare both views; only starts
+    # are added, never a shifted clipping threshold or a different objective.
+    lower_clipped = (mass <= eps) | (working_mass <= eps).cpu().numpy()
+    upper_clipped = (mass >= upper_clip) | (working_mass >= upper_clip).cpu().numpy()
+    lower_escape = (lower_clipped & (slope * model.upper > eps)
+                    & (model.alt * (1.0 - eps) > eps * model.nonalt))
+    upper_escape = (upper_clipped & (slope * model.lower < upper_clip)
+                    & (model.nonalt * upper_clip > (1.0 - upper_clip) * model.alt))
+    return bool(np.any(active & (lower_escape | upper_escape)))
 
 
 def _inner_model_value_torch(
@@ -328,25 +370,27 @@ _MISSING_SURROGATE_CURVATURE = 1e-6
 _OUTER_KKT_CHECK_EVERY = 4
 _PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
-_CONVEX_GLOBAL_OPTIMALITY_BASIS = "convex_fixed_linear_objective_plus_kkt"
+_CONVEX_GLOBAL_OPTIMALITY_BASIS = "convex_clipped_singleton_objective_plus_kkt_v1"
 OBJECTIVE_SHAPE_AUTO = "auto"
 INTEGER_MIXTURE_OBJECTIVE_SHAPE = "generic_nonconvex"
 
 
-def uses_nonconvex_observed_likelihood(data: TumorData) -> bool:
-    """Only a fixed single-candidate linear binomial loss has convex KKT authority."""
+def has_multiplicity_ambiguity(data: TumorData) -> bool:
+    """Structural candidate ambiguity, not a convexity assertion."""
     return bool(np.any(np.asarray(data.major_cn) > 1))
 
 
 def objective_shape_for_data(data: TumorData, requested: str) -> str:
-    """Return the only solver shape declaration valid for this likelihood.
+    """Choose the numerical update route, independently of convexity proof.
 
     Competing integer emissions can be multimodal and use the generic route.
-    Only structurally singleton emissions are eligible for the convex route.
+    Singleton emissions keep their scalar update route, but clipping can still
+    make their loss nonconvex. Only the frozen-model proof authorizes a global
+    certificate; a requested shape cannot authorize one.
     """
 
     normalized = _normalize_objective_shape(requested)
-    if uses_nonconvex_observed_likelihood(data):
+    if has_multiplicity_ambiguity(data):
         return INTEGER_MIXTURE_OBJECTIVE_SHAPE
     return "unimodal" if normalized == OBJECTIVE_SHAPE_AUTO else normalized
 
@@ -2482,8 +2526,8 @@ def _fit_from_start(
     )
     global_optimality_certified = bool(
         selection_eligible
-        and use_unimodal_objective
-        and not uses_nonconvex_observed_likelihood(data)
+        and torch_data.source_model is not None
+        and has_proven_convex_observed_loss(torch_data.source_model, eps=eps)
     )
     global_optimality_basis = (
         _CONVEX_GLOBAL_OPTIMALITY_BASIS
@@ -2636,7 +2680,6 @@ def fit_prepared(
     solver_context = problem
     data = problem.source_data
     eps = float(problem.problem.eps)
-    solver_state = warm_state
     tol = _validate_solver_tolerance(solver_options.tolerance)
     certification_tol = _validate_solver_tolerance(
         tol if solver_options.certification_tolerance is None
@@ -2664,16 +2707,34 @@ def fit_prepared(
     effective_pooled_start = problem.pooled_start
     effective_scalar_well_starts = problem.scalar_well_starts
 
-    if objective_shape.startswith("unimodal"):
-        start_bank = [phi_start] if phi_start is not None else [effective_exact_pilot]
-    else:
-        start_bank: list[np.ndarray | torch.Tensor] = []
-        if phi_start is not None:
-            start_bank.append(phi_start)
-        if include_default_starts:
-            start_bank.extend(effective_scalar_well_starts)
-            start_bank.append(effective_pooled_start)
-    start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
+    attempts: list[_StartAttempt] = []
+    if warm_state is not None:
+        attempts.append(_StartAttempt(warm_state.phi, warm_state, "warm"))
+    if phi_start is not None:
+        attempts.append(_StartAttempt(phi_start, None, "explicit"))
+    if not attempts and not include_default_starts:
+        raise ValueError("No start supplied: provide warm_state or phi_start, or enable default starts.")
+    singleton_route = objective_shape.startswith("unimodal")
+    if include_default_starts:
+        if singleton_route:
+            if not attempts:
+                attempts.append(_StartAttempt(effective_exact_pilot, None, "scalar_pilot"))
+        else:
+            attempts.extend(_StartAttempt(start, None, "scalar_well")
+                            for start in effective_scalar_well_starts)
+            attempts.append(_StartAttempt(effective_pooled_start, None, "pooled"))
+    attempts = _deduplicate_start_attempts(
+        attempts, runtime=effective_runtime, shape=tuple(problem.lower.shape),
+    )
+    if not has_multiplicity_ambiguity(data) and any(
+        _clipped_singleton_start_needs_pilot(problem, item.phi) for item in attempts
+    ):
+        # This mandatory safeguard compares feasible points of the same frozen
+        # objective. It does not move the box or turn local KKT into a global proof.
+        attempts = _deduplicate_start_attempts(
+            [*attempts, _StartAttempt(effective_exact_pilot, None, "clipping_escape_pilot")],
+            runtime=effective_runtime, shape=tuple(problem.lower.shape), atol=0.0,
+        )
 
     def solve_start_once(
         *,
@@ -2722,13 +2783,9 @@ def fit_prepared(
     best_artifacts_index = -1
     start_artifacts: list[RawFit] = []
     start_contexts: list[PreparedProblem] = []
-    for start in start_bank:
-        state_for_start = (
-            solver_state
-            if (solver_state is not None and start is start_bank[0])
-            else None
-        )
-        cpu_seed = state_for_start.phi if state_for_start is not None else start
+    for start_attempt in attempts:
+        start, state_for_start = start_attempt.phi, start_attempt.warm_state
+        cpu_seed = start
         attempted_artifacts: RawFit | None = None
         attempt_context = solver_context
         attempt_start = start

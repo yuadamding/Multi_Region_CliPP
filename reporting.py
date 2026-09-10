@@ -18,6 +18,7 @@ from .core.fusion.multiplicity import (
     infer_integer_multiplicity_posterior_numpy,
 )
 from ._version import __version__
+from ._source import source_fingerprint
 from .config import FitConfig
 from .core.fusion.types import RawFit
 from .io.data import CNFilterReport, TumorData
@@ -56,13 +57,7 @@ def _json_bytes(value: object) -> bytes:
 def _source_identity() -> dict[str, object]:
     """Hash installed Python sources; never mistake an enclosing repo for ours."""
     root = Path(__file__).resolve().parent
-    source = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        relative = path.relative_to(root)
-        if relative.name == "setup.py" or any(part in {"tests", "tools", "build", "__pycache__", ".git"} for part in relative.parts):
-            continue
-        source.update(str(relative).encode() + b"\0")
-        source.update(bytes.fromhex(_file_hash(path)))
+    source_hash = source_fingerprint(root)
     commit = dirty = None
     if (root / ".git").exists():
         try:
@@ -85,14 +80,14 @@ def _source_identity() -> dict[str, object]:
                 raise ValueError("Build source identity must be a JSON object.")
             revision = built.get("commit")
             if (built.get("schema_version") == 1
-                and built.get("python_source_sha256") == source.hexdigest()
+                and built.get("python_source_sha256") == source_hash
                 and isinstance(revision, str) and len(revision) == 40
                 and all(character in "0123456789abcdef" for character in revision)
                 and isinstance(built.get("dirty"), bool)):
                 commit, dirty = revision, built["dirty"]
         except (OSError, ValueError, TypeError):
             pass
-    return {"commit": commit, "dirty": dirty, "python_source_sha256": source.hexdigest()}
+    return {"commit": commit, "dirty": dirty, "python_source_sha256": source_hash}
 
 
 class RunPublication:
@@ -141,7 +136,7 @@ class RunPublication:
             },
             "config": config, "config_sha256": None if config is None else hashlib.sha256(_json_bytes(config)).hexdigest(),
             "workflow": workflow, "workflow_sha256": hashlib.sha256(_json_bytes(workflow)).hexdigest(),
-            "files": {},
+            "files": {}, "analysis": None,
         }
         # The manifest is also the exclusive claim: two concurrent starts
         # cannot both acquire the same namespace after their directory check.
@@ -186,9 +181,13 @@ class RunPublication:
             # The previous running manifest still cannot be read as complete.
             warnings.warn(f"Could not persist failed run status: {manifest_error}", RuntimeWarning)
 
-    def publish(self, tables: dict[str, pd.DataFrame]) -> None:
+    def publish(self, tables: dict[str, pd.DataFrame], *, analysis: dict[str, object] | None = None) -> None:
         if {f"{suffix}.tsv" for suffix in tables} != set(OUTPUT_SUFFIXES[:-1]):
             raise ValueError("Publication requires all four analysis tables.")
+        # Qualification is supplied only after identity-valid table generation.
+        # It describes the fit even if file publication subsequently fails.
+        _json_bytes(analysis)
+        self.record["analysis"] = analysis
         with tempfile.TemporaryDirectory(dir=self.outdir, prefix=".clipp2-tables-") as staging:
             paths = []
             for suffix, table in tables.items():
@@ -443,6 +442,7 @@ def write_fit_outputs(
 def _write_fit_tables(
     data: TumorData, raw_fit: RawFit, partition: SelectedPartition,
     refit: PartitionRefitSummary, eps: float | None, publication: RunPublication,
+    *, selection_result: BICSelectionResult | None = None,
 ) -> None:
     tables = {
         "mutation_clusters": mutation_output_table(data, raw_fit, partition, refit),
@@ -458,7 +458,9 @@ def _write_fit_tables(
             data.tumor_id, data.cn_filter_report
         ),
     }
-    publication.publish(tables)
+    publication.publish(tables, analysis=_manifest_qualification(
+        raw_fit, partition, refit, selection_result=selection_result,
+    ))
 
 
 SUMMARY_SCHEMA_VERSION = 4
@@ -493,6 +495,97 @@ def _array_fingerprint(values: np.ndarray, *, dtype: np.dtype) -> str:
     digest.update(array.dtype.str.encode("ascii"))
     digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
+
+
+def _finite_number(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
+
+
+def _raw_qualification(fit: RawFit) -> dict[str, object] | None:
+    """Persist raw evidence; missing typed evidence is explicitly unknown."""
+    if not isinstance(fit, RawFit):
+        return None
+    certificate, provenance = fit.certificate, fit.provenance
+    return {
+        "kkt_certified": bool(certificate.certified),
+        "admissible": bool(certificate.admissible),
+        "global_optimum_certified": bool(certificate.global_optimum),
+        "global_optimality_basis": str(provenance.global_optimality_basis),
+        "certificate_status": str(certificate.status),
+        "certificate_schema_version": int(certificate.schema_version),
+        "kkt_residual": _finite_number(certificate.components.residual),
+        "kkt_tolerance": _finite_number(certificate.tolerance),
+        "residual_method": str(certificate.residual_method),
+        "audit_dtype": str(certificate.audit_dtype),
+        "objective": _finite_number(fit.objective.total),
+        "lambda": _finite_number(provenance.lambda_value),
+        "objective_hash": str(provenance.certificate_problem_hash),
+        "base_objective_hash": str(provenance.base_fusion_objective_hash),
+        "graph_hash": str(provenance.original_graph_hash),
+        "phi_hash": _array_fingerprint(fit.phi, dtype=np.dtype(np.float64)),
+    }
+
+
+def _manifest_qualification(
+    raw_fit: RawFit,
+    partition: SelectedPartition,
+    refit: PartitionRefitSummary,
+    *, selection_result: BICSelectionResult | None,
+) -> dict[str, object]:
+    """Keep publication, raw admission, fixed-label refit, and search distinct."""
+    _validate_identity(raw_fit, partition, refit)
+    selected_raw = raw_fit if isinstance(partition, FusionPartition) else None
+    selected_score = None
+    if selection_result is not None:
+        from .model_selection.candidates import validate_candidate_identity
+
+        selected = selection_result.selected_model.partition_candidate
+        reference = selection_result.selected_model.raw_reference
+        validate_candidate_identity(selected)
+        validate_candidate_identity(reference)
+        if selected.partition is not partition or selected.refit is not refit or reference.raw_fit is not raw_fit:
+            raise ValueError("Manifest qualification does not match the serialized selection.")
+        selected_raw = selected.raw_fit if isinstance(selected, RawFusionCandidate) else None
+        selected_score = {"name": str(selected.score.name), "value": _finite_number(selected.score.value)}
+    direct = isinstance(partition, DirectPartition)
+    return {
+        "raw_reference": _raw_qualification(raw_fit),
+        "selected_raw_fit": None if selected_raw is None else _raw_qualification(selected_raw),
+        "selected_partition": {
+            "family": "direct_partition" if direct else "raw_fusion",
+            "source": str(partition.source), "signature": str(partition.signature),
+            "labels_hash": _array_fingerprint(partition.labels, dtype=np.dtype(np.int64)),
+            "n_clusters": int(partition.n_clusters),
+            "raw_partition_certified": bool(not direct and partition.certified),
+            "parent_raw_candidate_id": (int(partition.parent_raw_candidate_id)
+                                        if direct and partition.parent_raw_candidate_id is not None else None),
+            "parent_raw_lambda": (_finite_number(partition.parent_raw_lambda)
+                                  if direct and partition.parent_raw_lambda is not None else None),
+            "parent_raw_phi_hash": (partition.parent_raw_phi_hash or None) if direct else None,
+        },
+        "refit": {
+            "finite_candidate_found": bool(refit.finite_candidate_found),
+            "numerically_resolved": bool(refit.refit_numerically_resolved),
+            "global_optimum_certified": bool(refit.global_optimum_certified),
+            "mode": str(refit.refit_mode),
+            "certificate_method": str(refit.global_certificate_method),
+            "global_lower_bound": _finite_number(refit.global_lower_bound),
+            "global_optimality_gap": _finite_number(refit.global_optimality_gap),
+            "loglik": _finite_number(refit.loglik),
+            "phi_hash": _array_fingerprint(refit.phi, dtype=np.dtype(np.float64)),
+        },
+        "selection": {
+            "status": ("not_provided" if selection_result is None else
+                       "resolved" if selection_result.selection_optimum_resolved else "provisional_unresolved"),
+            "optimum_resolved": None if selection_result is None else bool(selection_result.selection_optimum_resolved),
+            "boundary_unresolved": None if selection_result is None else bool(selection_result.selection_boundary_unresolved),
+            "raw_lambda_path_resolved": None if selection_result is None else bool(selection_result.raw_lambda_path_resolved),
+            "global_hybrid_optimum_certified": None if selection_result is None else bool(selection_result.global_hybrid_optimum_certified),
+            "stop_reason": None if selection_result is None else str(selection_result.adaptive_search_stop_reason),
+            "method": None if selection_result is None else str(selection_result.selection_method),
+            "score": selected_score,
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,11 +804,13 @@ def write_analysis_outputs(
     if publication is None:
         publication = RunPublication(outdir, analysis.data.tumor_id,
                                      input_file=analysis.input_file, fit_config=analysis.fit_config)
+    if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != analysis.data.tumor_id:
+        raise ValueError("Publication does not belong to this tumor and output directory.")
     try:
-        write_fit_outputs(
-            outdir=Path(outdir), data=analysis.data, raw_fit=analysis.raw_fit,
-            partition=analysis.partition, refit=analysis.refit,
-            eps=float(analysis.fit_config.eps), publication=publication,
+        _write_fit_tables(
+            analysis.data, analysis.raw_fit, analysis.partition, analysis.refit,
+            float(analysis.fit_config.eps), publication,
+            selection_result=analysis.selection_result,
         )
     except BaseException as error:
         if own_publication:

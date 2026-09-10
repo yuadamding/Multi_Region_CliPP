@@ -1,11 +1,15 @@
 """Embed honest source identity in wheels without importing the inference stack."""
-import hashlib
 import json
 from pathlib import Path
+from runpy import run_path
 import subprocess
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
+
+
+# Loading this stdlib-only file directly must not import CliPP2 or Torch.
+source_fingerprint = run_path(str(Path(__file__).with_name("_source.py")))["source_fingerprint"]
 
 
 class BuildPy(build_py):
@@ -30,12 +34,8 @@ class BuildPy(build_py):
                 commit = dirty = None
         super().run()
         package = Path(self.build_lib) / "CliPP2"
-        digest = hashlib.sha256()
-        for path in sorted(package.rglob("*.py")):
-            digest.update(path.relative_to(package).as_posix().encode() + b"\0")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
         record = {"schema_version": 1, "commit": commit, "dirty": dirty,
-                  "python_source_sha256": digest.hexdigest()}
+                  "python_source_sha256": source_fingerprint(package)}
         (package / "_build_source.json").write_text(json.dumps(record, sort_keys=True) + "\n")
 
 

@@ -137,8 +137,15 @@ import sys
 import CliPP2
 from CliPP2.api import process_tumor
 from CliPP2.config import resolve_fit_config
+from CliPP2._source import source_fingerprint
+from CliPP2.reporting import _source_identity
 assert Path(CliPP2.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert CliPP2.__version__ == "0.5.0"
+package = Path(CliPP2.__file__).resolve().parent
+built = json.loads((package / "_build_source.json").read_text())
+assert source_fingerprint(package) == built["python_source_sha256"]
+assert _source_identity()["python_source_sha256"] == built["python_source_sha256"]
+assert _source_identity()["commit"] is None
 path = Path("wheel.tsv")
 path.write_text("mutation_id\tsample_id\talt_count\tref_count\tcount_observed\tpurity\tnormal_cn\tsegment_id\tcn_state_id\tcn_state_fraction\tallele_a_cn\tallele_b_cn\n"
                 "keep\tR1\t20\t80\t1\t0.8\t2\ts1\tclonal\t1\t2\t1\n"

@@ -1115,7 +1115,7 @@ def _partition_guided_admm_selection(
                     context,
                     float(proposal.lambda_value),
                     candidate_fit_options.solver,
-                    phi_start=phi_start,
+                    phi_start=None if solver_state_start is not None else phi_start,
                     include_default_starts=False,
                     warm_state=solver_state_start,
                 )

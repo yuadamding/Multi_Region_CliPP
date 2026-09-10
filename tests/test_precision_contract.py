@@ -72,7 +72,7 @@ def test_endpoint_candidate_derivatives_and_masked_units_are_finite(dtype, eps, 
     model = objective.model_to_torch(source, runtime, eps=eps)
     value = {"lower": eps, "upper": 1.0 - eps, "interior": 0.37}[boundary]
     phi = torch.full(model.shape, value, dtype=runtime.dtype)
-    kernel = objective._path_kernel_torch(model, phi, eps=eps)
+    kernel = objective._emission_kernel_torch(model, phi, eps=eps)
     assert torch.all((kernel.probability > 0) & (kernel.probability < 1))
     candidate = objective._candidate_terms_torch(
         model.alt[..., None], model.nonalt[..., None], kernel.probability, kernel.slope,
@@ -146,7 +146,7 @@ def test_likelihood_grid_omits_slope_and_mask_temporaries(monkeypatch, dtype):
     expected = torch.stack([
         objective.observed_terms_torch(model, phi[..., i], eps=1e-6).loss for i in range(4)
     ], -1)
-    original = objective._path_kernel_torch
+    original = objective._emission_kernel_torch
     seen = []
 
     def checked_kernel(*args, **kwargs):
@@ -156,7 +156,7 @@ def test_likelihood_grid_omits_slope_and_mask_temporaries(monkeypatch, dtype):
         seen.append(kernel.probability.numel())
         return kernel
 
-    monkeypatch.setattr(objective, "_path_kernel_torch", checked_kernel)
+    monkeypatch.setattr(objective, "_emission_kernel_torch", checked_kernel)
     actual = objective.observed_loss_grid_torch(model, phi, eps=1e-6)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert seen == [6 * 1 * 4 * 6]

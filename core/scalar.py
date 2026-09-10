@@ -32,7 +32,7 @@ class ScalarProblem(ImmutableArrayRecord):
         observed = np.asarray(self.observed, dtype=bool).reshape(-1)
         if alt.shape != nonalt.shape or observed.shape != alt.shape:
             raise ValueError("ScalarProblem observation arrays must have one shape.")
-        path_shape = (alt.size, np.asarray(self.slope).shape[-1])
+        candidate_shape = (alt.size, np.asarray(self.slope).shape[-1])
         arrays: dict[str, np.ndarray] = {}
         for name, dtype in (
             ("slope", np.float64),
@@ -40,8 +40,8 @@ class ScalarProblem(ImmutableArrayRecord):
             ("valid", bool),
         ):
             value = np.asarray(getattr(self, name), dtype=dtype)
-            if value.ndim != 2 or value.shape != path_shape:
-                raise ValueError(f"ScalarProblem.{name} must have shape {path_shape}.")
+            if value.ndim != 2 or value.shape != candidate_shape:
+                raise ValueError(f"ScalarProblem.{name} must have shape {candidate_shape}.")
             arrays[name] = value
         lower = float(self.lower)
         upper = float(self.upper)
@@ -188,8 +188,8 @@ def scalar_breakpoints(
     points = [problem.lower, problem.upper]
     rows = np.flatnonzero(problem.observed) if observed_only else range(problem.alt.size)
     for row in rows:
-        for path in np.flatnonzero(problem.valid[row]):
-            slope = float(problem.slope[row, path])
+        for candidate in np.flatnonzero(problem.valid[row]):
+            slope = float(problem.slope[row, candidate])
             for target in (problem.eps, 1.0 - problem.eps):
                 if slope > 0.0:
                     value = target / slope
@@ -281,7 +281,7 @@ def approximate_scalar_minimum(
     )
 
 
-def _active_path_arrays(problem: ScalarProblem) -> tuple[np.ndarray, ...]:
+def _active_candidate_arrays(problem: ScalarProblem) -> tuple[np.ndarray, ...]:
     active = problem.observed
     return (
         problem.alt[active],
@@ -293,7 +293,7 @@ def _active_path_arrays(problem: ScalarProblem) -> tuple[np.ndarray, ...]:
 
 
 def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> float:
-    alt, nonalt, candidate_slope, log_prior, valid = _active_path_arrays(
+    alt, nonalt, candidate_slope, log_prior, valid = _active_candidate_arrays(
         problem
     )
     mass_left = float(left) * candidate_slope
@@ -727,7 +727,6 @@ def partition_constrained_observed_refit(
         if mode == "interval_certified"
         else "_grid_local_approximate"
     )
-    path_suffix = "_path"
     return PartitionRefitResult(
         phi=np.clip(phi, epsilon, upper_matrix).astype(np.float64, copy=False),
         cluster_centers=centers,
@@ -756,8 +755,7 @@ def partition_constrained_observed_refit(
         ),
         labels=normalized_labels.copy(),
         loglik_source=(
-            "fixed_partition_observed_refit"
-            + path_suffix
+            "fixed_partition_observed_refit_path"
             + method_suffix
         ),
         global_lower_bound=selected_lower_bound,

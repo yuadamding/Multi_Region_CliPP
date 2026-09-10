@@ -13,7 +13,7 @@ from .graph_ops import (
     graph_forward_edges,
     project_dual_ball,
 )
-from .types import TorchRuntime
+from .types import KKTDiagnostics, TorchRuntime
 
 
 DEFAULT_INNER_KKT_CHECK_EVERY = 8
@@ -464,7 +464,7 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
     max_radius: float | torch.Tensor,
     max_scaled_edge_residual: float | torch.Tensor | None = None,
     max_scaled_ball_residual: float | torch.Tensor | None = None,
-) -> dict[str, float]:
+) -> KKTDiagnostics:
     """Assemble exact KKT diagnostics from an adjoint and edgewise maxima."""
     total_grad = grad_smooth + adj
     stat = stationarity_residual_torch(
@@ -544,26 +544,26 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
         float(box_residual),
     )
 
-    return {
-        "stationarity_residual": stationarity_residual,
-        "edge_subgradient_residual": edge_subgradient_residual,
-        "dual_ball_residual": dual_ball_residual,
-        "box_residual": float(box_residual),
-        "kkt_residual": max(
+    return KKTDiagnostics(
+        stationarity_residual=stationarity_residual,
+        edge_subgradient_residual=edge_subgradient_residual,
+        dual_ball_residual=dual_ball_residual,
+        box_residual=float(box_residual),
+        kkt_residual=max(
             stationarity_residual,
             edge_subgradient_residual,
             dual_ball_residual,
             float(box_residual),
         ),
-        "backward_error_stationarity_residual": (
+        backward_error_stationarity_residual=(
             backward_error_stationarity_residual
         ),
-        "backward_error_edge_subgradient_residual": (
+        backward_error_edge_subgradient_residual=(
             backward_error_edge_subgradient_residual
         ),
-        "backward_error_dual_ball_residual": backward_error_dual_ball_residual,
-        "backward_error_kkt_residual": backward_error_kkt_residual,
-    }
+        backward_error_dual_ball_residual=backward_error_dual_ball_residual,
+        backward_error_kkt_residual=backward_error_kkt_residual,
+    )
 
 
 def graph_fusion_kkt_residual_from_grad_torch(
@@ -580,7 +580,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     atol: float,
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
-) -> dict[str, float]:
+) -> KKTDiagnostics:
     lambda_value = validate_lambda_value(lambda_value)
     dual_scale_value = float(dual_scale)
     if not np.isfinite(dual_scale_value) or dual_scale_value < 0.0:
@@ -690,230 +690,6 @@ def graph_fusion_kkt_residual_from_grad_torch(
     )
 
 
-def _refine_graph_fusion_dual_certificate_streaming_torch(
-    *,
-    phi: torch.Tensor,
-    grad_smooth: torch.Tensor,
-    dual_kkt: torch.Tensor | None,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    lambda_value: float,
-    atol: float,
-    max_iter: int,
-    before_diag: dict[str, float],
-    edge_work_bytes: int | None,
-) -> dict[str, object]:
-    """Memory-bounded counterpart of the final dual-certificate refinement."""
-    num_edges = int(edge_u.numel())
-    num_regions = int(phi.shape[1])
-    num_nodes = int(phi.shape[0])
-    chunk_size = _edge_chunk_size(
-        num_edges=num_edges,
-        num_regions=num_regions,
-        dtype=phi.dtype,
-        work_bytes=edge_work_bytes,
-    )
-    incoming_valid = bool(
-        dual_kkt is not None and tuple(dual_kkt.shape) == (num_edges, num_regions)
-    )
-    incoming = (
-        dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
-    )
-
-    fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
-        phi=phi,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        atol=atol,
-        edge_work_bytes=edge_work_bytes,
-    )
-
-    dual = torch.zeros(
-        (num_edges, num_regions),
-        dtype=phi.dtype,
-        device=phi.device,
-    )
-    for edge_slice in _edge_slices(num_edges, chunk_size):
-        diff = graph_forward_edges(
-            phi,
-            edge_u=edge_u[edge_slice],
-            edge_v=edge_v[edge_slice],
-        )
-        diff_norm = torch.linalg.vector_norm(diff, dim=1)
-        active = diff_norm > float(atol)
-        radius = float(lambda_value) * edge_w[edge_slice]
-        analytic_chunk = (
-            radius[:, None] * diff / diff_norm[:, None].clamp_min(float(atol))
-        )
-        if incoming is None:
-            dual[edge_slice].copy_(
-                torch.where(
-                    active[:, None],
-                    analytic_chunk,
-                    torch.zeros_like(analytic_chunk),
-                )
-            )
-        else:
-            projected_incoming = project_dual_ball(
-                incoming[edge_slice],
-                radius,
-            )
-            dual[edge_slice].copy_(
-                torch.where(
-                    active[:, None],
-                    analytic_chunk,
-                    projected_incoming,
-                )
-            )
-
-    analytic_diag = graph_fusion_kkt_residual_from_grad_torch(
-        phi=phi,
-        grad_smooth=grad_smooth,
-        dual_kkt=dual,
-        lower=lower,
-        upper=upper,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        atol=atol,
-        edge_work_bytes=edge_work_bytes,
-    )
-    best_diag = analytic_diag
-    best_residual = float(analytic_diag["kkt_residual"])
-    best_source = "analytic"
-    best_dual: torch.Tensor = dual.clone()
-    if incoming is not None:
-        incoming_residual = float(before_diag["kkt_residual"])
-        if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
-            best_diag = before_diag
-            best_residual = incoming_residual
-            best_source = "incoming"
-            best_dual = incoming
-
-    refinement_iterations = 0
-    kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
-    if fused_edges > 0 and best_residual > kkt_target:
-        degree = torch.bincount(edge_u, minlength=num_nodes) + torch.bincount(
-            edge_v,
-            minlength=num_nodes,
-        )
-        step = 0.25 / max(float(torch.max(degree).item()), 1.0)
-        plateau_anchor = best_residual
-        stalled_iterations = 0
-        for _ in range(max(int(max_iter), 1)):
-            refinement_iterations += 1
-            adj = torch.zeros_like(phi)
-            mapping_delta = 0.0
-            for edge_slice in _edge_slices(num_edges, chunk_size):
-                dual_chunk = dual[edge_slice]
-                adj.index_add_(0, edge_u[edge_slice], dual_chunk)
-                adj.index_add_(
-                    0,
-                    edge_v[edge_slice],
-                    dual_chunk,
-                    alpha=-1.0,
-                )
-            stat = stationarity_residual_torch(
-                total_grad=grad_smooth + adj,
-                phi=phi,
-                lower=lower,
-                upper=upper,
-                atol=atol,
-            )
-            for edge_slice in _edge_slices(num_edges, chunk_size):
-                diff = graph_forward_edges(
-                    phi,
-                    edge_u=edge_u[edge_slice],
-                    edge_v=edge_v[edge_slice],
-                )
-                fused = torch.linalg.vector_norm(diff, dim=1) <= float(atol)
-                if not bool(torch.any(fused).item()):
-                    continue
-                stat_diff = graph_forward_edges(
-                    stat,
-                    edge_u=edge_u[edge_slice],
-                    edge_v=edge_v[edge_slice],
-                )
-                radius = float(lambda_value) * edge_w[edge_slice]
-                projected = project_dual_ball(
-                    dual[edge_slice] - float(step) * stat_diff,
-                    radius,
-                )
-                mapping_delta = max(
-                    mapping_delta,
-                    float(
-                        torch.max(
-                            torch.abs(projected[fused] - dual[edge_slice][fused])
-                        ).item()
-                    ),
-                )
-                dual[edge_slice].copy_(
-                    torch.where(
-                        fused[:, None],
-                        projected,
-                        dual[edge_slice],
-                    )
-                )
-            diag = graph_fusion_kkt_residual_from_grad_torch(
-                phi=phi,
-                grad_smooth=grad_smooth,
-                dual_kkt=dual,
-                lower=lower,
-                upper=upper,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                lambda_value=lambda_value,
-                atol=atol,
-                edge_work_bytes=edge_work_bytes,
-            )
-            residual = float(diag["kkt_residual"])
-            if residual < best_residual:
-                best_residual = residual
-                best_diag = diag
-                if best_source == "incoming":
-                    best_dual = dual.clone()
-                else:
-                    best_dual.copy_(dual)
-                best_source = "refined"
-            if residual <= kkt_target:
-                break
-            plateau_anchor, stalled_iterations, plateaued = (
-                _update_certificate_refinement_plateau(
-                    anchor_residual=plateau_anchor,
-                    best_residual=best_residual,
-                    mapping_delta=mapping_delta,
-                    stalled_iterations=stalled_iterations,
-                    atol=atol,
-                    dtype=phi.dtype,
-                )
-            )
-            if plateaued:
-                break
-
-    if best_source == "incoming":
-        status = "input_dual_retained"
-    elif fused_edges > 0:
-        status = "refined_fused_edge_dual"
-    else:
-        status = "analytic_nonfused_dual"
-    return {
-        "dual": best_dual,
-        "diag": best_diag,
-        "status": status,
-        "dual_refined": bool(best_source != "incoming"),
-        "fused_edges": int(fused_edges),
-        "nonzero_edges": int(nonzero_edges),
-        "stationarity_before": float(before_diag["stationarity_residual"]),
-        "stationarity_after": float(best_diag["stationarity_residual"]),
-        "refinement_iterations": int(refinement_iterations),
-    }
-
-
 def refine_graph_fusion_dual_certificate_torch(
     *,
     phi: torch.Tensor,
@@ -929,284 +705,181 @@ def refine_graph_fusion_dual_certificate_torch(
     max_iter: int = 96,
     edge_work_bytes: int | None = None,
 ) -> dict[str, object]:
+    """Refine one fixed-primal witness using simultaneous bounded edge work."""
     lambda_value = validate_lambda_value(lambda_value)
+    num_edges, num_regions = int(edge_u.numel()), int(phi.shape[1])
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
-        phi=phi,
-        grad_smooth=grad_smooth,
-        dual_kkt=dual_kkt,
-        lower=lower,
-        upper=upper,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        atol=atol,
+        phi=phi, grad_smooth=grad_smooth, dual_kkt=dual_kkt,
+        lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
+        edge_w=edge_w, lambda_value=lambda_value, atol=atol,
         edge_work_bytes=edge_work_bytes,
     )
-    if edge_u.numel() == 0 or lambda_value <= 0.0:
-        dual = torch.zeros(
-            (int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device
-        )
+    if num_edges == 0 or lambda_value <= 0.0:
+        dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
         after_diag = graph_fusion_kkt_residual_from_grad_torch(
-            phi=phi,
-            grad_smooth=grad_smooth,
-            dual_kkt=dual,
-            lower=lower,
-            upper=upper,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            lambda_value=lambda_value,
-            atol=atol,
+            phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
+            lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
+            edge_w=edge_w, lambda_value=lambda_value, atol=atol,
             edge_work_bytes=edge_work_bytes,
         )
         return {
-            "dual": dual,
-            "diag": after_diag,
-            "status": "zero_penalty_no_dual_needed",
-            "dual_refined": False,
-            "fused_edges": 0,
-            "nonzero_edges": 0,
-            "stationarity_before": float(before_diag["stationarity_residual"]),
-            "stationarity_after": float(after_diag["stationarity_residual"]),
+            "dual": dual, "diag": after_diag,
+            "status": "zero_penalty_no_dual_needed", "dual_refined": False,
+            "fused_edges": 0, "nonzero_edges": 0,
+            "stationarity_before": before_diag.stationarity_residual,
+            "stationarity_after": after_diag.stationarity_residual,
             "refinement_iterations": 0,
         }
 
-    budget = (
-        DEFAULT_EDGE_WORK_BYTES if edge_work_bytes is None else int(edge_work_bytes)
+    chunk_size = _edge_chunk_size(
+        num_edges=num_edges, num_regions=num_regions, dtype=phi.dtype,
+        work_bytes=edge_work_bytes,
     )
     incoming_valid = bool(
-        dual_kkt is not None
-        and tuple(dual_kkt.shape) == (int(edge_u.numel()), int(phi.shape[1]))
+        dual_kkt is not None and tuple(dual_kkt.shape) == (num_edges, num_regions)
     )
-    incoming_residual = float(before_diag["kkt_residual"])
-    if (
-        incoming_valid
-        and np.isfinite(incoming_residual)
-        and incoming_residual <= _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
-    ):
+    incoming = (
+        dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
+    )
+    incoming_residual = before_diag.kkt_residual
+    kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
+    if incoming_valid and np.isfinite(incoming_residual) and incoming_residual <= kkt_target:
         fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
-            phi=phi,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            atol=atol,
-            edge_work_bytes=budget,
+            phi=phi, edge_u=edge_u, edge_v=edge_v, atol=atol,
+            edge_work_bytes=edge_work_bytes,
         )
-        incoming = dual_kkt.to(dtype=phi.dtype, device=phi.device)
         return {
-            "dual": incoming,
-            "diag": before_diag,
-            "status": "input_dual_retained",
-            "dual_refined": False,
-            "fused_edges": int(fused_edges),
-            "nonzero_edges": int(nonzero_edges),
-            "stationarity_before": float(before_diag["stationarity_residual"]),
-            "stationarity_after": float(before_diag["stationarity_residual"]),
+            "dual": incoming, "diag": before_diag,
+            "status": "input_dual_retained", "dual_refined": False,
+            "fused_edges": fused_edges, "nonzero_edges": nonzero_edges,
+            "stationarity_before": before_diag.stationarity_residual,
+            "stationarity_after": before_diag.stationarity_residual,
             "refinement_iterations": 0,
         }
-    if (
-        _edge_tensor_nbytes(
-            num_edges=int(edge_u.numel()),
-            num_regions=int(phi.shape[1]),
-            dtype=phi.dtype,
-        )
-        > budget
-    ):
-        return _refine_graph_fusion_dual_certificate_streaming_torch(
-            phi=phi,
-            grad_smooth=grad_smooth,
-            dual_kkt=dual_kkt,
-            lower=lower,
-            upper=upper,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            lambda_value=lambda_value,
-            atol=atol,
-            max_iter=max_iter,
-            before_diag=before_diag,
-            edge_work_bytes=budget,
-        )
 
-    diff = graph_forward_edges(phi, edge_u=edge_u, edge_v=edge_v)
-    diff_norm = torch.linalg.norm(diff, dim=1)
-    radius = float(lambda_value) * edge_w
-    active = diff_norm > float(atol)
-    fused = ~active
-    dual = torch.zeros(
-        (int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device
-    )
-    if torch.any(active):
-        dual[active] = (
-            radius[active, None]
-            * diff[active]
-            / diff_norm[active, None].clamp_min(float(atol))
+    dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
+    fused_edges = 0
+    # Keep small-problem masks/radii once; larger problems reconstruct only
+    # the current bounded chunk instead of retaining all edge work.
+    single_chunk = chunk_size == num_edges
+    for edge_slice in _edge_slices(num_edges, chunk_size):
+        diff = graph_forward_edges(
+            phi, edge_u=edge_u[edge_slice], edge_v=edge_v[edge_slice],
         )
-    if (
-        torch.any(fused)
-        and dual_kkt is not None
-        and tuple(dual_kkt.shape) == tuple(dual.shape)
-    ):
-        dual[fused] = dual_kkt.to(dtype=phi.dtype, device=phi.device)[fused]
-        fused_radius = radius[fused]
-        dual[fused] = project_dual_ball(dual[fused], fused_radius)
+        diff_norm = torch.linalg.vector_norm(diff, dim=1)
+        radius = float(lambda_value) * edge_w[edge_slice]
+        active = diff_norm > float(atol)
+        fused = ~active
+        fused_edges += int(torch.sum(fused).item())
+        dual_chunk = dual[edge_slice]
+        if bool(torch.any(active).item()):
+            dual_chunk[active] = (
+                radius[active, None] * diff[active]
+                / diff_norm[active, None].clamp_min(float(atol))
+            )
+        if incoming is not None and bool(torch.any(fused).item()):
+            dual_chunk[fused] = project_dual_ball(incoming[edge_slice][fused], radius[fused])
+    del diff, diff_norm, active, dual_chunk
 
     analytic_diag = graph_fusion_kkt_residual_from_grad_torch(
-        phi=phi,
-        grad_smooth=grad_smooth,
-        dual_kkt=dual,
-        lower=lower,
-        upper=upper,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        atol=atol,
+        phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
+        lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
+        edge_w=edge_w, lambda_value=lambda_value, atol=atol,
+        edge_work_bytes=edge_work_bytes,
     )
     best_dual = dual.clone()
     best_diag = analytic_diag
-    best_residual = float(analytic_diag["kkt_residual"])
+    best_residual = analytic_diag.kkt_residual
     best_source = "analytic"
+    # Reconstructed nonfused edges can improve feasibility while worsening
+    # stationarity. Preserve an equally good or better incoming witness.
+    if incoming is not None and np.isfinite(incoming_residual) and incoming_residual <= best_residual:
+        best_dual = incoming.clone() if single_chunk else incoming
+        best_diag = before_diag
+        best_residual = incoming_residual
+        best_source = "incoming"
 
-    # Reconstructing the analytic active-edge subgradient can improve edge
-    # feasibility while worsening stationarity at a finite-accuracy primal
-    # iterate.  A certificate-refinement routine must be monotone in the full
-    # KKT residual, so retain the incoming actual ADMM multiplier whenever it
-    # is the stronger certificate.
-    if dual_kkt is not None and tuple(dual_kkt.shape) == tuple(dual.shape):
-        incoming_residual = float(before_diag["kkt_residual"])
-        if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
-            best_dual = dual_kkt.to(dtype=phi.dtype, device=phi.device).clone()
-            best_diag = before_diag
-            best_residual = incoming_residual
-            best_source = "incoming"
     refinement_iterations = 0
-    kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
-    if torch.any(fused) and best_residual > kkt_target:
-        degree = torch.bincount(
-            torch.cat([edge_u, edge_v]),
-            minlength=int(phi.shape[0]),
-        ).max()
+    if fused_edges > 0 and best_residual > kkt_target:
+        num_nodes = int(phi.shape[0])
+        degree = torch.bincount(torch.cat([edge_u, edge_v]), minlength=num_nodes).max()
         step = 0.25 / max(float(degree.item()), 1.0)
-        plateau_anchor = best_residual
-        stalled_iterations = 0
+        plateau_anchor, stalled_iterations = best_residual, 0
         for _ in range(max(int(max_iter), 1)):
             refinement_iterations += 1
-            adj = graph_adjoint_edges(
-                dual,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                num_nodes=int(phi.shape[0]),
-            )
-            total_grad = grad_smooth + adj
+            if single_chunk:
+                adj = graph_adjoint_edges(
+                    dual, edge_u=edge_u, edge_v=edge_v, num_nodes=num_nodes,
+                )
+            else:
+                # Preserve the old streamed update's scatter reduction order
+                # on every device; full audits retain their own adjoint path.
+                adj = torch.zeros_like(phi)
+                for edge_slice in _edge_slices(num_edges, chunk_size):
+                    adj.index_add_(0, edge_u[edge_slice], dual[edge_slice])
+                    adj.index_add_(0, edge_v[edge_slice], dual[edge_slice], alpha=-1.0)
+            # Freeze the complete current adjoint/residual before ANY update.
+            # Recomputing this between chunks would change the algorithm.
             stat = stationarity_residual_torch(
-                total_grad=total_grad,
-                phi=phi,
-                lower=lower,
-                upper=upper,
-                atol=atol,
+                total_grad=grad_smooth + adj, phi=phi, lower=lower, upper=upper, atol=atol,
             )
-            fused_before = dual[fused]
-            fused_after = (
-                fused_before
-                - float(step)
-                * (graph_forward_edges(stat, edge_u=edge_u, edge_v=edge_v)[fused])
-            )
-            fused_radius = radius[fused]
-            fused_after = project_dual_ball(fused_after, fused_radius)
-            mapping_delta = float(
-                torch.max(torch.abs(fused_after - fused_before)).item()
-            )
-            dual[fused] = fused_after
+            mapping_delta = 0.0
+            for edge_slice in _edge_slices(num_edges, chunk_size):
+                if not single_chunk:
+                    diff = graph_forward_edges(
+                        phi, edge_u=edge_u[edge_slice], edge_v=edge_v[edge_slice],
+                    )
+                    fused = torch.linalg.vector_norm(diff, dim=1) <= float(atol)
+                    radius = float(lambda_value) * edge_w[edge_slice]
+                if not bool(torch.any(fused).item()):
+                    continue
+                fused_before = dual[edge_slice][fused]
+                stat_diff = graph_forward_edges(
+                    stat, edge_u=edge_u[edge_slice], edge_v=edge_v[edge_slice],
+                )
+                fused_after = project_dual_ball(
+                    fused_before - float(step) * stat_diff[fused], radius[fused],
+                )
+                mapping_delta = max(
+                    mapping_delta, float(torch.max(torch.abs(fused_after - fused_before)).item()),
+                )
+                dual[edge_slice][fused] = fused_after
             diag = graph_fusion_kkt_residual_from_grad_torch(
-                phi=phi,
-                grad_smooth=grad_smooth,
-                dual_kkt=dual,
-                lower=lower,
-                upper=upper,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                lambda_value=lambda_value,
-                atol=atol,
+                phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
+                lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
+                edge_w=edge_w, lambda_value=lambda_value, atol=atol,
+                edge_work_bytes=edge_work_bytes,
             )
-            residual = float(diag["kkt_residual"])
+            residual = diag.kkt_residual
             if residual < best_residual:
-                best_residual = residual
-                best_diag = diag
-                best_dual = dual.clone()
+                best_residual, best_diag = residual, diag
+                if best_source == "incoming":
+                    best_dual = dual.clone()
+                else:
+                    best_dual.copy_(dual)
                 best_source = "refined"
             if residual <= kkt_target:
                 break
-            plateau_anchor, stalled_iterations, plateaued = (
-                _update_certificate_refinement_plateau(
-                    anchor_residual=plateau_anchor,
-                    best_residual=best_residual,
-                    mapping_delta=mapping_delta,
-                    stalled_iterations=stalled_iterations,
-                    atol=atol,
-                    dtype=phi.dtype,
-                )
+            plateau_anchor, stalled_iterations, plateaued = _update_certificate_refinement_plateau(
+                anchor_residual=plateau_anchor, best_residual=best_residual,
+                mapping_delta=mapping_delta, stalled_iterations=stalled_iterations,
+                atol=atol, dtype=phi.dtype,
             )
             if plateaued:
                 break
 
-    if best_source == "incoming":
-        status = "input_dual_retained"
-    elif torch.any(fused):
-        status = "refined_fused_edge_dual"
-    else:
-        status = "analytic_nonfused_dual"
-
-    return {
-        "dual": best_dual,
-        "diag": best_diag,
-        "status": status,
-        "dual_refined": bool(best_source != "incoming"),
-        "fused_edges": int(torch.sum(fused).item()),
-        "nonzero_edges": int(torch.sum(active).item()),
-        "stationarity_before": float(before_diag["stationarity_residual"]),
-        "stationarity_after": float(best_diag["stationarity_residual"]),
-        "refinement_iterations": int(refinement_iterations),
-    }
-
-
-def inner_kkt_residual_torch(
-    *,
-    phi: torch.Tensor,
-    dual: torch.Tensor,
-    U: torch.Tensor,
-    h: torch.Tensor,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    lambda_value: float,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    atol: float,
-    dual_scale: float = 1.0,
-    edge_work_bytes: int | None = None,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> float:
-    lambda_value = validate_lambda_value(lambda_value)
-    diag = graph_fusion_kkt_residual_from_grad_torch(
-        phi=phi,
-        grad_smooth=h * (phi - U),
-        dual_kkt=dual,
-        lower=lower,
-        upper=upper,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        atol=atol,
-        dual_scale=dual_scale,
-        edge_work_bytes=edge_work_bytes,
+    status = (
+        "input_dual_retained" if best_source == "incoming" else
+        "refined_fused_edge_dual" if fused_edges else "analytic_nonfused_dual"
     )
-    if diagnostics_out is not None:
-        diagnostics_out.clear()
-        diagnostics_out.update(diag)
-    return float(diag["kkt_residual"])
+    return {
+        "dual": best_dual, "diag": best_diag, "status": status,
+        "dual_refined": best_source != "incoming", "fused_edges": fused_edges,
+        "nonzero_edges": num_edges - fused_edges,
+        "stationarity_before": before_diag.stationarity_residual,
+        "stationarity_after": best_diag.stationarity_residual,
+        "refinement_iterations": refinement_iterations,
+    }
 
 
 def _complete_graph_admm_stationarity_components_torch(
@@ -1240,46 +913,6 @@ def _complete_graph_admm_stationarity_components_torch(
     return grad_smooth, float(residual.item()), float(backward_error.item())
 
 
-def _complete_graph_admm_kkt_residual_from_maxima_torch(
-    *,
-    phi: torch.Tensor,
-    grad_smooth: torch.Tensor,
-    adj: torch.Tensor,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    max_edge_residual: float | torch.Tensor,
-    max_ball_residual: float | torch.Tensor,
-    max_radius: float | torch.Tensor,
-    max_scaled_edge_residual: float | torch.Tensor,
-    max_scaled_ball_residual: float | torch.Tensor,
-    atol: float,
-    use_backward_error_stopping: bool,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> float:
-    diag = graph_fusion_kkt_diagnostics_from_components_torch(
-        phi=phi,
-        grad_smooth=grad_smooth,
-        adj=adj,
-        lower=lower,
-        upper=upper,
-        atol=atol,
-        max_edge_residual=max_edge_residual,
-        max_ball_residual=max_ball_residual,
-        max_radius=max_radius,
-        max_scaled_edge_residual=max_scaled_edge_residual,
-        max_scaled_ball_residual=max_scaled_ball_residual,
-    )
-    if diagnostics_out is not None:
-        diagnostics_out.clear()
-        diagnostics_out.update(diag)
-    key = (
-        "backward_error_kkt_residual"
-        if use_backward_error_stopping
-        else "kkt_residual"
-    )
-    return float(diag[key])
-
-
 def solve_majorized_subproblem_pdhg_torch(
     *,
     runtime: TorchRuntime,
@@ -1300,8 +933,7 @@ def solve_majorized_subproblem_pdhg_torch(
     tau_node: torch.Tensor | None = None,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     use_backward_error_stopping: bool = False,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float, KKTDiagnostics | None]:
     lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(
         torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower),
@@ -1320,7 +952,7 @@ def solve_majorized_subproblem_pdhg_torch(
             (0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device
         )
         # This branch is a closed-form box projection; no PDHG iteration ran.
-        return projected, empty_dual, empty_dual, 0, residual <= tol, residual
+        return projected, empty_dual, empty_dual, 0, residual <= tol, residual, None
 
     if dual_start is not None and tuple(dual_start.shape) == (
         int(edge_u.numel()),
@@ -1354,6 +986,7 @@ def solve_majorized_subproblem_pdhg_torch(
     converged = False
     iterations = 0
     last_residual = np.inf
+    last_diagnostics = None
     actual_max_iter = max(int(max_iter), 10)
     for inner_iter in range(actual_max_iter):
         iterations = inner_iter + 1
@@ -1392,12 +1025,10 @@ def solve_majorized_subproblem_pdhg_torch(
 
         if audit_due:
             cheap_converged = bool(primal_delta <= tol and dual_delta <= tol)
-            iteration_diagnostics: dict[str, float | int] = {}
-            legacy_residual = inner_kkt_residual_torch(
+            last_diagnostics = graph_fusion_kkt_residual_from_grad_torch(
                 phi=phi,
-                dual=dual,
-                U=U,
-                h=h,
+                dual_kkt=dual,
+                grad_smooth=h * (phi - U),
                 lower=lower,
                 upper=upper,
                 lambda_value=lambda_value,
@@ -1405,21 +1036,17 @@ def solve_majorized_subproblem_pdhg_torch(
                 edge_v=edge_v,
                 edge_w=edge_w,
                 atol=tol,
-                diagnostics_out=iteration_diagnostics,
             )
-            if diagnostics_out is not None:
-                diagnostics_out.clear()
-                diagnostics_out.update(iteration_diagnostics)
             last_residual = float(
-                iteration_diagnostics["backward_error_kkt_residual"]
+                last_diagnostics.backward_error_kkt_residual
                 if use_backward_error_stopping
-                else legacy_residual
+                else last_diagnostics.kkt_residual
             )
             if cheap_converged and last_residual <= 5.0 * tol:
                 converged = True
                 break
 
-    return phi, dual, dual, iterations, converged, float(last_residual)
+    return phi, dual, dual, iterations, converged, float(last_residual), last_diagnostics
 
 
 def _complete_graph_isotropic_box_qp_torch(
@@ -1621,8 +1248,8 @@ def _closed_form_box_fusion_result(
     lower: torch.Tensor,
     upper: torch.Tensor,
     tol: float,
-    diagnostics_out: dict[str, float | int] | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    diagnostics_out: dict[str, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float, KKTDiagnostics | None]:
     projected = torch.minimum(torch.maximum(U, lower), upper)
     diag = graph_fusion_kkt_diagnostics_from_components_torch(
         phi=projected,
@@ -1635,15 +1262,14 @@ def _closed_form_box_fusion_result(
         max_ball_residual=0.0,
         max_radius=0.0,
     )
-    residual = float(diag["kkt_residual"])
+    residual = float(diag.kkt_residual)
     empty_dual = torch.zeros(
         (0, projected.shape[1]), dtype=runtime.dtype, device=runtime.device
     )
     if diagnostics_out is not None:
         diagnostics_out.clear()
-        diagnostics_out.update(diag)
         diagnostics_out.update(inner_kkt_audits=0, inner_stationarity_checks=0)
-    return projected, empty_dual, empty_dual, 0, residual <= tol, residual
+    return projected, empty_dual, empty_dual, 0, residual <= tol, residual, diag
 
 
 def _initial_complete_graph_rho(
@@ -1682,8 +1308,8 @@ def _solve_majorized_subproblem_alm_dense_torch(
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    diagnostics_out: dict[str, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float, KKTDiagnostics | None]:
     lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(
         torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower),
@@ -1726,6 +1352,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
     converged = False
     iterations = 0
     last_residual = np.inf
+    last_diagnostics = None
     actual_dual = rho * scaled_dual
     actual_max_iter = max(int(max_iter), 10)
     box_iter = _box_qp_sweeps_for_atol(box_phi_atol, max_iter=box_max_iter)
@@ -1855,7 +1482,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 dual=actual_dual,
                 radius=radius,
             )
-            last_residual = _complete_graph_admm_kkt_residual_from_maxima_torch(
+            last_diagnostics = graph_fusion_kkt_diagnostics_from_components_torch(
                 phi=phi,
                 grad_smooth=grad_smooth,
                 adj=adj,
@@ -1867,8 +1494,10 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 max_scaled_edge_residual=scaled_edge_max,
                 max_scaled_ball_residual=scaled_ball_max,
                 atol=tol,
-                use_backward_error_stopping=use_backward_error_stopping,
-                diagnostics_out=diagnostics_out,
+            )
+            last_residual = float(
+                last_diagnostics.backward_error_kkt_residual
+                if use_backward_error_stopping else last_diagnostics.kkt_residual
             )
             # The audit carries both legacy and componentwise box-QP KKT
             # residuals. Ordinary solves stop on the former; promoted
@@ -1888,7 +1517,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
         diagnostics_out["inner_kkt_audits"] = int(kkt_audits)
         diagnostics_out["inner_stationarity_checks"] = int(stationarity_checks)
 
-    return phi, scaled_dual, actual_dual, iterations, converged, float(last_residual)
+    return phi, scaled_dual, actual_dual, iterations, converged, float(last_residual), last_diagnostics
 
 
 def _solve_majorized_subproblem_alm_streaming_torch(
@@ -1914,8 +1543,8 @@ def _solve_majorized_subproblem_alm_streaming_torch(
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
     edge_work_bytes: int | None = None,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    diagnostics_out: dict[str, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float, KKTDiagnostics | None]:
     """Exact complete-graph ADMM with bounded edgewise working storage."""
     lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(
@@ -1995,6 +1624,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
     converged = False
     iterations = 0
     last_residual = np.inf
+    last_diagnostics = None
     actual_max_iter = max(int(max_iter), 10)
     box_iter = _box_qp_sweeps_for_atol(
         box_phi_atol,
@@ -2182,7 +1812,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                     max_scaled_ball_residual, scaled_ball_max
                 )
                 del edge_diff
-            last_residual = _complete_graph_admm_kkt_residual_from_maxima_torch(
+            last_diagnostics = graph_fusion_kkt_diagnostics_from_components_torch(
                 phi=phi,
                 grad_smooth=grad_smooth,
                 adj=audit_adjoint,
@@ -2194,8 +1824,10 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                 max_scaled_edge_residual=max_scaled_edge_residual,
                 max_scaled_ball_residual=max_scaled_ball_residual,
                 atol=tol,
-                use_backward_error_stopping=use_backward_error_stopping,
-                diagnostics_out=diagnostics_out,
+            )
+            last_residual = float(
+                last_diagnostics.backward_error_kkt_residual
+                if use_backward_error_stopping else last_diagnostics.kkt_residual
             )
             if last_residual <= kkt_stop_tol:
                 converged = True
@@ -2219,6 +1851,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
         iterations,
         converged,
         float(last_residual),
+        last_diagnostics,
     )
 
 
@@ -2245,8 +1878,8 @@ def solve_majorized_subproblem_alm_torch(
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
     edge_work_bytes: int | None = None,
-    diagnostics_out: dict[str, float | int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    diagnostics_out: dict[str, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float, KKTDiagnostics | None]:
     """Solve the complete-graph group-fusion subproblem by scaled-dual ADMM.
 
     Small problems retain the historical dense implementation exactly.  Once

@@ -7,7 +7,9 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import DenseEdgeCertificate, KKTComponents, RawFit, WorkCounters
+from ..core.fusion.types import (
+    ConvergenceResult, DenseEdgeCertificate, KKTComponents, RawFit, WorkCounters,
+)
 from ..io.data import ImmutableArrayRecord, readonly_array
 
 StartArray = np.ndarray | torch.Tensor
@@ -243,13 +245,12 @@ class RawAttemptTrace:
     mathematically_certified: bool
     objective: float
     kkt_components: KKTComponents
-    kkt_residual: float
     kkt_tolerance: float
     dominant_kkt_component: str
     certificate_status: str
     certificate_certified: bool
     certificate_admissible: bool
-    mm_consistency_violations: int
+    convergence: ConvergenceResult
     work: WorkCounters
     outer_max_iter: int
     inner_max_iter: int
@@ -258,20 +259,11 @@ class RawAttemptTrace:
     audit_dtype: str
     precision_polished: bool
     promotion_status: str = "not_recorded"
-    stage_outer_iterations: int = 0
-    stage_outer_max_iter: int = 0
-    stage_inner_iterations: int = 0
-    stage_inner_max_iter: int = 0
-    stage_inner_solve_calls: int = 0
-    stop_reason: str = "not_recorded"
-    progress_residual_method: str = "not_recorded"
-    solve_tolerance: float = float("nan")
-    legacy_stop_kkt_residual: float = float("inf")
-    componentwise_stop_kkt_residual: float = float("inf")
-    accepted_full_steps: int = 0
-    accepted_damped_steps: int = 0
-    rejected_outer_steps: int = 0
     fallback_reason: str = ""
+
+    @property
+    def kkt_residual(self) -> float:
+        return self.kkt_components.residual
 
 
 @dataclass(frozen=True, slots=True)

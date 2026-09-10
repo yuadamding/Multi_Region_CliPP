@@ -3,6 +3,96 @@
 Dated evidence for the changes below, not a claim that a moving branch or a
 new device/cohort is qualified. See [README.md](README.md) for current usage.
 
+## Whole-fit ownership and certificate consolidation — 2026-09-09
+
+Reference: `72f76a8c2ab3066ab1df01b5288d303e73e2f8d0`; version remains `0.5.0`.
+The final tested inference-source fingerprint is
+`2c0af4df27314b582dd71601324d8c3ec64d7dfc7d17b5173af2293800593ee1`.
+The frozen reference archive SHA-256 is
+`85dde34f48086c56a63920a9e22c3ef243b9694eecda6e42d79f9cdd0856e70c`.
+
+The reported ownership issue is real: replacing only `RawFit.state` leaves
+its separate `certificate.witness` on the original device. The replacement
+`offload_raw_fit_to_cpu` moves both, including dense/compressed witnesses,
+warm-state certificate hints, and witness-only fits with no state. One tensor
+memo reuses transfers for identical views across all those owners. Values,
+dtype, graph/scope evidence, diagnostics, and recorded solve device are
+preserved. Guided initialization moves its two final state tensors to CPU at
+construction, so no second generic state-only offloader remains.
+
+Terminal certification adds work counters immediately instead of keeping
+every refinement result. It also releases the temporary edge-dual alias after
+computing the next generalized-gradient adjustment. The four-pass limit,
+optional fifth pass, gradient reconciliation, and final audit are unchanged.
+A pinned, instrumented terminal-loop test observes previous live witness
+counts **[0,1,2,3,4] → [0,1,1,1,1]** while retaining all five passes and the
+same summed work count of 15. The float32 variant additionally checks that
+only the final witness survives when the float64 audit begins. These tests
+mock certificate results inside actual solver orchestration; they are not
+end-to-end GPU memory measurements.
+
+One dual-refinement driver replaces the vectorized and streamed drivers.
+Each iteration freezes the complete adjoint/residual before updating any
+chunk. Incoming/analytic comparison, strict best-witness updates, ties,
+projection, plateau rules, status strings, and work accounting are preserved.
+The one-chunk route still uses the existing full graph-adjoint implementation;
+the streamed update still uses its original bounded scatter accumulation.
+No new forced-streaming CUDA reduction route is introduced. Full-graph audit
+routes, including their existing deterministic complete-graph path, remain
+unchanged.
+
+Numerical routines now exchange `KKTDiagnostics` directly. Obsolete mapping
+conversions and unused residual-copy/cache blocks are deleted; legacy progress
+residuals remain distinct from terminal componentwise backward errors.
+`RawAttemptTrace` composes the existing frozen, tensor-free `ConvergenceResult`
+and derives its aggregate KKT residual. Established failure-message fields and
+tokens remain exact, without reintroducing a witness-owning certificate record.
+
+The NumPy evaluator has one private emission/reduction path for loss-only,
+posterior-only, and full-derivative work. CEM keeps its existing center loop;
+reporting keeps the same marginalized conditional posterior and MAP tie rule.
+Internal emission/candidate names replace retired path terminology without
+compatibility aliases. Legitimate lambda-path names and public refit
+provenance strings are deliberately unchanged.
+
+Validation in `ml1`: **637 tests passed, 6 CUDA-only tests skipped**; Ruff and
+`git diff --check` pass. The suite includes isolated wheel installation and
+CPU fits, independent simultaneous-update calculations, nonfinite/fail-closed
+diagnostics, both witness representations, alias preservation, stateless fits,
+and recovery/bracket continuation tests. Pinned fixed-environment CPU captures
+are byte-identical, with final-source fingerprints checked before and after
+each capture:
+
+| Capture | Coverage | Matching SHA-256 |
+| --- | --- | --- |
+| Certificate refinement | 36 cases: both dtypes/chunk modes, incoming/analytic/refined witnesses, complete residual sequences and statuses | `02b4f85153360dd5cc96d2cb295961b3f6187e0065759737739480d25eab8a57` |
+| Inner solves | 24 ALM/PDHG cases: dense/streamed, zero/positive lambda, legacy/componentwise stopping, values and work counts | `cd28ff64a9ed5bfb6ec5703241435f565fd0d4ca4e5f9d9c80de18a254ab572e` |
+| Host reductions | 2,424 numerical leaves: full terms, center costs, CEM decisions, conditional probabilities and MAP calls | `bf4094d42e22e239a859ab31c1a7d8406b4ffc832d318b002f713dfc656b7038` |
+| Raw/warm and hybrid | 17,900 numerical leaves: objective/graph identities, basins, certificates, scores and uncertainty | `4041b281a0e16ddbb3405e6a11d367d5080ebdf21b40b68527d39fe56ab96bbd` |
+| Proposal pools | 3,432 numerical leaves: ambiguous multi-region pilot/final-Phi pools, labels, refits and ordering | `a2447cfe2b7d2d43318f490cf32d9166e84e67bafc539ac83e2e25b937fffe72` |
+| CNA-positive hybrid | 566 numerical leaves: public refits, posteriors, CNA-only F1, qualification and four TSVs | `52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4` |
+
+For a 256-mutation, 3-region, 6-candidate host fixture, instrumented derivative
+arrays decrease **3 arrays / 110,592 bytes → zero** per loss/posterior call.
+Three center evaluations avoid 331,776 aggregate derivative-array bytes. Full
+derivative evaluation is unchanged. This measures selected array allocations,
+not total peak memory, RSS, latency, or production VRAM. Small-fixture F1
+parity likewise is not a cohort-accuracy claim; the CNA checks retain exact
+`major_cn != minor_cn` eligibility and public refitted CCFs.
+
+Inference source remains **34 modules**, decreasing **725,861 → 713,768 bytes**
+(12,093 fewer bytes; 1.67%). Tests and qualification evidence remain in the
+repository. No likelihood, graph, fusion norm, score, candidate family, global
+optimality safeguard, output schema, or balanced `0.004` admission gate changed.
+
+CUDA and representative release/cohort qualification are still pending. No
+remote jobs were launched. Six tests are explicitly gated by
+`CLIPP2_TEST_CUDA=1` for execution only inside an approved, commit-pinned
+Seadragon LSF allocation: persistent dense/compressed history, witness-only
+fits, and one-/multi-chunk adjoint routing. The `clipp2-run` workflow requires
+an immutable committed source and the external LSF project runbook, which is
+currently absent. CPU results do not qualify CUDA behavior or GPU memory use.
+
 ## Deletion-first compaction — 2026-09-09
 
 Reference: `bb726ad3fb3737cca48e06cce66943d5fbba52b4`; version remains `0.5.0`.

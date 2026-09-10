@@ -929,20 +929,18 @@ def _compressed_graph_fusion_kkt(
                 max_scaled_ball_residual, float(scaled_ball_residual.item())
             )
 
-    return KKTDiagnostics.from_mapping(
-        graph_fusion_kkt_diagnostics_from_components_torch(
-            phi=phi,
-            grad_smooth=grad_smooth,
-            adj=adj,
-            lower=lower,
-            upper=upper,
-            atol=atol,
-            max_edge_residual=max_edge_residual,
-            max_ball_residual=max_ball_residual,
-            max_radius=max_radius,
-            max_scaled_edge_residual=max_scaled_edge_residual,
-            max_scaled_ball_residual=max_scaled_ball_residual,
-        )
+    return graph_fusion_kkt_diagnostics_from_components_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        adj=adj,
+        lower=lower,
+        upper=upper,
+        atol=atol,
+        max_edge_residual=max_edge_residual,
+        max_ball_residual=max_ball_residual,
+        max_radius=max_radius,
+        max_scaled_edge_residual=max_scaled_edge_residual,
+        max_scaled_ball_residual=max_scaled_ball_residual,
     )
 
 
@@ -977,7 +975,7 @@ def _audit_certificate(
             lambda_value=problem.lambda_value,
             atol=problem.atol,
         )
-    values = graph_fusion_kkt_residual_from_grad_torch(
+    return graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
         grad_smooth=grad_smooth,
         dual_kkt=_dense_dual_for_graph(
@@ -991,7 +989,6 @@ def _audit_certificate(
         lambda_value=problem.lambda_value,
         atol=problem.atol,
     )
-    return KKTDiagnostics.from_mapping(values)
 
 
 def _refine_certificate(
@@ -1049,7 +1046,7 @@ def _refine_certificate(
     )
     return CertificateAttempt(
         certificate=refined_certificate,
-        diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
+        diagnostics=dense["diag"],
         status=str(dense["status"]),
     )
 

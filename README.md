@@ -111,6 +111,12 @@ qualification are rebuilt. `SolverState` remains mutable numerical work state.
 Discarded multistart fits are released after comparison. Search attempt traces
 retain immutable diagnostics, never discarded fits or certificate tensors;
 actual controller continuation and bracket states remain available.
+Persistent fits keep both continuation state and independent certificate
+witnesses on CPU, preserving tensor values, dtype, aliases, and solve-device
+provenance. Terminal certification retains only its current evidence. One
+refinement driver preserves the original full/chunked adjoint routes and uses
+a frozen complete residual for each simultaneous update. Host CEM costs and
+multiplicity posteriors skip derivatives without changing marginalization.
 
 ## Outputs and integrity
 

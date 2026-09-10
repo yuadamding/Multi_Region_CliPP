@@ -496,13 +496,13 @@ def _linear_candidate_starts_torch(
     global scalar certificates.
     """
 
-    if int(model.path_shape[-1]) <= 2:
+    if int(model.candidate_shape[-1]) <= 2:
         return ()
     lower, upper = model.lower, model.upper
     informed = model.observed & (model.total > 0.0)
     vaf = (model.alt + 0.5) / (model.total + 1.0)
     starts: list[torch.Tensor] = []
-    for candidate_index in range(min(int(model.path_shape[-1]), 6)):
+    for candidate_index in range(min(int(model.candidate_shape[-1]), 6)):
         slope = model.slope[..., candidate_index]
         eligible = informed & model.valid[..., candidate_index] & (slope > 0.0)
         seed = torch.where(

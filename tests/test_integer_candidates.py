@@ -30,7 +30,7 @@ def test_exact_candidate_support_and_uniform_normalized_prior(major, minor):
 
 def test_padded_width_is_data_dependent_and_padding_never_has_prior_mass():
     model = compile_observed_model(integer_data(((1, 2), (4, 3))), eps=1e-6)
-    assert model.path_shape == (2, 2, 4)
+    assert model.candidate_shape == (2, 2, 4)
     np.testing.assert_array_equal(model.valid.sum(axis=-1), [[1, 2], [4, 3]])
     assert np.all(model.slope[~model.valid] == 0)
     assert np.all(model.log_prior[~model.valid] == -np.inf)

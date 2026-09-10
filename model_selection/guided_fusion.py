@@ -89,7 +89,7 @@ class GuidedFusionDiagnostics:
 
 @dataclass(frozen=True, slots=True)
 class GuidedFusionInitialization:
-    """A data-derived lambda and solver-compatible primal/actual-dual state."""
+    """A data-derived lambda and host-resident primal/actual-dual warm state."""
 
     lambda_value: float
     solver_state: SolverState
@@ -806,11 +806,11 @@ def build_guided_fusion_initialization(
             max_between_dual_ball_ratio=_max_dual_ratio(
                 dual, mask=between, radius=radius
             ),
-            kkt_residual=float(audit["kkt_residual"]),
-            stationarity_residual=float(audit["stationarity_residual"]),
-            edge_subgradient_residual=float(audit["edge_subgradient_residual"]),
-            dual_ball_residual=float(audit["dual_ball_residual"]),
-            box_residual=float(audit["box_residual"]),
+            kkt_residual=float(audit.kkt_residual),
+            stationarity_residual=float(audit.stationarity_residual),
+            edge_subgradient_residual=float(audit.edge_subgradient_residual),
+            dual_ball_residual=float(audit.dual_ball_residual),
+            box_residual=float(audit.box_residual),
             num_exact_lower_active_coordinates=int(
                 torch.sum(lower_active & ~upper_active).item()
             ),
@@ -821,8 +821,8 @@ def build_guided_fusion_initialization(
         )
 
     state = SolverState(
-        phi=phi.detach(),
-        dual=dual.detach(),
+        phi=phi.detach().cpu(),
+        dual=dual.detach().cpu(),
         previous_lambda=float(lambda_value),
         objective_spec_hash=str(solver_context.objective_spec_hash),
     )

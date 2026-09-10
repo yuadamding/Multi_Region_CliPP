@@ -20,6 +20,7 @@ from ..core.fusion.solver import (
     transfer_scalar_pilot_certificates,
 )
 from ..core.fusion.types import (
+    ConvergenceResult,
     RawFit,
     PreparedProblem,
     SolverState,
@@ -52,9 +53,9 @@ from ..model_selection.proposals import (
     build_partition_guided_graph_with_resource_policy as _build_partition_guided_graph_with_resource_policy,
     clone_start as _clone_start,
     direct_partition_source as _direct_partition_source,
-    escape_path_breakpoint_retry_state as _escape_path_breakpoint_retry_state,
+    escape_emission_breakpoint_retry_state as _escape_emission_breakpoint_retry_state,
     explicit_path_default_start_specs as _explicit_path_default_start_specs,
-    offload_solver_state_to_cpu as _offload_solver_state_to_cpu,
+    offload_raw_fit_to_cpu as _offload_raw_fit_to_cpu,
     pilot_matrix_hash as _pilot_matrix_hash,
     select_raw_start_attempt as _select_raw_start_attempt,
     solver_retry_fit_options,
@@ -140,20 +141,21 @@ class NoCertifiedRawReferenceError(RuntimeError):
                 "promotion": best.promotion_status,
                 "polished": best.precision_polished,
                 "stage_outer": (
-                    f"{best.stage_outer_iterations}/{best.stage_outer_max_iter}"
+                    f"{best.convergence.stage_outer_iterations}/"
+                    f"{best.convergence.stage_outer_max_iter}"
                 ),
-                "stage_inner": best.stage_inner_iterations,
-                "stage_inner_max": best.stage_inner_max_iter,
-                "stage_inner_calls": best.stage_inner_solve_calls,
-                "stop": best.stop_reason,
-                "progress": best.progress_residual_method,
-                "solve_tol": best.solve_tolerance,
-                "legacy_kkt": best.legacy_stop_kkt_residual,
-                "componentwise_kkt": best.componentwise_stop_kkt_residual,
+                "stage_inner": best.convergence.stage_inner_iterations,
+                "stage_inner_max": best.convergence.stage_inner_max_iter,
+                "stage_inner_calls": best.convergence.stage_inner_solve_calls,
+                "stop": best.convergence.stop_reason,
+                "progress": best.convergence.progress_residual_method,
+                "solve_tol": best.convergence.solve_tolerance,
+                "legacy_kkt": best.convergence.legacy_stop_kkt_residual,
+                "componentwise_kkt": best.convergence.componentwise_stop_kkt_residual,
                 "steps": (
-                    f"{best.accepted_full_steps}/"
-                    f"{best.accepted_damped_steps}/"
-                    f"{best.rejected_outer_steps}"
+                    f"{best.convergence.accepted_full_steps}/"
+                    f"{best.convergence.accepted_damped_steps}/"
+                    f"{best.convergence.rejected_outer_steps}"
                 ),
                 "fallback": best.fallback_reason,
             }
@@ -211,6 +213,8 @@ def _raw_attempt_trace(
         raise TypeError("Raw attempt diagnostics require a current typed RawFit.")
     certificate = fit.certificate
     convergence = fit.convergence
+    if not isinstance(convergence, ConvergenceResult):
+        raise TypeError("Raw attempt diagnostics require a current typed ConvergenceResult.")
     components = {
         "stationarity": float(certificate.components.stationarity),
         "edge_subgradient": float(certificate.components.edge_subgradient),
@@ -230,7 +234,6 @@ def _raw_attempt_trace(
         mathematically_certified=bool(attempt.mathematically_certified),
         objective=float(fit.objective.total),
         kkt_components=certificate.components,
-        kkt_residual=float(certificate.components.residual),
         kkt_tolerance=float(certificate.tolerance),
         dominant_kkt_component=(
             max(finite_components, key=finite_components.get)
@@ -240,7 +243,7 @@ def _raw_attempt_trace(
         certificate_status=str(certificate.status),
         certificate_certified=bool(certificate.certified),
         certificate_admissible=bool(certificate.admissible),
-        mm_consistency_violations=int(convergence.mm_consistency_violations),
+        convergence=convergence,
         work=fit.work,
         outer_max_iter=int(outer_max_iter),
         inner_max_iter=int(inner_max_iter),
@@ -249,19 +252,6 @@ def _raw_attempt_trace(
         audit_dtype=str(certificate.audit_dtype),
         precision_polished=bool(certificate.precision_polished),
         promotion_status=str(attempt.promotion_status),
-        stage_outer_iterations=int(convergence.stage_outer_iterations),
-        stage_outer_max_iter=int(convergence.stage_outer_max_iter),
-        stage_inner_iterations=int(convergence.stage_inner_iterations),
-        stage_inner_max_iter=int(convergence.stage_inner_max_iter),
-        stage_inner_solve_calls=int(convergence.stage_inner_solve_calls),
-        stop_reason=str(convergence.stop_reason),
-        progress_residual_method=str(convergence.progress_residual_method),
-        solve_tolerance=float(convergence.solve_tolerance),
-        legacy_stop_kkt_residual=float(convergence.legacy_stop_kkt_residual),
-        componentwise_stop_kkt_residual=float(convergence.componentwise_stop_kkt_residual),
-        accepted_full_steps=int(convergence.accepted_full_steps),
-        accepted_damped_steps=int(convergence.accepted_damped_steps),
-        rejected_outer_steps=int(convergence.rejected_outer_steps),
         fallback_reason=str(certificate.fallback_reason),
     )
 
@@ -269,23 +259,24 @@ def _raw_attempt_trace(
 def _compact_raw_attempt_summary(item: RawAttemptTrace) -> str:
     """Render one scalar-only attempt token suitable for scheduler stderr."""
 
+    convergence = item.convergence
     steps = (
-        f"{item.accepted_full_steps}/{item.accepted_damped_steps}/"
-        f"{item.rejected_outer_steps}"
+        f"{convergence.accepted_full_steps}/{convergence.accepted_damped_steps}/"
+        f"{convergence.rejected_outer_steps}"
     )
     return (
         f"r{item.search_round}:{item.search_phase}:{item.source}@{item.lambda_value:.6g}"
         f"|kkt={item.kkt_residual:.6g}/{item.kkt_tolerance:.6g}"
         f"|dtype={item.working_dtype}/{item.audit_dtype}"
         f"|prom={item.promotion_status}|polish={int(item.precision_polished)}"
-        f"|progress={item.progress_residual_method}"
-        f"|solve_tol={item.solve_tolerance:.6g}"
-        f"|outer={item.stage_outer_iterations}/{item.stage_outer_max_iter}"
-        f"|inner={item.stage_inner_iterations}/"
-        f"{item.stage_inner_solve_calls}x{item.stage_inner_max_iter}"
-        f"|stop={item.stop_reason}"
-        f"|stop_kkt={item.legacy_stop_kkt_residual:.6g}/"
-        f"{item.componentwise_stop_kkt_residual:.6g}"
+        f"|progress={convergence.progress_residual_method}"
+        f"|solve_tol={convergence.solve_tolerance:.6g}"
+        f"|outer={convergence.stage_outer_iterations}/{convergence.stage_outer_max_iter}"
+        f"|inner={convergence.stage_inner_iterations}/"
+        f"{convergence.stage_inner_solve_calls}x{convergence.stage_inner_max_iter}"
+        f"|stop={convergence.stop_reason}"
+        f"|stop_kkt={convergence.legacy_stop_kkt_residual:.6g}/"
+        f"{convergence.componentwise_stop_kkt_residual:.6g}"
         f"|steps={steps}"
         f"|fallback={item.fallback_reason or 'none'}"
     )
@@ -345,7 +336,7 @@ def _raw_reference_failure_diagnostics(
         dominant_component = str(best_attempt.dominant_kkt_component)
 
     mm_values = [
-        attempt.mm_consistency_violations for attempt in attempts
+        attempt.convergence.mm_consistency_violations for attempt in attempts
     ]
     direct = [record for record in records if record.family == "direct_partition"]
     return RawReferenceFailureDiagnostics(
@@ -646,10 +637,6 @@ def _partition_guided_admm_selection(
             solver_context=base_solver_context,
             fit_options=effective_fit_options,
         )
-    )
-    guided_initialization = replace(
-        guided_initialization,
-        solver_state=_offload_solver_state_to_cpu(guided_initialization.solver_state),
     )
     runtime = base_solver_context.runtime
     model = base_solver_context.model
@@ -963,7 +950,7 @@ def _partition_guided_admm_selection(
                     solver_state_start, changed_count = None, 0
                     cold_state = original_state
                 else:
-                    solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
+                    solver_state_start, changed_count = _escape_emission_breakpoint_retry_state(
                         original_state,
                         start_source=lambda_start_source,
                         start_lambda=lambda_start_value,
@@ -993,11 +980,7 @@ def _partition_guided_admm_selection(
                     raise AssertionError(
                         "Raw multistart changed the fixed objective identity."
                     )
-                if seed_fit.state is not None:
-                    seed_fit = replace(
-                        seed_fit,
-                        state=_offload_solver_state_to_cpu(seed_fit.state),
-                    )
+                seed_fit = _offload_raw_fit_to_cpu(seed_fit)
                 recovery_fit = recovery_fit_by_lambda.get(lambda_key)
                 residual = float(seed_fit.certificate.components.residual)
                 if seed_fit.state is not None and np.isfinite(residual) and (

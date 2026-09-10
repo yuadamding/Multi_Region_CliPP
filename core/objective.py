@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import torch
@@ -190,41 +190,41 @@ class ObservedModel(ImmutableArrayRecord):
         if observed.shape != shape:
             raise ValueError(f"ObservedModel.observed must have shape {shape}.")
 
-        path_arrays = {
+        candidate_arrays = {
             name: np.array(getattr(self, name), dtype=np.float64, copy=True, order="C")
             for name in ("slope", "log_prior")
         }
-        path_shape = path_arrays["slope"].shape
-        if len(path_shape) != 3 or path_shape[:2] != shape or not path_shape[2]:
+        candidate_shape = candidate_arrays["slope"].shape
+        if len(candidate_shape) != 3 or candidate_shape[:2] != shape or not candidate_shape[2]:
             raise ValueError(
-                "ObservedModel path arrays must have nonempty shape (M, S, K)."
+                "ObservedModel candidate arrays must have nonempty shape (M, S, K)."
             )
-        for name, value in path_arrays.items():
-            if value.shape != path_shape:
-                raise ValueError(f"ObservedModel.{name} must have shape {path_shape}.")
+        for name, value in candidate_arrays.items():
+            if value.shape != candidate_shape:
+                raise ValueError(f"ObservedModel.{name} must have shape {candidate_shape}.")
         valid = np.array(self.valid, dtype=bool, copy=True, order="C")
-        if valid.shape != path_shape:
-            raise ValueError(f"ObservedModel.valid must have shape {path_shape}.")
+        if valid.shape != candidate_shape:
+            raise ValueError(f"ObservedModel.valid must have shape {candidate_shape}.")
         if not np.all(np.any(valid, axis=-1)):
-            raise ValueError("Every mutation-region entry must have a valid path.")
-        slopes = path_arrays["slope"][valid]
+            raise ValueError("Every mutation-region entry must have a valid candidate.")
+        slopes = candidate_arrays["slope"][valid]
         if np.any(~np.isfinite(slopes)) or np.any(slopes < 0.0):
             raise ValueError("Valid slope values must be finite and nonnegative.")
-        if np.any(~np.isfinite(path_arrays["log_prior"][valid])):
+        if np.any(~np.isfinite(candidate_arrays["log_prior"][valid])):
             raise ValueError("Valid log_prior values must be finite.")
 
-        path_arrays["slope"] = np.where(valid, path_arrays["slope"], 0.0)
-        path_arrays["log_prior"] = np.where(
-            valid, path_arrays["log_prior"], -np.inf
+        candidate_arrays["slope"] = np.where(valid, candidate_arrays["slope"], 0.0)
+        candidate_arrays["log_prior"] = np.where(
+            valid, candidate_arrays["log_prior"], -np.inf
         )
-        maximum = np.max(path_arrays["log_prior"], axis=-1, keepdims=True)
+        maximum = np.max(candidate_arrays["log_prior"], axis=-1, keepdims=True)
         normalizer = np.squeeze(
             maximum
             + np.log(
                 np.sum(
                     np.where(
                         valid,
-                        np.exp(path_arrays["log_prior"] - maximum),
+                        np.exp(candidate_arrays["log_prior"] - maximum),
                         0.0,
                     ),
                     axis=-1,
@@ -234,7 +234,7 @@ class ObservedModel(ImmutableArrayRecord):
             axis=-1,
         )
         if not np.allclose(normalizer, 0.0, rtol=0.0, atol=1e-10):
-            raise ValueError("ObservedModel.log_prior must normalize over valid paths.")
+            raise ValueError("ObservedModel.log_prior must normalize over valid candidates.")
 
         model_id = str(self.model_id).strip()
         if not model_id:
@@ -242,7 +242,7 @@ class ObservedModel(ImmutableArrayRecord):
         for name, value in observation_arrays.items():
             object.__setattr__(self, name, _readonly_array(value, dtype=np.float64))
         object.__setattr__(self, "observed", _readonly_array(observed, dtype=bool))
-        for name, value in path_arrays.items():
+        for name, value in candidate_arrays.items():
             object.__setattr__(self, name, _readonly_array(value, dtype=np.float64))
         object.__setattr__(self, "valid", _readonly_array(valid, dtype=bool))
         object.__setattr__(self, "model_id", model_id)
@@ -258,7 +258,7 @@ class ObservedModel(ImmutableArrayRecord):
         return tuple(int(value) for value in self.alt.shape)
 
     @property
-    def path_shape(self) -> tuple[int, int, int]:
+    def candidate_shape(self) -> tuple[int, int, int]:
         return tuple(int(value) for value in self.slope.shape)
 
     @property
@@ -347,7 +347,7 @@ class TorchObservedModel:
         return tuple(int(value) for value in self.alt.shape)
 
     @property
-    def path_shape(self) -> tuple[int, int, int]:
+    def candidate_shape(self) -> tuple[int, int, int]:
         return tuple(int(value) for value in self.slope.shape)
 
     @property
@@ -372,14 +372,14 @@ class TorchObservedTerms:
 
 
 @dataclass(frozen=True, slots=True)
-class _NumpyPathKernel:
+class _NumpyEmissionKernel:
     mass: np.ndarray
     probability: np.ndarray
-    slope: np.ndarray
+    slope: np.ndarray | None
 
 
 @dataclass(frozen=True, slots=True)
-class _TorchPathKernel:
+class _TorchEmissionKernel:
     mass: torch.Tensor
     probability: torch.Tensor
     slope: torch.Tensor | None
@@ -562,24 +562,27 @@ def _validate_candidate_range(model: ObservedModel, eps: float, dtype: torch.dty
         )
 
 
-def _path_kernel_numpy(
+def _emission_kernel_numpy(
     model: ObservedModel,
     phi: np.ndarray,
     *,
     eps: float,
-) -> _NumpyPathKernel:
+    derivatives: bool = True,
+) -> _NumpyEmissionKernel:
     epsilon = _validated_epsilon(eps)
     phi_array = np.asarray(phi, dtype=np.float64)
     if phi_array.shape != model.shape or not np.all(np.isfinite(phi_array)):
         raise ValueError(f"phi must be a finite array with shape {model.shape}.")
     mass = model.slope * phi_array[..., None]
     probability = np.clip(mass, epsilon, 1.0 - epsilon)
-    slope = np.where(
-        (mass > epsilon) & (mass < 1.0 - epsilon),
-        model.slope,
-        0.0,
-    )
-    return _NumpyPathKernel(mass=mass, probability=probability, slope=slope)
+    slope = None
+    if derivatives:
+        slope = np.where(
+            (mass > epsilon) & (mass < 1.0 - epsilon),
+            model.slope,
+            0.0,
+        )
+    return _NumpyEmissionKernel(mass=mass, probability=probability, slope=slope)
 
 
 def candidate_terms_numpy(alt, nonalt, probability, slope, *, derivative_order=2):
@@ -613,14 +616,14 @@ def _candidate_terms_torch(alt, nonalt, probability, slope, *, derivative_order=
     return log_kernel, score, curvature
 
 
-def _path_kernel_torch(
+def _emission_kernel_torch(
     model: TorchObservedModel,
     phi: torch.Tensor,
     *,
     eps: float,
     derivatives: bool = True,
-) -> _TorchPathKernel:
-    """Evaluate every canonical path over optional trailing grid dimensions.
+) -> _TorchEmissionKernel:
+    """Evaluate every canonical candidate over optional trailing grid dimensions.
 
     ``phi`` has shape ``(M, S, *grid)``. Runtime model arrays are reshaped,
     not copied, so the kernel stays resident on its original device while a
@@ -636,13 +639,13 @@ def _path_kernel_torch(
     if phi.dtype != model.alt.dtype or phi.device != model.alt.device:
         raise ValueError("phi must use the observed model's runtime dtype and device.")
     grid_ndim = phi.ndim - 2
-    path_shape = (*model.shape, *((1,) * grid_ndim), model.path_shape[-1])
+    candidate_shape = (*model.shape, *((1,) * grid_ndim), model.candidate_shape[-1])
 
-    def path_view(value: torch.Tensor) -> torch.Tensor:
-        return value.reshape(path_shape)
+    def candidate_view(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(candidate_shape)
 
     expanded_phi = phi.unsqueeze(-1)
-    candidate_slope = path_view(model.slope)
+    candidate_slope = candidate_view(model.slope)
     mass = candidate_slope * expanded_phi
     probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
     slope = None
@@ -652,20 +655,23 @@ def _path_kernel_torch(
             candidate_slope,
             torch.zeros_like(candidate_slope),
         )
-    return _TorchPathKernel(mass=mass, probability=probability, slope=slope)
+    return _TorchEmissionKernel(mass=mass, probability=probability, slope=slope)
 
 
-def observed_terms_numpy(
+def _observed_reduction_numpy(
     model: ObservedModel,
     phi: np.ndarray,
     *,
     eps: float,
-) -> ObservedTerms:
-    """Evaluate loss, left-gradient, curvature majorant, and path posterior."""
+    output: Literal["loss", "posterior", "terms"],
+) -> np.ndarray | ObservedTerms:
+    """One marginalized reduction, with only the requested numerical work."""
 
-    kernel = _path_kernel_numpy(model, phi, eps=eps)
+    derivatives = output == "terms"
+    kernel = _emission_kernel_numpy(model, phi, eps=eps, derivatives=derivatives)
     log_kernel, state_gradient, state_curvature = candidate_terms_numpy(
         model.alt[..., None], model.nonalt[..., None], kernel.probability, kernel.slope,
+        derivative_order=2 if derivatives else 0,
     )
     joint = np.where(
         model.valid,
@@ -676,13 +682,19 @@ def observed_terms_numpy(
     maximum = np.max(joint, axis=-1, keepdims=True)
     unnormalized = np.where(model.valid, np.exp(joint - maximum), 0.0)
     denominator = np.sum(unnormalized, axis=-1, keepdims=True)
+    if output != "posterior":
+        log_normalizer = np.squeeze(maximum + np.log(denominator), axis=-1)
+        loss = -log_normalizer
+    if output == "loss":
+        return np.where(model.observed, loss, 0.0)
     posterior = unnormalized / denominator
-    log_normalizer = np.squeeze(maximum + np.log(denominator), axis=-1)
-    loss = -log_normalizer
-    gradient = -np.sum(posterior * state_gradient, axis=-1)
-    hessian_upper = np.sum(posterior * state_curvature, axis=-1)
+    if derivatives:
+        gradient = -np.sum(posterior * state_gradient, axis=-1)
+        hessian_upper = np.sum(posterior * state_curvature, axis=-1)
     prior = np.where(model.valid, np.exp(model.log_prior), 0.0)
     posterior = np.where(model.observed[..., None], posterior, prior)
+    if output == "posterior":
+        return posterior
     loss = np.where(model.observed, loss, 0.0)
     gradient = np.where(model.observed, gradient, 0.0)
     hessian_upper = np.where(
@@ -696,6 +708,17 @@ def observed_terms_numpy(
     )
 
 
+def observed_terms_numpy(
+    model: ObservedModel,
+    phi: np.ndarray,
+    *,
+    eps: float,
+) -> ObservedTerms:
+    """Evaluate loss, left-gradient, curvature majorant, and candidate posterior."""
+
+    return cast(ObservedTerms, _observed_reduction_numpy(model, phi, eps=eps, output="terms"))
+
+
 def observed_terms_torch(
     model: TorchObservedModel,
     phi: torch.Tensor,
@@ -706,7 +729,7 @@ def observed_terms_torch(
 
     if tuple(phi.shape) != tuple(model.alt.shape):
         raise ValueError(f"phi must have shape {tuple(model.alt.shape)}.")
-    kernel = _path_kernel_torch(model, phi, eps=eps)
+    kernel = _emission_kernel_torch(model, phi, eps=eps)
     log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
         model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
     )
@@ -748,22 +771,22 @@ def observed_loss_grid_torch(
     start generation.
     """
 
-    kernel = _path_kernel_torch(model, phi, eps=eps, derivatives=False)
+    kernel = _emission_kernel_torch(model, phi, eps=eps, derivatives=False)
     grid_ndim = phi.ndim - 2
     observation_shape = (*model.shape, *((1,) * grid_ndim))
-    path_shape = (*observation_shape, model.path_shape[-1])
+    candidate_shape = (*observation_shape, model.candidate_shape[-1])
 
     def observation_view(value: torch.Tensor) -> torch.Tensor:
         return value.reshape(observation_shape)
 
-    def path_view(value: torch.Tensor) -> torch.Tensor:
-        return value.reshape(path_shape)
+    def candidate_view(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(candidate_shape)
 
     log_kernel, _, _ = _candidate_terms_torch(
         observation_view(model.alt).unsqueeze(-1), observation_view(model.nonalt).unsqueeze(-1),
         kernel.probability, kernel.slope, derivative_order=0,
     )
-    joint = (log_kernel + path_view(model.log_prior)).masked_fill(~path_view(model.valid), -torch.inf)
+    joint = (log_kernel + candidate_view(model.log_prior)).masked_fill(~candidate_view(model.valid), -torch.inf)
     del log_kernel
     loss = -torch.logsumexp(joint, dim=-1)
     if not bool(respect_observed):
@@ -786,9 +809,9 @@ def observed_em_terms_torch(
 
     if tuple(phi.shape) != model.shape:
         raise ValueError(f"phi must have shape {model.shape}.")
-    if tuple(responsibilities.shape) != model.path_shape:
+    if tuple(responsibilities.shape) != model.candidate_shape:
         raise ValueError(
-            f"responsibilities must have shape {model.path_shape}, "
+            f"responsibilities must have shape {model.candidate_shape}, "
             f"not {tuple(responsibilities.shape)}."
         )
     if responsibilities.dtype != model.alt.dtype or (
@@ -805,9 +828,9 @@ def observed_em_terms_torch(
     weights = responsibilities.masked_fill(~model.valid, 0.0)
     normalizer = torch.sum(weights, dim=-1, keepdim=True)
     if bool(torch.any(normalizer <= 0.0).item()):
-        raise ValueError("responsibilities must assign mass to a valid path.")
+        raise ValueError("responsibilities must assign mass to a valid candidate.")
     weights = weights / normalizer
-    kernel = _path_kernel_torch(model, phi, eps=eps)
+    kernel = _emission_kernel_torch(model, phi, eps=eps)
     log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
         model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
     )
@@ -880,7 +903,7 @@ def observed_one_sided_gradients_torch(
     epsilon = _validated_epsilon(eps, model.alt.dtype)
     if tuple(phi.shape) != model.shape:
         raise ValueError(f"phi must have shape {model.shape}.")
-    kernel = _path_kernel_torch(model, phi, eps=epsilon)
+    kernel = _emission_kernel_torch(model, phi, eps=epsilon)
     expanded_phi = phi.unsqueeze(-1)
     left_slope = model.slope
     right_slope = model.slope
@@ -953,7 +976,7 @@ def infer_integer_multiplicity_posterior_numpy(
         raise ValueError("phi must lie inside the compiled CCF bounds.")
 
     posterior = np.asarray(
-        observed_terms_numpy(model, phi_array, eps=eps).posterior,
+        _observed_reduction_numpy(model, phi_array, eps=eps, output="posterior"),
         dtype=np.float64,
     )
     # The compiler validates the complete, increasingly ordered integer range.

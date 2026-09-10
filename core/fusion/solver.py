@@ -918,7 +918,7 @@ def _finalize_precision_polish(
     )
 
 
-def escape_path_breakpoint_solver_state(
+def escape_emission_breakpoint_solver_state(
     state: SolverState | None,
     *,
     context: PreparedProblem,
@@ -1322,19 +1322,8 @@ def prepare_torch_problem_with_resource_policy(
             resolved_by_cpu_fallback = True
 
 
-def _initial_outer_diag() -> dict[str, float | int]:
-    """Fail-closed residuals used until the first outer KKT audit."""
-    return {
-        "stationarity_residual": np.inf,
-        "edge_subgradient_residual": np.inf,
-        "dual_ball_residual": np.inf,
-        "box_residual": np.inf,
-        "kkt_residual": np.inf,
-    }
-
-
 def _backward_error_kkt_within_gate(
-    diagnostics: dict[str, float | int],
+    diagnostics: KKTDiagnostics,
     *,
     certification_tol: float,
 ) -> bool:
@@ -1343,12 +1332,10 @@ def _backward_error_kkt_within_gate(
     The legacy globally normalized L2 residual remains available for progress
     reporting, but its dimension-dependent scaling cannot terminate an outer
     solve whose authoritative componentwise backward error is still too high.
-    Missing and nonfinite schema-v2 diagnostics fail closed.
+    Unset and nonfinite schema-v2 diagnostics fail closed.
     """
 
-    residual = float(
-        diagnostics.get("backward_error_kkt_residual", float("inf"))
-    )
+    residual = float(diagnostics.backward_error_kkt_residual)
     return bool(
         np.isfinite(residual)
         and residual >= 0.0
@@ -1411,7 +1398,6 @@ def _solve_inner_subproblem(
                 f"approximately {dense_bytes} bytes (available policy limit: "
                 f"{dense_limit})."
             )
-    surrogate_diag_values: dict[str, float | int] = {}
     if use_alm:
         (
             phi_trial,
@@ -1420,6 +1406,7 @@ def _solve_inner_subproblem(
             _inner_iterations,
             inner_ok,
             _inner_residual,
+            surrogate_diag,
         ) = solve_majorized_subproblem_alm_torch(
             runtime=runtime,
             num_mutations=num_mutations,
@@ -1438,7 +1425,6 @@ def _solve_inner_subproblem(
             dual_start_is_actual=dual_start_is_actual,
             spectral_rho=bool(spectral_rho),
             use_backward_error_stopping=bool(use_backward_error_stopping),
-            diagnostics_out=surrogate_diag_values,
         )
     else:
         (
@@ -1448,6 +1434,7 @@ def _solve_inner_subproblem(
             _inner_iterations,
             inner_ok,
             _inner_residual,
+            surrogate_diag,
         ) = solve_majorized_subproblem_pdhg_torch(
             runtime=runtime,
             num_mutations=num_mutations,
@@ -1466,7 +1453,6 @@ def _solve_inner_subproblem(
             dual_start=dual,
             tau_node=pdhg_tau_node,
             use_backward_error_stopping=bool(use_backward_error_stopping),
-            diagnostics_out=surrogate_diag_values,
         )
     if use_alm:
         # The outer MM loop carries the rho-invariant actual multiplier y.
@@ -1474,9 +1460,7 @@ def _solve_inner_subproblem(
         # edge-by-region tensor does not remain live through outer scoring and
         # certificate refinement.
         dual_trial = dual_kkt_trial
-    if surrogate_diag_values:
-        surrogate_diag = surrogate_diag_values
-    else:
+    if surrogate_diag is None:
         surrogate_diag = graph_fusion_kkt_residual_from_grad_torch(
             phi=phi_trial,
             grad_smooth=h * (phi_trial - U),
@@ -1508,7 +1492,7 @@ def _solve_inner_subproblem(
             graph_hash=str(graph_hash),
         ),
         surrogate_certificate=certificate,
-        surrogate_kkt=KKTDiagnostics.from_mapping(surrogate_diag),
+        surrogate_kkt=surrogate_diag,
         converged=bool(inner_ok),
         iterations=int(_inner_iterations),
     )
@@ -1653,7 +1637,6 @@ def _fit_from_start(
     iterations = 0
     work_counters = WorkCounters()
     current_inner_converged = False
-    final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
     mm_consistency_violations = 0
     total_inner_iterations = 0
@@ -1694,7 +1677,7 @@ def _fit_from_start(
         else:
             responsibilities = current_mutation_region_terms.posterior
             if responsibilities is None:
-                raise AssertionError("Observed terms lack path responsibilities.")
+                raise AssertionError("Observed terms lack candidate responsibilities.")
             surrogate_terms = observed_em_terms_torch(
                 model,
                 phi,
@@ -1739,17 +1722,17 @@ def _fit_from_start(
                 gradient=forcing_gradient,
                 witness=forcing_certificate,
                 refine=False,
-            ).diagnostics.as_dict()
-            forcing_residual_key = (
-                "backward_error_kkt_residual"
+            ).diagnostics
+            forcing_residual = (
+                forcing_diag.backward_error_kkt_residual
                 if use_backward_error_progress
-                else "kkt_residual"
+                else forcing_diag.kkt_residual
             )
             inner_progress_tolerance = max(
                 5.0 * tol,
                 min(
                     float(np.sqrt(tol)),
-                    0.9 * float(forcing_diag[forcing_residual_key]),
+                    0.9 * float(forcing_residual),
                 ),
             )
         else:
@@ -2189,7 +2172,6 @@ def _fit_from_start(
             or iterations % _OUTER_KKT_CHECK_EVERY == 0
             or not np.isfinite(objective)
         )
-        outer_diag = final_outer_diag
         outer_converged = False
         if do_outer_kkt_audit:
             outer_terms = current_mutation_region_terms
@@ -2235,10 +2217,10 @@ def _fit_from_start(
             if should_refine:
                 work_counters = work_counters + observed_refinement.work_counters
             certificate = observed_refinement.certificate
-            outer_diag = observed_refinement.diagnostics.as_dict()
-            legacy_stop_kkt_residual = float(outer_diag["kkt_residual"])
+            outer_diag = observed_refinement.diagnostics
+            legacy_stop_kkt_residual = float(outer_diag.kkt_residual)
             componentwise_stop_kkt_residual = float(
-                outer_diag.get("backward_error_kkt_residual", float("inf"))
+                outer_diag.backward_error_kkt_residual
             )
             outer_converged = bool(
                 _backward_error_kkt_within_gate(
@@ -2246,12 +2228,10 @@ def _fit_from_start(
                     certification_tol=cert_tol,
                 )
                 if use_backward_error_progress
-                else float(outer_diag["kkt_residual"]) <= 5.0 * cert_tol
+                else float(outer_diag.kkt_residual) <= 5.0 * cert_tol
             )
         if accepted:
             current_inner_converged = bool(inner_converged)
-        if do_outer_kkt_audit:
-            final_outer_diag = outer_diag
         converged_outer = bool(outer_converged)
         if (
             rel_change <= tol
@@ -2286,7 +2266,6 @@ def _fit_from_start(
         tol=cert_tol,
     )
 
-    final_refinements = []
     certificate_needs_final_pass = False
     for _ in range(4):
         final_certificate_refinement = certify(
@@ -2302,7 +2281,7 @@ def _fit_from_start(
                 else None
             ),
         )
-        final_refinements.append(final_certificate_refinement)
+        work_counters = work_counters + final_certificate_refinement.work_counters
         certificate = final_certificate_refinement.certificate
         certificate_needs_final_pass = False
         if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
@@ -2319,6 +2298,7 @@ def _fit_from_start(
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
         )
+        del interval_dual
         next_gradient = build_certificate_gradient(
             model,
             phi,
@@ -2353,14 +2333,10 @@ def _fit_from_start(
                 else None
             ),
         )
-        final_refinements.append(final_certificate_refinement)
-
-    for refinement in final_refinements:
-        work_counters = work_counters + refinement.work_counters
+        work_counters = work_counters + final_certificate_refinement.work_counters
     certificate = final_certificate_refinement.certificate
-    final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
     working_precision_kkt_residual = float(
-        final_outer_diag["backward_error_kkt_residual"]
+        final_certificate_refinement.diagnostics.backward_error_kkt_residual
     )
     certificate_audit_dtype = dtype_name(runtime.dtype)
     authoritative_objective = float(objective)
@@ -2390,16 +2366,8 @@ def _fit_from_start(
         work_counters = work_counters + WorkCounters(
             full_certificate_audit_passes=1
         )
-    admission_diag = admission_diagnostics.as_dict()
-    for key in (
-        "backward_error_stationarity_residual",
-        "backward_error_edge_subgradient_residual",
-        "backward_error_dual_ball_residual",
-        "backward_error_kkt_residual",
-    ):
-        final_outer_diag[key] = admission_diag[key]
     authoritative_kkt_residual = float(
-        admission_diag["backward_error_kkt_residual"]
+        admission_diagnostics.backward_error_kkt_residual
     )
     if not np.isfinite(float(authoritative_objective)):
         outer_stop_reason = "nonfinite_objective"
@@ -2467,11 +2435,11 @@ def _fit_from_start(
         objective_spec_hash=str(objective_spec_hash),
     )
     terminal_components = KKTComponents(
-        stationarity=float(admission_diag["backward_error_stationarity_residual"]),
+        stationarity=float(admission_diagnostics.backward_error_stationarity_residual),
         edge_subgradient=float(
-            admission_diag["backward_error_edge_subgradient_residual"]
+            admission_diagnostics.backward_error_edge_subgradient_residual
         ),
-        dual_ball=float(admission_diag["backward_error_dual_ball_residual"]),
+        dual_ball=float(admission_diagnostics.backward_error_dual_ball_residual),
         # Box feasibility is enforced by every primal update. The normalized
         # stationarity component already incorporates the box normal cone.
         box=0.0,

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 import hashlib
-from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
 import torch
@@ -112,29 +112,6 @@ class KKTDiagnostics:
     backward_error_edge_subgradient_residual: float = float("inf")
     backward_error_dual_ball_residual: float = float("inf")
     backward_error_kkt_residual: float = float("inf")
-
-    @classmethod
-    def from_mapping(cls, values: Mapping[str, float | int]) -> "KKTDiagnostics":
-        fail_closed_fields = {
-            "backward_error_stationarity_residual",
-            "backward_error_edge_subgradient_residual",
-            "backward_error_dual_ball_residual",
-            "backward_error_kkt_residual",
-        }
-        return cls(
-            **{
-                item.name: float(
-                    values.get(item.name, float("inf"))
-                    if item.name in fail_closed_fields
-                    else values[item.name]
-                )
-                for item in fields(cls)
-            }
-        )
-
-    def as_dict(self) -> dict[str, float | int]:
-        return {item.name: getattr(self, item.name) for item in fields(self)}
-
 
 @dataclass(frozen=True, slots=True)
 class DenseEdgeCertificate:

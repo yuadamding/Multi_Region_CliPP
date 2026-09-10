@@ -1,6 +1,7 @@
 """Discarded raw starts retain scalar diagnostics, never numerical witnesses."""
 
 from dataclasses import FrozenInstanceError, asdict, fields, is_dataclass, replace
+from ast import literal_eval
 from types import SimpleNamespace
 import weakref
 
@@ -77,6 +78,8 @@ def test_trace_releases_fit_state_and_certificate_witness():
     fit = replace(fit, state=state, certificate=replace(fit.certificate, witness=witness))
     refs = [weakref.ref(item) for item in (fit.phi, state.phi, dual)]
     trace = _trace(fit)
+    assert trace.convergence is fit.convergence
+    assert trace.kkt_components is fit.certificate.components
     del fit, state, dual, witness
     assert all(ref() is None for ref in refs)
     _assert_scalar_record(trace)
@@ -85,6 +88,29 @@ def test_trace_releases_fit_state_and_certificate_witness():
     assert trace.kkt_components == KKTComponents(.01, .02, .03, .04)
     with pytest.raises(FrozenInstanceError):
         trace.source = "changed"
+    with pytest.raises(FrozenInstanceError):
+        trace.convergence.stage_outer_iterations = 100
+
+
+def test_trace_composes_convergence_and_derives_residual_without_duplicate_fields():
+    _, fit, _, _ = _fit()
+    trace = _trace(fit)
+    stored = {item.name for item in fields(trace)}
+    assert stored.isdisjoint({item.name for item in fields(ConvergenceResult)})
+    assert "kkt_residual" not in stored
+    assert "certificate" not in stored
+    assert asdict(trace)["convergence"] == asdict(fit.convergence)
+    for components in (
+        KKTComponents(.7, .02, .03, .04),
+        KKTComponents(float("nan"), 0, 0, 0),
+        KKTComponents(0, float("nan"), 0, 0),
+        KKTComponents(float("inf"), 0, 0, 0),
+    ):
+        changed = replace(trace, kkt_components=components)
+        expected = components.residual
+        assert changed.kkt_residual == expected or (
+            np.isnan(changed.kkt_residual) and np.isnan(expected)
+        )
 
 
 def test_failure_fields_and_compact_token_match_bb726ad():
@@ -107,7 +133,7 @@ def test_failure_fields_and_compact_token_match_bb726ad():
         accepted_damped_steps=2, rejected_outer_steps=3,
         fallback_reason="dense_cpu_after_solver_resource_limit",
     )
-    best = asdict(diagnostics.best_raw_attempt)
+    best = asdict(trace) | asdict(trace.convergence) | {"kkt_residual": trace.kkt_residual}
     assert {key: best[key] for key in expected_best} == expected_best
     assert diagnostics.best_raw_attempt is trace
     assert diagnostics.raw_candidate_count == diagnostics.raw_solver_attempt_count == 1
@@ -126,7 +152,16 @@ def test_failure_fields_and_compact_token_match_bb726ad():
         tumor_id=data.tumor_id, records=[record], adaptive_search_stop_reason="budget",
     )
     assert "raw_solver_attempts=1" in str(error)
-    assert "'stage_outer': '3/4'" in str(error)
+    external_best = literal_eval(str(error).partition("; best_attempt=")[2].partition("; attempts=")[0])
+    assert external_best == {
+        "phase": "solver_recovery", "source": "cold", "lambda": .1,
+        "dtype": "float32/float64", "promotion": "applied", "polished": True,
+        "stage_outer": "3/4", "stage_inner": 5, "stage_inner_max": 6,
+        "stage_inner_calls": 7, "stop": "outer_iteration_limit",
+        "progress": "componentwise", "solve_tol": 5e-5, "legacy_kkt": .2,
+        "componentwise_kkt": .04, "steps": "1/2/3",
+        "fallback": "dense_cpu_after_solver_resource_limit",
+    }
     assert diagnostics.attempt_summaries[0] in str(error)
 
 
@@ -135,7 +170,7 @@ def test_trace_fields_are_typed_without_retired_result_fallbacks():
     with pytest.raises(TypeError, match="current typed RawFit"):
         _trace(SimpleNamespace(certificate=fit.certificate, convergence=fit.convergence))
     legacy = replace(fit, convergence=SimpleNamespace(iterations=10, mm_consistency_violations=0))
-    with pytest.raises(AttributeError, match="stage_outer_iterations"):
+    with pytest.raises(TypeError, match="current typed ConvergenceResult"):
         _trace(legacy)
     assert not hasattr(search, "BestRawAttemptDiagnostics")
 
@@ -156,7 +191,7 @@ def test_best_trace_stable_ties_nonfinite_components_and_absent_start_details():
     assert unresolved.best_raw_attempt is None and np.isnan(unresolved.min_kkt_residual)
     fallback = search._raw_attempts(replace(record, trace=replace(record.trace, raw_attempts=())))
     assert len(fallback) == 1 and fallback[0].outer_max_iter == 0
-    assert fallback[0].stage_outer_max_iter == 4
+    assert fallback[0].convergence.stage_outer_max_iter == 4
     _assert_scalar_record(fallback[0])
 
 
@@ -189,6 +224,7 @@ def test_search_discards_side_starts_but_preserves_recovery_and_bracket_states(
     calls = []
     observations = []
     markers = {}
+    state_none_offloads = []
 
     class Controller:
         stop_reason = "controlled_trace_test"
@@ -226,14 +262,13 @@ def test_search_discards_side_starts_but_preserves_recovery_and_bracket_states(
         calls.append((round_index, local_index))
         phi = torch.full(data.alt_counts.shape, .2 + .001 * len(calls), dtype=torch.float64)
         dual = torch.zeros((1, 1), dtype=torch.float64)
-        dual_refs.append(weakref.ref(dual))
         if round_index == 0 and local_index in (1, 2):
             markers["selected" if local_index == 1 else "recovery"] = phi.clone()
         witness = DenseEdgeCertificate(dual, context.graph_hash, "observed_objective")
         state = SolverState(phi, dual, lam, certificate=witness,
                             objective_spec_hash=context.objective_spec_hash)
         return replace(
-            template, phi=phi.numpy(), state=state,
+            template, phi=phi.numpy(), state=state if local_index < 3 else None,
             objective=ObjectiveValue(1.0 if local_index == 1 else 2.0),
             certificate=replace(template.certificate, witness=witness,
                 precision_polished=False, working_dtype="float64",
@@ -243,9 +278,21 @@ def test_search_discards_side_starts_but_preserves_recovery_and_bracket_states(
                     base=context.base_objective_key, lambda_hex=float(lam).hex())),
         )
 
+    offload = search._offload_raw_fit_to_cpu
+
+    def tracked_offload(fit):
+        if fit.state is None:
+            state_none_offloads.append(True)
+        result = offload(fit)
+        # Track retained CPU tensor objects, not detached source handles that
+        # the ownership boundary deliberately replaces even on CPU.
+        dual_refs.append(weakref.ref(result.certificate.witness.dual))
+        return result
+
+    monkeypatch.setattr(search, "_offload_raw_fit_to_cpu", tracked_offload)
     monkeypatch.setattr(search, "OnlineLambdaController", Controller)
     monkeypatch.setattr(search, "fit_prepared", fake_fit)
-    monkeypatch.setattr(search, "_escape_path_breakpoint_retry_state",
+    monkeypatch.setattr(search, "_escape_emission_breakpoint_retry_state",
                         lambda state, **kwargs: (state, 0))
     monkeypatch.setattr(search, "_explicit_path_default_start_specs", lambda **kwargs: tuple(
         (f"bank_{i}", 0.0, None, np.full(data.alt_counts.shape, .1 + .7 * i / bank_size))
@@ -266,6 +313,7 @@ def test_search_discards_side_starts_but_preserves_recovery_and_bracket_states(
     assert [row.candidate.raw_fit.objective.total for row in raw] == [1.0] * 3
     assert sum(len(row.trace.raw_attempts) for row in raw) == len(calls)
     assert len(calls) >= 3 * bank_size
+    assert state_none_offloads
     for row in raw:
         for trace in row.trace.raw_attempts:
             _assert_scalar_record(trace)

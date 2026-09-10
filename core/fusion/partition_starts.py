@@ -19,7 +19,7 @@ from ...config import (
     PARTITION_MAX_CANDIDATES_PER_K,
 )
 from ..objective import (
-    ObservedModel, TorchObservedModel, compile_observed_model, model_to_torch, observed_terms_numpy,
+    ObservedModel, TorchObservedModel, compile_observed_model, model_to_torch, _observed_reduction_numpy,
     observed_loss_grid_torch,
 )
 from ..bic import fixed_partition_dirichlet_score
@@ -429,8 +429,8 @@ def _loss_to_centers(
 
     for cluster_idx in range(num_clusters):
         phi_for_center = np.broadcast_to(centers[cluster_idx], model.shape)
-        terms = observed_terms_numpy(model, phi_for_center, eps=float(eps))
-        cost[:, cluster_idx] = np.sum(terms.loss, axis=1)
+        loss = _observed_reduction_numpy(model, phi_for_center, eps=float(eps), output="loss")
+        cost[:, cluster_idx] = np.sum(loss, axis=1)
         infeasible[:, cluster_idx] = np.any(
             phi_for_center > model.upper + max(float(eps), 1e-8), axis=1
         )

@@ -14,7 +14,7 @@ from ..core.fusion.graph_ops import (
 )
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.solver import (
-    escape_path_breakpoint_solver_state,
+    escape_emission_breakpoint_solver_state,
     objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
     transfer_scalar_pilot_certificates,
@@ -165,20 +165,18 @@ def clone_start(start: StartArray) -> StartArray:
     return np.asarray(start).copy()
 
 
-def offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | None:
-    """Move persistent warm-start tensors off the accelerator.
+def offload_raw_fit_to_cpu(fit: RawFit) -> RawFit:
+    """Move all persistent state and certificate payloads off the accelerator.
 
     Online model selection retains several certified and failed candidates so
     later proposals can warm-start from either side of an observed bracket.
     A complete-graph dual has shape E x S and can exceed a GiB for large
     cohorts. Keeping every historical dual on CUDA makes memory scale with the
     number of evaluated lambdas even though only one state is used at a time.
-    Host storage preserves the exact float dtype and values; the solver moves
-    the selected state back to its runtime device when it is next used.
+    One tensor memo preserves aliases across state, warm hints and the separate
+    terminal witness. Host storage preserves dtype, values and evidence; solve
+    provenance still describes the actual computation device.
     """
-
-    if state is None:
-        return None
 
     cpu_tensors: dict[
         tuple[
@@ -227,34 +225,36 @@ def offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | None
             )
         return certificate
 
-    warm_state = state.warm_state
-    if isinstance(warm_state, DenseWarmState):
-        warm_state = replace(
-            warm_state,
-            phi=to_cpu(warm_state.phi),
-            dual=to_cpu(warm_state.dual),
+    state = fit.state
+    if state is not None:
+        warm_state = state.warm_state
+        if isinstance(warm_state, DenseWarmState):
+            warm_state = replace(
+                warm_state,
+                phi=to_cpu(warm_state.phi),
+                dual=to_cpu(warm_state.dual),
+            )
+        elif isinstance(warm_state, PrimalOnlyWarmState):
+            warm_state = replace(
+                warm_state,
+                phi=to_cpu(warm_state.phi),
+                structure_hint=to_cpu(warm_state.structure_hint),
+                certificate_hint=certificate_to_cpu(warm_state.certificate_hint),
+            )
+        state = replace(
+            state,
+            phi=to_cpu(state.phi),
+            dual=to_cpu(state.dual),
+            warm_state=warm_state,
+            certificate=certificate_to_cpu(state.certificate),
         )
-    elif isinstance(warm_state, PrimalOnlyWarmState):
-        warm_state = replace(
-            warm_state,
-            phi=to_cpu(warm_state.phi),
-            structure_hint=to_cpu(warm_state.structure_hint),
-            certificate_hint=certificate_to_cpu(warm_state.certificate_hint),
-        )
-
-    certificate = certificate_to_cpu(state.certificate)
-
-    return SolverState(
-        phi=to_cpu(state.phi),
-        dual=to_cpu(state.dual),
-        previous_lambda=float(state.previous_lambda),
-        warm_state=warm_state,
-        certificate=certificate,
-        objective_spec_hash=str(state.objective_spec_hash),
+    return replace(
+        fit, state=state,
+        certificate=replace(fit.certificate, witness=certificate_to_cpu(fit.certificate.witness)),
     )
 
 
-def escape_path_breakpoint_retry_state(
+def escape_emission_breakpoint_retry_state(
     state: SolverState | None,
     *,
     start_source: str,
@@ -269,7 +269,7 @@ def escape_path_breakpoint_retry_state(
     } and _canonical_lambda(start_lambda) == _canonical_lambda(target_lambda)
     if state is None or not same_lambda_failure:
         return state, 0
-    return escape_path_breakpoint_solver_state(state, context=context, tol=tol)
+    return escape_emission_breakpoint_solver_state(state, context=context, tol=tol)
 
 
 def solver_retry_fit_options(
@@ -551,8 +551,8 @@ __all__ = [
     "build_partition_guided_graph_with_resource_policy",
     "clone_start",
     "direct_partition_source",
-    "escape_path_breakpoint_retry_state",
-    "offload_solver_state_to_cpu",
+    "escape_emission_breakpoint_retry_state",
+    "offload_raw_fit_to_cpu",
     "pilot_matrix_hash",
     "select_raw_start_attempt",
     "solver_retry_fit_options",

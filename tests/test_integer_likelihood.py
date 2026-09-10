@@ -174,8 +174,8 @@ def test_compiler_rebuilds_candidates_after_cn_replacement():
     data = integer_data(((4,),))
     original = compile_observed_model(data, eps=EPS)
     changed = compile_observed_model(replace(data, major_cn=np.array([[3.0]])), eps=EPS)
-    assert original.path_shape == (1, 1, 4)
-    assert changed.path_shape == (1, 1, 3)
+    assert original.candidate_shape == (1, 1, 4)
+    assert changed.candidate_shape == (1, 1, 3)
     np.testing.assert_array_equal(changed.valid, np.ones((1, 1, 3), dtype=bool))
     np.testing.assert_array_equal(changed.log_prior, np.full((1, 1, 3), -np.log(3.0)))
 

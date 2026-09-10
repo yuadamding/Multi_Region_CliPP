@@ -211,9 +211,8 @@ def test_kkt_record_preserves_distinct_progress_and_admission_quantities():
     assert diag.backward_error_kkt_residual == .4
     assert set(asdict(diag)) == {
         "stationarity_residual", "edge_subgradient_residual", "dual_ball_residual",
-        "box_residual", "kkt_residual", "backward_error_stationarity_residual",
+        "box_residual", "backward_error_stationarity_residual",
         "backward_error_edge_subgradient_residual", "backward_error_dual_ball_residual",
-        "backward_error_kkt_residual",
     }
     assert not _backward_error_kkt_within_gate(diag, certification_tol=8e-4)
 
@@ -226,7 +225,7 @@ def test_nonfinite_audit_and_missing_admission_components_fail_closed(bad_value)
     assert isinstance(diag, KKTDiagnostics)
     assert not np.isfinite(diag.backward_error_kkt_residual)
     assert not _backward_error_kkt_within_gate(diag, certification_tol=8e-4)
-    incomplete = KKTDiagnostics(0., 0., 0., 0., 0.)
+    incomplete = KKTDiagnostics(0., 0., 0., 0.)
     assert not _backward_error_kkt_within_gate(incomplete, certification_tol=8e-4)
 
 
@@ -254,10 +253,10 @@ def test_inner_results_return_typed_diagnostics_without_mapping_copies(dtype_nam
         solve = backend.solve_majorized_subproblem_alm_torch
         kwargs["edge_work_bytes"] = (2 if backend_name.endswith("streamed") else 100) * 2 * U.element_size()
         kwargs["diagnostics_out"] = counters
-    phi, _, dual, iterations, converged, residual, diag = solve(**kwargs)
+    phi, dual, iterations, converged, diag = solve(**kwargs)
     assert isinstance(diag, KKTDiagnostics)
     assert iterations == 48 and not converged
-    assert residual == (diag.backward_error_kkt_residual if backward else diag.kkt_residual)
+    assert np.isfinite(diag.backward_error_kkt_residual if backward else diag.kkt_residual)
     recomputed = backend.graph_fusion_kkt_residual_from_grad_torch(
         phi=phi, grad_smooth=kwargs["h"] * (phi - U), dual_kkt=dual,
         lower=kwargs["lower"], upper=kwargs["upper"],
@@ -269,9 +268,9 @@ def test_inner_results_return_typed_diagnostics_without_mapping_copies(dtype_nam
         assert counters == {"inner_kkt_audits": expected_audits, "inner_stationarity_checks": 6}
     kwargs["lambda_value"] = 0.
     closed = solve(**kwargs)
-    assert closed[3:6] == (0, True, 0.)
+    assert closed[2:4] == (0, True)
     if backend_name == "pdhg":
-        assert closed[6] is None
+        assert closed[4] is None
     else:
-        assert isinstance(closed[6], KKTDiagnostics)
+        assert isinstance(closed[4], KKTDiagnostics)
         assert counters == {"inner_kkt_audits": 0, "inner_stationarity_checks": 0}

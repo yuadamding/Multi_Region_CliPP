@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import math
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
@@ -96,6 +97,14 @@ class CertificateOptions:
             raise ValueError("certificate column_tolerance must be positive.")
 
 
+def _residual_max(*values: float) -> float:
+    """Aggregate nonnegative residuals without hiding invalid components."""
+    normalized = tuple(float(value) for value in values)
+    if any(not math.isfinite(value) or value < 0.0 for value in normalized):
+        return math.inf
+    return max(normalized, default=0.0)
+
+
 @dataclass(frozen=True, slots=True)
 class KKTDiagnostics:
     """Backend-neutral normalized graph-fusion KKT diagnostics."""
@@ -104,14 +113,27 @@ class KKTDiagnostics:
     edge_subgradient_residual: float
     dual_ball_residual: float
     box_residual: float
-    kkt_residual: float
     # Scale-stable full-certificate diagnostics.  The historical fields above
     # remain solver-progress diagnostics; terminal raw-candidate admission uses
     # the backward-error residual under exactness-provenance schema v2.
     backward_error_stationarity_residual: float = float("inf")
     backward_error_edge_subgradient_residual: float = float("inf")
     backward_error_dual_ball_residual: float = float("inf")
-    backward_error_kkt_residual: float = float("inf")
+
+    @property
+    def kkt_residual(self) -> float:
+        return _residual_max(
+            self.stationarity_residual, self.edge_subgradient_residual,
+            self.dual_ball_residual, self.box_residual,
+        )
+
+    @property
+    def backward_error_kkt_residual(self) -> float:
+        return _residual_max(
+            self.backward_error_stationarity_residual,
+            self.backward_error_edge_subgradient_residual,
+            self.backward_error_dual_ball_residual, self.box_residual,
+        )
 
 @dataclass(frozen=True, slots=True)
 class DenseEdgeCertificate:
@@ -376,9 +398,7 @@ class KKTComponents:
 
     @property
     def residual(self) -> float:
-        return float(
-            max(self.stationarity, self.edge_subgradient, self.dual_ball, self.box)
-        )
+        return _residual_max(self.stationarity, self.edge_subgradient, self.dual_ball, self.box)
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,8 +455,11 @@ class FitProvenance:
     dtype: str
     inner_solver: str
     global_optimality_basis: str
-    likelihood_eps: float
     scalar_pilot_certificates: tuple[ScalarGlobalMinimumCertificate, ...] = ()
+
+    @property
+    def likelihood_eps(self) -> float:
+        return float.fromhex(self.objective_key.base.eps_hex)
 
     @property
     def lambda_value(self) -> float:

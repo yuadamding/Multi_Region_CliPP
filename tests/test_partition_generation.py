@@ -185,11 +185,9 @@ def test_torch_ward_remains_chunk_independent():
 
 def test_final_phi_pool_keeps_declared_k_grid_and_host_source(monkeypatch):
     data = integer_data(((2, 3), (3, 6), (6, 2), (4, 4)))
-    from CliPP2.core.fusion.torch_backend import resolve_runtime
-    from CliPP2.core.objective import model_to_torch
+    from test_curvature_preparation import _context
     options = resolve_fit_config(device="cpu", dtype="float64")
-    runtime = resolve_runtime("cpu", dtype="float64")
-    model = model_to_torch(compile_observed_model(data, eps=EPS), runtime, eps=EPS)
+    context = _context(data)
     seen = []
     ward = partitions.hessian_weighted_ward_label_sets_torch
 
@@ -199,7 +197,7 @@ def test_final_phi_pool_keeps_declared_k_grid_and_host_source(monkeypatch):
 
     monkeypatch.setattr(partitions, "hessian_weighted_ward_label_sets_torch", capture)
     candidates = partitions.generate_partition_initializer_pool(
-        data=data, pilot_phi=data.phi_init, fit_options=options, runtime=runtime, model=model,
+        context=context, pilot_phi=data.phi_init, fit_options=options,
         declared_k_grid=(4, 2, 2, 0, 7),
     )
     assert seen == [[2, 4]]

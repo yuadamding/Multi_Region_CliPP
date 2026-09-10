@@ -53,7 +53,7 @@ def test_terminal_four_plus_final_pass_streams_work_and_releases_witnesses(monke
             references.append(weakref.ref(dual))
         return CertificateAttempt(
             DenseEdgeCertificate(dual, problem.graph_hash, gradient.scope),
-            KKTDiagnostics(1., 1., 1., 0., 1., 1., 1., 1., 1.),
+            KKTDiagnostics(1., 1., 1., 0., 1., 1., 1.),
             "refined_fused_edge_dual", WorkCounters(index),
         )
 
@@ -65,7 +65,7 @@ def test_terminal_four_plus_final_pass_streams_work_and_releases_witnesses(monke
         # promotion/auditing allocates more working storage, not just on return.
         assert [reference() is not None for reference in references] == [False] * 4 + [True]
         audit_calls.append(True)
-        return KKTDiagnostics(1., 1., 1., 0., 1., 1., 1., 1., 1.), "observed_objective", True, 123.
+        return KKTDiagnostics(1., 1., 1., 0., 1., 1., 1.), "observed_objective", True, 123.
 
     monkeypatch.setattr(solver, "_terminal_backward_error_audit_float64", final_audit)
     fit = solver._fit_from_start(
@@ -86,14 +86,16 @@ def test_terminal_four_plus_final_pass_streams_work_and_releases_witnesses(monke
     (float("inf"), False), (float("nan"), False), (-.1, False),
 ])
 def test_typed_admission_keeps_componentwise_gate(residual, accepted):
-    diagnostics = KKTDiagnostics(0., 0., 0., 0., 0.)
+    diagnostics = KKTDiagnostics(0., 0., 0., 0.)
     assert not solver._backward_error_kkt_within_gate(diagnostics, certification_tol=8e-4)
-    diagnostics = replace(diagnostics, backward_error_kkt_residual=residual)
+    diagnostics = replace(diagnostics, backward_error_stationarity_residual=residual,
+                          backward_error_edge_subgradient_residual=0.,
+                          backward_error_dual_ball_residual=0.)
     assert solver._backward_error_kkt_within_gate(diagnostics, certification_tol=8e-4) is accepted
     # A favorable legacy progress residual cannot override componentwise rejection.
     assert diagnostics.kkt_residual == 0.
-    if np.isnan(residual):
-        assert np.isnan(diagnostics.backward_error_kkt_residual)
+    if not np.isfinite(residual) or residual < 0:
+        assert diagnostics.backward_error_kkt_residual == np.inf
 
 
 def test_mapping_diagnostics_are_not_a_second_internal_interface():

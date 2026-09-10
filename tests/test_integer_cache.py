@@ -9,12 +9,13 @@ import pytest
 from CliPP2.config import resolve_fit_config
 from CliPP2.core.fusion import solver
 from CliPP2.core.fusion.torch_backend import resolve_runtime
-from CliPP2.core.fusion.partition_starts import _resolve_partition_runtime
+from CliPP2.core.fusion.partition_starts import generate_partition_initializer_pool
 from CliPP2.core.objective import compile_observed_model, model_to_torch
 from CliPP2.io.data import CNFilterRecord, CNFilterReport, tumor_data_fingerprint
 from CliPP2.model_selection import candidates
 from CliPP2.model_selection.partitions import _partition_signature
 from test_integer_likelihood import integer_data
+from test_curvature_preparation import _context
 
 
 def _key(data):
@@ -82,8 +83,12 @@ def test_same_shape_source_model_must_match_requested_data(change):
         source = replace(source, upper=source.upper * 0.8)
     runtime = resolve_runtime("cpu", dtype="float64")
     tensor = model_to_torch(source, runtime, eps=.01 if change == "eps" else 1e-6)
-    with pytest.raises(ValueError, match="TumorData/eps objective"):
-        _resolve_partition_runtime(data=data, model=tensor)
+    context = replace(_context(data), source_model=source, model=tensor, _tensor_snapshot=())
+    with pytest.raises(ValueError, match="likelihood or epsilon"):
+        generate_partition_initializer_pool(
+            context=context, pilot_phi=context.exact_pilot,
+            fit_options=resolve_fit_config(device="cpu", dtype="float64"),
+        )
 
 
 def test_forged_runtime_input_label_cannot_authorize_wrong_source_model():
@@ -102,12 +107,16 @@ def test_forged_runtime_input_label_cannot_authorize_wrong_source_model():
 
 def test_runtime_validation_supports_matching_nondefault_eps():
     data = integer_data(((4,),))
-    runtime = resolve_runtime("cpu", dtype="float64")
-    tensors = model_to_torch(compile_observed_model(data, eps=.01), runtime, eps=.01)
-    _, rebuilt = _resolve_partition_runtime(data=data, model=tensors, eps=.01)
-    assert rebuilt.source_fingerprint == tensors.source_fingerprint
-    with pytest.raises(ValueError, match="TumorData/eps objective"):
-        _resolve_partition_runtime(data=data, model=tensors)
+    context = _context(data, eps=.01)
+    assert generate_partition_initializer_pool(
+        context=context, pilot_phi=context.exact_pilot,
+        fit_options=resolve_fit_config(device="cpu", dtype="float64", eps=.01),
+    )
+    with pytest.raises(ValueError, match="prepared likelihood epsilon"):
+        generate_partition_initializer_pool(
+            context=context, pilot_phi=context.exact_pilot,
+            fit_options=resolve_fit_config(device="cpu", dtype="float64"),
+        )
 
 
 def test_exclusion_provenance_does_not_invalidate_retained_refit_cache():

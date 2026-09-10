@@ -184,13 +184,19 @@ def test_candidate_model_identity_invalidates_tensor_and_refit_cache():
     data = integer_data(((4,),))
     changed = integer_data(((3,),))
     runtime = resolve_runtime("cpu", dtype="float64")
-    from CliPP2.core.fusion.partition_starts import _resolve_partition_runtime
+    from CliPP2.core.fusion.partition_starts import generate_partition_initializer_pool
+    from CliPP2.config import resolve_fit_config
+    from test_curvature_preparation import _context
     tensors = model_to_torch(compile_observed_model(changed, eps=EPS), runtime, eps=EPS)
     assert tumor_data_fingerprint(data) != tumor_data_fingerprint(changed)
     assert compile_observed_model(data, eps=EPS).fingerprint != (
         compile_observed_model(changed, eps=EPS).fingerprint)
-    with pytest.raises(ValueError, match="runtime source"):
-        _resolve_partition_runtime(data=data, model=tensors, eps=EPS)
+    context = replace(_context(data), model=tensors, _tensor_snapshot=())
+    with pytest.raises(ValueError, match="likelihood or epsilon"):
+        generate_partition_initializer_pool(
+            context=context, pilot_phi=context.exact_pilot,
+            fit_options=resolve_fit_config(device="cpu", dtype="float64"),
+        )
     stale = compile_observed_model(changed, eps=EPS)
     with pytest.raises(ValueError, match="tumor objective"):
         partition_constrained_observed_refit(

@@ -86,7 +86,7 @@ def _selection(data: TumorData, phi: float = 0.75):
             objective_key=make_lambda_objective_key(
                 make_base_objective_key(model, graph_hash="fixture-graph", eps=EPS), lambda_value=.1),
             source_data_hash=tumor_data_fingerprint(data), device="cpu", dtype="float64",
-            inner_solver="fixture", global_optimality_basis="not_certified", likelihood_eps=EPS,
+            inner_solver="fixture", global_optimality_basis="not_certified",
         ),
     )
     return raw, partition, refit

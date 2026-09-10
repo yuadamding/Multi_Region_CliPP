@@ -1385,7 +1385,7 @@ def _solve_inner_subproblem(
     graph_hash: str,
 ) -> InnerSolveResult:
     """Dispatch the majorized inner subproblem to the ALM (complete-graph) or PDHG
-    solver and wrap its legacy tuple in a representation-aware result."""
+    solver and retain its sole actual multiplier in the outer result."""
     if use_alm:
         dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
             num_nodes=num_mutations,
@@ -1401,11 +1401,9 @@ def _solve_inner_subproblem(
     if use_alm:
         (
             phi_trial,
-            dual_trial,
             dual_kkt_trial,
             _inner_iterations,
             inner_ok,
-            _inner_residual,
             surrogate_diag,
         ) = solve_majorized_subproblem_alm_torch(
             runtime=runtime,
@@ -1429,11 +1427,9 @@ def _solve_inner_subproblem(
     else:
         (
             phi_trial,
-            dual_trial,
             dual_kkt_trial,
             _inner_iterations,
             inner_ok,
-            _inner_residual,
             surrogate_diag,
         ) = solve_majorized_subproblem_pdhg_torch(
             runtime=runtime,
@@ -1454,12 +1450,6 @@ def _solve_inner_subproblem(
             tau_node=pdhg_tau_node,
             use_backward_error_stopping=bool(use_backward_error_stopping),
         )
-    if use_alm:
-        # The outer MM loop carries the rho-invariant actual multiplier y.
-        # Drop the low-level scaled-u return here so a second complete
-        # edge-by-region tensor does not remain live through outer scoring and
-        # certificate refinement.
-        dual_trial = dual_kkt_trial
     if surrogate_diag is None:
         surrogate_diag = graph_fusion_kkt_residual_from_grad_torch(
             phi=phi_trial,
@@ -1487,7 +1477,7 @@ def _solve_inner_subproblem(
         backend_name=str(backend_name),
         warm_state=DenseWarmState(
             phi=phi_trial,
-            dual=dual_trial if torch.is_tensor(dual_trial) else None,
+            dual=dual_kkt_trial if torch.is_tensor(dual_kkt_trial) else None,
             previous_lambda=float(lambda_value),
             graph_hash=str(graph_hash),
         ),
@@ -2504,13 +2494,14 @@ def _fit_from_start(
             dtype=dtype_name(runtime.dtype),
             inner_solver=str(inner_solver),
             global_optimality_basis=str(global_optimality_basis),
-            likelihood_eps=float(eps),
             scalar_pilot_certificates=problem.scalar_pilot_certificates,
         ),
     )
 
 
-def _validate_prepared_problem(context: PreparedProblem) -> None:
+def _validate_prepared_problem(
+    context: PreparedProblem, *, allow_deferred_graph: bool = False,
+) -> None:
     """Validate frozen source identity without accepting a competing request."""
     context.assert_runtime_unchanged()
     data = context.source_data
@@ -2523,7 +2514,7 @@ def _validate_prepared_problem(context: PreparedProblem) -> None:
         or context.model.source_fingerprint != source.fingerprint
     ):
         raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
-    if context.graph_spec.name == "deferred_likelihood_pilot":
+    if context.graph_spec.name == "deferred_likelihood_pilot" and not allow_deferred_graph:
         raise ValueError("A deferred likelihood pilot is not a prepared fusion graph.")
     if context.graph_hash != context.graph_spec.fingerprint:
         raise ValueError("Prepared problem graph identity is inconsistent.")

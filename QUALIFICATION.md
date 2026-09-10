@@ -3,6 +3,100 @@
 Dated evidence for the changes below, not a claim that a moving branch or a
 new device/cohort is qualified. See [README.md](README.md) for current usage.
 
+## Residual correctness and ALM consolidation — 2026-09-10
+
+Reference: `aa799344d2addb043b85034928cdb3c50e2d9b4b`; version remains `0.5.0`.
+The final tested inference-source fingerprint is
+`23e2150c18694bf1dbbacab9dcdbe6d695ada86c15f5c017ee4dbd11dc6e40a2`.
+The frozen reference archive SHA-256 is
+`65bc46668dfda954b7ac1b0fa5a0220ccab82e8abade3b4aa87607dac4c8e1cc`.
+
+The reported residual bug reproduces in the actual reference package. With
+`phi=U=(0.2,0.2,0.8)`, complete-graph weights `(0,1,1)`, zero dual and lambda
+one, float32 produces a NaN edge component but aggregate residual zero.
+Float64 reports legacy residual `0.3` and componentwise backward error `0.6`.
+The feasible point `(0.21,0.21,0.79)` lowers the quadratic-plus-fusion objective
+from `1.2` to `1.16015`. This establishes an incorrect working diagnostic and
+potential stopping decision, **not** a demonstrated false public terminal
+certificate: the separate authoritative float64 audit remains in place.
+
+The edge residual now replaces only an exactly zero denominator with one;
+nonzero denominators and zero-weight edges are unchanged. Both dtypes report
+the expected violation. One scalar residual maximum rejects every nonfinite
+or negative component with infinity. On-device maxima preserve NaNs and reject
+negative values without a host synchronization. Dense, streamed ALM, compressed
+certificate and omitted-edge scans cannot erase invalid components by taking
+a maximum with zero. Invalid radius normalizers also fail closed instead of
+converting a finite violation into zero by division by infinity.
+
+`KKTDiagnostics` derives its legacy and backward-error totals from their
+separate component sets; `KKTComponents` uses the same fail-closed rule. Their
+individual diagnostic values remain available. `FitProvenance.likelihood_eps`
+derives exactly from the typed objective key. Removed duplicate constructor
+fields are not reintroduced by a compatibility wrapper. External diagnostic
+properties and published output schema remain unchanged; malformed epsilon
+keys can now fail earlier at hexadecimal parsing.
+
+ALM and PDHG return five values: primal, actual edge multiplier, iterations,
+convergence and typed diagnostics. Only PDHG's existing closed-form branch can
+omit diagnostics. Scaled ADMM duals remain inside ALM; both actual/scaled
+warm-start initialization modes remain supported and tested. The outer result
+and warm state share the actual multiplier without a second outgoing dual.
+
+One ALM driver replaces its dense/streamed control loops. Each iteration
+completes shrinkage and the full adjoint before solving nodes, then completes
+every dual update before deciding rho. The original full-array reductions and
+streamed accumulation orders remain distinct, including their historical
+pre/post-rescaling audit timing. The box-QP solver, compiled/eager dispatch,
+spectral-rho schedule, actual-multiplier invariance, stopping convention,
+tolerances, audit cadence and work counts are preserved. Even a one-edge
+problem retains the streamed route when its byte budget is below one edge.
+
+Curvature consumes one supplied `TorchObservedModel` and same-shape/dtype/device
+pilot tensor. Proposal boundaries validate the prepared source and runtime
+tensor mutation stamps, including pre-graph contexts; ordinary fits still
+reject a deferred graph. The redundant runtime resolver is deleted. On the
+pinned five-mutation/two-region preparation, initial curvature, initial pool
+and final pool sequence, runtime constructions decrease **3 → 1**. Actual
+immutable source construction remains one on both sides; extra boundary
+validation uses its existing source cache, not another compilation. Curvature,
+scalar pilots, Ward ordering, labels, refits, scores and adaptive graph weights
+match their pinned values in both dtypes.
+
+Validation in `ml1`: **963 tests passed, 11 explicit CUDA-only tests skipped**;
+Ruff and `git diff --check` pass. This includes the isolated installed-wheel
+CPU fit, an independent exhaustive active-set QP/ADMM oracle, actual/scaled
+warm continuation, exact rho-rescaling checks, zero-radius violations,
+NaN/infinity/negative injection into every residual position and chunk, and
+edited prepared-tensor rejection. Fresh paired CPU captures bind the final
+source at startup and completion:
+
+| Capture | Coverage | Matching SHA-256 |
+| --- | --- | --- |
+| Inner solvers | 280 route-specific ALM/PDHG cases, both dtypes, warm modes, active/frozen bounds, zero lambda/no edges, both stopping conventions; every iterate/audit/rho trajectory, including 18 rho-changing cases | `cdd15ee6a2cb0dc58862084cba52376b19aefa0d21c992323e61ea97ab1b6f21` |
+| Raw/warm and hybrid | 17,994 numeric leaves; ten raw/warm cases, two tiny hybrid fits, flattened diagnostic totals, derived epsilon, identities, refits, scores and uncertainty | `ca13c62e829becec31422936a8e0e2f1f0d0f5f4c57cd16f582e00c4c3eac226` |
+| CNA-positive hybrid | 566 numeric leaves; four fits, public CCFs, labels, posteriors, exact `major_cn != minor_cn` F1 population and all four TSV contents/schemas | `52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4` |
+
+Valid-case captures are byte-identical to the reference. Deliberately invalid
+residuals and the zero-radius bug reproduction must change; they are covered
+by correctness tests rather than forced into a parity claim. The CNA fixtures
+have eight eligible rows each and preserve macro/micro/weighted/per-class F1;
+this is smoke-test parity, not evidence of improved cohort accuracy.
+
+Inference source remains **34 modules**, decreasing **713,768 → 703,778 bytes**
+(9,990 fewer bytes; 1.40%). No likelihood, objective, graph, candidate family,
+score, output schema, or balanced `0.004` admission gate is changed. These
+measurements establish source contraction and eliminated runtime model builds,
+not a production runtime or peak-memory improvement.
+
+CUDA and representative release/cohort qualification remain pending. No remote
+jobs were launched. The eleven CUDA tests require `CLIPP2_TEST_CUDA=1` inside
+an approved, commit-pinned Seadragon LSF allocation; they now also cover the
+ALM compiled/full/streamed routes and cross-precision zero-radius audit. The
+`clipp2-run` skill requires an immutable committed source and the external LSF
+project runbook, which is still absent. This working patch is not a committed
+run source; local CPU evidence does not replace those release gates.
+
 ## Whole-fit ownership and certificate consolidation — 2026-09-09
 
 Reference: `72f76a8c2ab3066ab1df01b5288d303e73e2f8d0`; version remains `0.5.0`.

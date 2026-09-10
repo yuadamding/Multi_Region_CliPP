@@ -117,6 +117,11 @@ provenance. Terminal certification retains only its current evidence. One
 refinement driver preserves the original full/chunked adjoint routes and uses
 a frozen complete residual for each simultaneous update. Host CEM costs and
 multiplicity posteriors skip derivatives without changing marginalization.
+ALM likewise has one driver with the original dense/streamed arithmetic; its
+outer caller receives only the actual edge multiplier. Curvature reuses the
+validated prepared model. Legacy and backward-error residual totals are derived
+separately and fail closed on nonfinite or negative components; zero-radius
+edges remain in the graph and use an exact-zero-safe residual calculation.
 
 ## Outputs and integrity
 

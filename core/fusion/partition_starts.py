@@ -19,7 +19,7 @@ from ...config import (
     PARTITION_MAX_CANDIDATES_PER_K,
 )
 from ..objective import (
-    ObservedModel, TorchObservedModel, compile_observed_model, model_to_torch, _observed_reduction_numpy,
+    ObservedModel, TorchObservedModel, compile_observed_model, _observed_reduction_numpy,
     observed_loss_grid_torch,
 )
 from ..bic import fixed_partition_dirichlet_score
@@ -33,7 +33,8 @@ from .torch_backend import (
     dtype_name,
     resolve_runtime,
 )
-from .types import TorchRuntime
+from .solver import _validate_prepared_problem
+from .types import PreparedProblem
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The
@@ -64,55 +65,25 @@ class PartitionRefinementResult:
     component_death_count: int
 
 
-def _resolve_partition_runtime(
-    *,
-    data: TumorData,
-    exact_pilot: np.ndarray | torch.Tensor | object | None = None,
-    model: TorchObservedModel | None = None,
-    device: str | torch.device | None = None,
-    dtype: str | torch.dtype | None = None,
-
-    eps: float = 1e-6,
-) -> tuple[TorchRuntime, TorchObservedModel]:
-    source = compile_observed_model(data, eps=float(eps))
-    if model is not None and model.source_fingerprint != source.fingerprint:
-        raise ValueError("Partition runtime source does not match the TumorData/eps objective.")
-    template = model.alt if model is not None else exact_pilot
-    if torch.is_tensor(template):
-        device = template.device if device is None else device
-        dtype = template.dtype if dtype is None else dtype
-    runtime = resolve_runtime(
-        None if device is None else str(device),
-        dtype=dtype_name(dtype) if isinstance(dtype, torch.dtype) else dtype,
-    )
-    # Always rebuild from immutable source, never cast rounded or edited views.
-    return runtime, model_to_torch(source, runtime, eps=float(eps))
-
-
 @torch.no_grad()
 def observed_curvature_at_pilot_torch(
-    data: TumorData,
-    exact_pilot: np.ndarray | torch.Tensor | object,
+    model: TorchObservedModel,
+    pilot_phi: torch.Tensor,
     *,
-
     eps: float,
     step_fraction: float = 1e-3,
     min_step: float = 1e-4,
     curvature_floor: float = 1e-6,
     curvature_cap_quantile: float = 0.995,
-    model: TorchObservedModel | None = None,
-    device: str | torch.device | None = None,
-    dtype: str | torch.dtype | None = None,
 ) -> torch.Tensor:
-    runtime, model = _resolve_partition_runtime(
-        data=data,
-        exact_pilot=exact_pilot,
-        model=model,
-        device=device,
-        dtype=dtype,
-        eps=eps,
-    )
-    phi0 = as_runtime_tensor(exact_pilot, runtime)
+    """Evaluate a controlled runtime view; preparation owns source integrity."""
+    if not isinstance(model, TorchObservedModel) or not torch.is_tensor(pilot_phi):
+        raise TypeError("Curvature requires a TorchObservedModel and a pilot Tensor.")
+    if tuple(pilot_phi.shape) != model.shape:
+        raise ValueError("Curvature pilot and model must have the same shape.")
+    if pilot_phi.dtype != model.alt.dtype or pilot_phi.device != model.alt.device:
+        raise ValueError("Curvature pilot and model must share dtype and device.")
+    phi0 = pilot_phi
     upper = model.upper
     lower_value = float(eps)
     lower = torch.full_like(phi0, lower_value)
@@ -709,11 +680,9 @@ def generate_likelihood_partition_starts(
 
 def generate_partition_initializer_pool(
     *,
-    data: TumorData,
+    context: PreparedProblem,
     pilot_phi: np.ndarray | torch.Tensor,
     fit_options: FitConfig,
-    runtime: TorchRuntime,
-    model: TorchObservedModel,
     curvature: np.ndarray | torch.Tensor | None = None,
     declared_k_grid: tuple[int, ...] | None = None,
 ) -> tuple[PartitionCandidate, ...]:
@@ -722,6 +691,11 @@ def generate_partition_initializer_pool(
     These scored proposals supply the raw guide and the independent direct
     candidate pool; final selection still refits labels under its own gate.
     """
+    _validate_prepared_problem(context, allow_deferred_graph=True)
+    if float(fit_options.eps) != context.eps:
+        raise ValueError("Partition options must preserve the prepared likelihood epsilon.")
+    data, runtime = context.source_data, context.runtime
+    pilot_tensor = as_runtime_tensor(pilot_phi, runtime)
     if declared_k_grid is None:
         k_grid = [int(k) for k in PARTITION_K_ANCHORS if 1 <= int(k) <= int(data.num_mutations)]
         k_cap = min(int(LIKELIHOOD_PARTITION_K_MAX), int(data.num_mutations))
@@ -732,11 +706,10 @@ def generate_partition_initializer_pool(
         k_grid = sorted({int(k) for k in declared_k_grid if 1 <= int(k) <= int(data.num_mutations)})
     if curvature is None:
         curvature = observed_curvature_at_pilot_torch(
-            data, pilot_phi, eps=float(fit_options.eps), model=model,
-            device=runtime.device, dtype=runtime.dtype,
+            context.model, pilot_tensor, eps=context.eps,
         )
     label_sets = hessian_weighted_ward_label_sets_torch(
-        pilot_phi, curvature, K_grid=k_grid, device=runtime.device, dtype=runtime.dtype,
+        pilot_tensor, curvature, K_grid=k_grid, device=runtime.device, dtype=runtime.dtype,
     )
     return tuple(generate_likelihood_partition_starts(
         data, eps=float(fit_options.eps), label_sets=label_sets,

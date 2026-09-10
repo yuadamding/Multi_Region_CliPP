@@ -13,6 +13,7 @@ from ..core.fusion.partition_starts import (
     observed_curvature_at_pilot_torch,
 )
 from ..core.fusion.solver import (
+    _validate_prepared_problem,
     fit_prepared,
     objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
@@ -544,21 +545,14 @@ def _partition_guided_admm_selection(
     )
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
-    pilot_model = pilot_context.model
+    _validate_prepared_problem(pilot_context, allow_deferred_graph=True)
     guide_curvature = observed_curvature_at_pilot_torch(
-        data,
-        pilot_phi,
-        eps=float(fit_options.eps),
-        model=pilot_model,
-        device=pilot_runtime.device,
-        dtype=pilot_runtime.dtype,
+        pilot_context.model, pilot_phi, eps=pilot_context.eps,
     )
     initializer_pool = generate_partition_initializer_pool(
-        data=data,
+        context=pilot_context,
         pilot_phi=pilot_phi,
         fit_options=fit_options,
-        runtime=pilot_runtime,
-        model=pilot_model,
         curvature=guide_curvature,
     )
     guide = _best_partition_candidate(list(initializer_pool))
@@ -638,8 +632,6 @@ def _partition_guided_admm_selection(
             fit_options=effective_fit_options,
         )
     )
-    runtime = base_solver_context.runtime
-    model = base_solver_context.model
     effective_graph = base_solver_context.graph_spec
     effective_tensor_graph = base_solver_context.graph
     effective_fit_options = replace(
@@ -1135,11 +1127,9 @@ def _partition_guided_admm_selection(
         if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
             continue
         final_pool = generate_partition_initializer_pool(
-            data=data,
+            context=base_solver_context,
             pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
             fit_options=effective_fit_options,
-            runtime=runtime,
-            model=model,
             declared_k_grid=final_k_grid,
         )
         direct_proposals.extend(

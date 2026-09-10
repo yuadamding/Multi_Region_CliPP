@@ -65,7 +65,7 @@ def test_reporting_checks_typed_base_objective_not_only_source_hash(fitted, fiel
     base = replace(raw.provenance.objective_key.base, **{field: "corrupt"})
     raw = replace(raw, provenance=replace(raw.provenance,
                   objective_key=replace(raw.provenance.objective_key, base=base)))
-    with pytest.raises(ValueError, match="likelihood, box or epsilon"):
+    with pytest.raises(ValueError, match="likelihood, box or epsilon|invalid hexadecimal"):
         _view(fitted, raw_fit=raw)
 
 

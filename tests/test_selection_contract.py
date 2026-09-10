@@ -1,7 +1,6 @@
 """One production policy with the original hybrid and score constants."""
 
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +18,8 @@ from CliPP2.config import (
     resolve_fit_config,
 )
 from CliPP2.core.fusion import partition_starts
+from test_curvature_preparation import _context
+from test_integer_likelihood import integer_data
 
 
 @pytest.mark.parametrize("profile,expected", [
@@ -94,10 +95,10 @@ def test_hybrid_initializer_keeps_ward_cem_and_reference_settings(monkeypatch):
 
     monkeypatch.setattr(partition_starts, "hessian_weighted_ward_label_sets_torch", labels)
     monkeypatch.setattr(partition_starts, "generate_likelihood_partition_starts", generate)
+    context = _context(integer_data(((1,),) * 31))
     result = partition_starts.generate_partition_initializer_pool(
-        data=SimpleNamespace(num_mutations=31), pilot_phi="pilot",
+        context=context, pilot_phi=context.exact_pilot,
         fit_options=resolve_fit_config(device="cpu"),
-        runtime=SimpleNamespace(device="cpu", dtype="float64"), model=None,
         curvature="curvature",
     )
     assert result == ("candidate",)

@@ -17,6 +17,7 @@ from .torch_backend import (
 )
 from .graph_ops import project_dual_ball
 from .types import (
+    _residual_max,
     WorkCounters,
     CertificateOptions,
     CompressedEdgeCertificate,
@@ -353,7 +354,6 @@ def _resource_limit_diagnostics(
         edge_subgradient_residual=float("inf"),
         dual_ball_residual=float("inf"),
         box_residual=box_primal_violation / max(box_scale, 1e-300),
-        kkt_residual=float("inf"),
     )
 
 
@@ -497,7 +497,7 @@ def _scan_omitted_internal_edges(
             0, edge_v[internal]
         )
         scores = torch.linalg.vector_norm(gradients, dim=1) / max(float(scale), 1e-300)
-        maximum = max(maximum, float(torch.max(scores).item()))
+        maximum = _residual_max(maximum, float(torch.max(scores).item()))
         count = min(int(add_batch), int(scores.numel()))
         values, positions = torch.topk(scores, k=count, largest=True, sorted=False)
         best_scores.append(values)
@@ -910,22 +910,22 @@ def _compressed_graph_fusion_kkt(
                 dual=dual_chunk,
                 radius=radius,
             )
-            max_edge_residual = max(
+            max_edge_residual = _residual_max(
                 max_edge_residual,
                 float(edge_residual.item()),
             )
-            max_ball_residual = max(
+            max_ball_residual = _residual_max(
                 max_ball_residual,
                 float(ball_residual.item()),
             )
-            max_radius = max(
+            max_radius = _residual_max(
                 max_radius,
                 float(radius_max.item()),
             )
-            max_scaled_edge_residual = max(
+            max_scaled_edge_residual = _residual_max(
                 max_scaled_edge_residual, float(scaled_edge_residual.item())
             )
-            max_scaled_ball_residual = max(
+            max_scaled_ball_residual = _residual_max(
                 max_scaled_ball_residual, float(scaled_ball_residual.item())
             )
 
